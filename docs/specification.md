@@ -139,3 +139,7 @@ MVP собран и проверен: `btawg/` (два бинарника, 11 п
 Статус, запуск и честные ограничения: `btawg/README.md`. План и решения:
 `docs/superpowers/plans/2026-11-18-btawg-mvp.md`,
 `docs/superpowers/specs/2026-11-18-btawg-mvp-design.md`.
+
+Роутинг-политика, live reload из панели, TUN на стороне хаба и shared
+`internal/tunsetup`: `docs/superpowers/plans/2026-11-18-routing-policy.md`,
+`docs/superpowers/specs/2026-11-18-routing-policy-design.md`.

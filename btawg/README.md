@@ -80,6 +80,53 @@ like kernel WireGuard's ip_forward). In netstack mode use
 through `btawg0`. **Do not** route LAN traffic through SOCKS5 — the egress
 dials destinations on the hub's host, which is for the internet only.
 
+## Routing policy
+
+Policy is enforced on the hub and configured only in the panel. Each client
+has two independent controls:
+
+- **Internet** checkbox — gates the chained SOCKS5 egress to the real internet.
+  The hub host itself (`10.77.0.1`) stays reachable regardless; turning this
+  off produces a pure work-net client.
+- **Visible peers** multi-select — the list of other clients this client may
+  exchange overlay packets with. Visibility is mutual: A can talk to B only
+  when A lists B **and** B lists A.
+
+Examples (in the owner's spirit):
+
+- Mutual pairs: client 1 sees only client 2, and client 2 sees only client 1;
+  client 5 ↔ client 6 the same way. Everyone else is isolated from them.
+- Full VPN: every client has **Internet** on and **Visible peers** = All.
+- Work net without internet: every client has **Internet** off and **Visible
+  peers** = All, so they can reach each other and the hub but nothing else.
+
+Changes are saved to the store and reloaded into the hub snapshot live via
+`POST /clients/policy`. **No server restart and no re-import of clients are
+required** for policy changes; only AWG-profile / transport / port changes
+require the restart + re-import banner shown on the server-settings page.
+
+### Hub TUN mode and the no-route-takeover invariant
+
+`btawg-server` defaults to real TUN mode and creates `btawg0` with the hub
+overlay address (`10.77.0.1/24` by default). Flags:
+
+```sh
+./btawg-server -tun btawg0        # default real-TUN mode (root required)
+./btawg-server -no-tun            # userspace netstack mode (tests, dev)
+```
+
+The hub adds **no routes** — not even a subnet route. Clients add only the
+overlay subnet route into their own `btawg0`; they never install a default
+route. No node in the system takes over the system's routing table.
+
+### Egress gate semantics
+
+The hub's egress SOCKS5 is the only path from a client to the public
+internet. If a client's **Internet** toggle is off, the gate closes that
+client's egress connections immediately (fail-closed). The hub itself and
+overlay peer-to-peer traffic still flow through the AWG device; only the
+SOCKS5 egress is gated.
+
 ## Import string
 
 `btawg://` + base64url(JSON): version, infohash, hub public key, client
@@ -118,3 +165,8 @@ hub's IP via DHT, but without AWG keys the channel stays opaque.
   comes from the emulated 20 ms one-way channel benchmark.
 - No ACL groups, rate limits, LAN-behind-client routing, kill switch, or
   IPv6 in this MVP; revocation removes the AWG peer and detaches the carrier.
+- Hub real-TUN mode requires root and is verified only by the root-gated unit
+  tests and design review, not on this non-root dev host. Run it on the VPS
+  with `sudo ./btawg-server`.
+- Disallowed client↔client dials are silently dropped by design, so they time
+  out rather than returning a clean error or RST.

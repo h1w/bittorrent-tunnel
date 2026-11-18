@@ -1,5 +1,10 @@
 # btawg: routing policy, TUN on both sides, camouflage apply — design
 
+> Status: implemented and verified in branch `btawg-routing-policy`
+> (commits `998d368`..`ecf8840` plus Task 8 docs/live run). The live runtime
+> verification on the non-root dev host uses `-no-tun`; hub real-TUN mode is
+> covered by the root-gated `internal/tunsetup` unit tests and design review.
+
 ## Intent
 
 Owner requirements (conversation, 2026-11-18):
