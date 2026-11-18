@@ -240,7 +240,8 @@ func (s *Server) Run(ctx context.Context) error {
 		// address, not a host interface address.
 		return s.ns.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(s.cfg.ServerIP), 0))
 	})
-	go egress.Serve(runCtx, s.egressLn)
+	gated := &gatedListener{inner: s.egressLn, policy: s.policy}
+	go egress.Serve(runCtx, gated)
 
 	switch {
 	case s.sock != nil:
