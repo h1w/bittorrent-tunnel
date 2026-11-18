@@ -314,6 +314,21 @@ func (s *Server) RegisterClient(rec store.ClientRecord) error {
 	return nil
 }
 
+// RevokeClient removes a client at runtime (panel revoke): the AWG peer is
+// dropped, its carrier detached, and future handshakes from its peer ID are
+// rejected.
+func (s *Server) RevokeClient(rec store.ClientRecord) error {
+	ipc := fmt.Sprintf("public_key=%s\nremove=true\n", rec.PubKey)
+	if err := s.dev.IpcSet(ipc); err != nil {
+		return fmt.Errorf("ipc remove peer: %w", err)
+	}
+	s.bd.Detach(bind.Endpoint(netip.MustParseAddr(rec.IP)))
+	s.mu.Lock()
+	delete(s.byPeerID, rec.PeerID)
+	s.mu.Unlock()
+	return nil
+}
+
 // ConnectedCount reports how many carriers are attached per overlay IP.
 func (s *Server) ConnectedCount() map[string]int {
 	s.mu.Lock()

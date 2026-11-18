@@ -110,6 +110,7 @@ type ServerConfig struct {
 	ExternalIP    string     `json:"external_ip"`
 	InfoHash      string     `json:"infohash"`       // 20-byte hex, generated at first boot
 	ServerPrivKey string     `json:"server_privkey"` // hex (secret), generated at first boot
+	AdminPassHash string     `json:"admin_pass_hash"` // bcrypt hash of the panel password
 }
 
 // DefaultServerConfig returns the shipped defaults used when the store has no

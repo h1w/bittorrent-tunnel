@@ -6,12 +6,17 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"golang.org/x/crypto/bcrypt"
+
+	"bittorrent-tunnel/btawg/internal/panel"
 	"bittorrent-tunnel/btawg/internal/server"
 	"bittorrent-tunnel/btawg/internal/store"
 )
@@ -55,6 +60,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Panel identity: generate the admin password at first boot.
+	if cfg.AdminPassHash == "" {
+		pw := randomPassword()
+		hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+		if err == nil {
+			cfg.AdminPassHash = string(hash)
+			if err := st.SaveServerConfig(cfg); err == nil {
+				fmt.Printf("btawg-server: panel login admin / %s (shown once, loopback :%d)\n", pw, cfg.PanelPort)
+			}
+		}
+	}
+	go func() {
+		p := panel.New(st, srv, "admin", cfg.AdminPassHash)
+		addr := fmt.Sprintf("127.0.0.1:%d", cfg.PanelPort)
+		fmt.Printf("btawg-server: panel on http://%s (SSH port-forward to reach it)\n", addr)
+		if err := http.ListenAndServe(addr, p.Handler()); err != nil {
+			fmt.Fprintf(os.Stderr, "btawg-server: panel: %v\n", err)
+		}
+	}()
+
 	errCh := make(chan error, 2)
 	go func() { errCh <- srv.Run(ctx) }()
 	go func() { errCh <- srv.Announce(ctx) }()
@@ -72,4 +97,15 @@ func main() {
 			os.Exit(1)
 		}
 	}
+}
+
+// randomPassword returns a 16-char alphanumeric password.
+func randomPassword() string {
+	const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, 16)
+	rand.Read(b)
+	for i := range b {
+		b[i] = alphabet[int(b[i])%len(alphabet)]
+	}
+	return string(b)
 }
