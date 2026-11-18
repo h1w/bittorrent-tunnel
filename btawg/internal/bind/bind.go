@@ -22,12 +22,18 @@ const EndpointPort = 51820
 
 type endpointID struct{ addr netip.AddrPort }
 
-func (e endpointID) ClearSrc()                          {}
-func (e endpointID) SrcToString() string                 { return "" }
-func (e endpointID) DstToString() string                 { return e.addr.String() }
-func (e endpointID) DstToBytes() []byte                  { a := e.addr.Addr().As4(); b := make([]byte, 6); copy(b, a[:]); binary.BigEndian.PutUint16(b[4:], e.addr.Port()); return b }
-func (e endpointID) DstIP() netip.Addr                   { return e.addr.Addr() }
-func (e endpointID) SrcIP() netip.Addr                   { return netip.Addr{} }
+func (e endpointID) ClearSrc()           {}
+func (e endpointID) SrcToString() string { return "" }
+func (e endpointID) DstToString() string { return e.addr.String() }
+func (e endpointID) DstToBytes() []byte {
+	a := e.addr.Addr().As4()
+	b := make([]byte, 6)
+	copy(b, a[:])
+	binary.BigEndian.PutUint16(b[4:], e.addr.Port())
+	return b
+}
+func (e endpointID) DstIP() netip.Addr { return e.addr.Addr() }
+func (e endpointID) SrcIP() netip.Addr { return netip.Addr{} }
 
 type tagged struct {
 	ep   endpointID

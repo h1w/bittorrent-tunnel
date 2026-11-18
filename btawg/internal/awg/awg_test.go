@@ -39,7 +39,7 @@ func TestClientConf(t *testing.T) {
 		ClientPrivKey: "11223344556677889900aabbccddeeff00112233",
 		ServerPubKey:  "aabbccddeeff00112233445566778899aabbccdd",
 		ServerIP:      "10.77.0.1",
-		Profile:        config.DefaultProfile(),
+		Profile:       config.DefaultProfile(),
 	}
 	got := ClientConf(c)
 	for _, want := range []string{

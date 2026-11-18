@@ -444,7 +444,7 @@ func (r *recordingPacketConn) Close() error {
 	return nil
 }
 
-func (r *recordingPacketConn) LocalAddr() net.Addr  { return r.local }
+func (r *recordingPacketConn) LocalAddr() net.Addr                { return r.local }
 func (r *recordingPacketConn) SetDeadline(t time.Time) error      { return nil }
 func (r *recordingPacketConn) SetReadDeadline(t time.Time) error  { return nil }
 func (r *recordingPacketConn) SetWriteDeadline(t time.Time) error { return nil }

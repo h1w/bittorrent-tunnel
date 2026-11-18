@@ -16,15 +16,15 @@ type filterTun struct {
 	policy *policySnapshot
 }
 
-func (f *filterTun) File() *os.File                                 { return f.inner.File() }
+func (f *filterTun) File() *os.File { return f.inner.File() }
 func (f *filterTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	return f.inner.Read(bufs, sizes, offset)
 }
-func (f *filterTun) MTU() (int, error)                             { return f.inner.MTU() }
-func (f *filterTun) Name() (string, error)                         { return f.inner.Name() }
-func (f *filterTun) Events() <-chan tun.Event                      { return f.inner.Events() }
-func (f *filterTun) Close() error                                  { return f.inner.Close() }
-func (f *filterTun) BatchSize() int                                { return f.inner.BatchSize() }
+func (f *filterTun) MTU() (int, error)        { return f.inner.MTU() }
+func (f *filterTun) Name() (string, error)    { return f.inner.Name() }
+func (f *filterTun) Events() <-chan tun.Event { return f.inner.Events() }
+func (f *filterTun) Close() error             { return f.inner.Close() }
+func (f *filterTun) BatchSize() int           { return f.inner.BatchSize() }
 
 // Write filters outbound packets from peers against the routing policy.
 // Disallowed packets are dropped silently and are not passed to the inner

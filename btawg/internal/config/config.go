@@ -54,16 +54,16 @@ func (p AWGProfile) String() string {
 // reachable endpoint: it exists only inside the tunnel.
 type ClientConfig struct {
 	Version       int        `json:"version"`
-	InfoHash      string     `json:"infohash"`      // 20-byte hex
-	ServerPubKey string     `json:"server_pubkey"` // hex
+	InfoHash      string     `json:"infohash"`       // 20-byte hex
+	ServerPubKey  string     `json:"server_pubkey"`  // hex
 	ClientPrivKey string     `json:"client_privkey"` // hex (secret)
-	ClientPubKey  string     `json:"client_pubkey"` // hex
-	ClientIP      string     `json:"client_ip"`     // overlay, e.g. 10.77.0.2
-	Subnet        string     `json:"subnet"`        // overlay, e.g. 10.77.0.0/24
-	ServerIP      string     `json:"server_ip"`     // overlay hub, e.g. 10.77.0.1
-	Transport     string     `json:"transport"`     // ext-utp|ext-tcp|req-utp|req-tcp
-	SocksPort     int        `json:"socks_port"`    // client's local no-auth SOCKS5
-	EgressPort    int        `json:"egress_port"`   // hub's overlay SOCKS5 the chain targets
+	ClientPubKey  string     `json:"client_pubkey"`  // hex
+	ClientIP      string     `json:"client_ip"`      // overlay, e.g. 10.77.0.2
+	Subnet        string     `json:"subnet"`         // overlay, e.g. 10.77.0.0/24
+	ServerIP      string     `json:"server_ip"`      // overlay hub, e.g. 10.77.0.1
+	Transport     string     `json:"transport"`      // ext-utp|ext-tcp|req-utp|req-tcp
+	SocksPort     int        `json:"socks_port"`     // client's local no-auth SOCKS5
+	EgressPort    int        `json:"egress_port"`    // hub's overlay SOCKS5 the chain targets
 	Profile       AWGProfile `json:"awg_profile"`
 	DHTBootstrap  []string   `json:"dht_bootstrap,omitempty"`
 }
@@ -108,8 +108,8 @@ type ServerConfig struct {
 	SocksPort     int        `json:"socks_port"`
 	PanelPort     int        `json:"panel_port"`
 	ExternalIP    string     `json:"external_ip"`
-	InfoHash      string     `json:"infohash"`       // 20-byte hex, generated at first boot
-	ServerPrivKey string     `json:"server_privkey"` // hex (secret), generated at first boot
+	InfoHash      string     `json:"infohash"`        // 20-byte hex, generated at first boot
+	ServerPrivKey string     `json:"server_privkey"`  // hex (secret), generated at first boot
 	AdminPassHash string     `json:"admin_pass_hash"` // bcrypt hash of the panel password
 }
 
@@ -118,11 +118,11 @@ type ServerConfig struct {
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
 		AWGProfile:  DefaultProfile(),
-		Subnet:     "10.77.0.0/24",
-		ServerIP:   "10.77.0.1",
-		Transport:  "ext-utp",
+		Subnet:      "10.77.0.0/24",
+		ServerIP:    "10.77.0.1",
+		Transport:   "ext-utp",
 		CarrierPort: 6881,
-		SocksPort:  1080,
-		PanelPort:  8080,
+		SocksPort:   1080,
+		PanelPort:   8080,
 	}
 }

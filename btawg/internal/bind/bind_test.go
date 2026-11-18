@@ -31,7 +31,7 @@ func (s *stubTransport) Send(p []byte) error {
 func (s *stubTransport) Recv() <-chan []byte   { return s.recv }
 func (s *stubTransport) Done() <-chan struct{} { return s.done }
 func (s *stubTransport) Close()                { s.once.Do(func() { close(s.done) }) }
-func (s *stubTransport) Wait()                { s.Close() }
+func (s *stubTransport) Wait()                 { s.Close() }
 
 func (s *stubTransport) sentBufs() [][]byte {
 	s.mu.Lock()

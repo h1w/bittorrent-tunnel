@@ -19,8 +19,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: btawg/go.mod
+      # third_party/ is a vendored upstream copy (one local patch); keep
+      # upstream formatting there and check only our code.
       - name: gofmt
-        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+        run: test -z "$(gofmt -l cmd internal)" || (gofmt -l cmd internal && exit 1)
       - name: vet
         run: go vet ./...
       - name: build

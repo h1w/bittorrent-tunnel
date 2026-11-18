@@ -347,9 +347,9 @@ func TestUpdateClientPolicy(t *testing.T) {
 
 	csrf := csrfOf(t, c, srv.URL, "/clients")
 	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
-		"csrf":    {csrf},
-		"id":      {idA},
-		"peers":   {idB},
+		"csrf":  {csrf},
+		"id":    {idA},
+		"peers": {idB},
 	})
 	if err != nil {
 		t.Fatalf("post policy: %v", err)
@@ -384,10 +384,10 @@ func TestUpdateClientPolicyInternetPresence(t *testing.T) {
 
 	csrf := csrfOf(t, c, srv.URL, "/clients")
 	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
-		"csrf":    {csrf},
-		"id":      {id},
+		"csrf":     {csrf},
+		"id":       {id},
 		"internet": {"1"},
-		"peers":   {"*"},
+		"peers":    {"*"},
 	})
 	if err != nil {
 		t.Fatalf("post policy: %v", err)

@@ -14,11 +14,11 @@ import (
 
 // fakeTun records Write calls and otherwise satisfies tun.Device.
 type fakeTun struct {
-	writes [][][]byte
+	writes  [][][]byte
 	offsets []int
 }
 
-func (f *fakeTun) File() *os.File                                 { return nil }
+func (f *fakeTun) File() *os.File                                           { return nil }
 func (f *fakeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) { return 0, nil }
 func (f *fakeTun) Write(bufs [][]byte, offset int) (int, error) {
 	f.writes = append(f.writes, bufs)
@@ -94,9 +94,9 @@ func TestFilterTunDropsDisallowed(t *testing.T) {
 	ft := &filterTun{inner: inner, policy: p}
 
 	bufs := [][]byte{
-		makeIPv4(aIP, bIP),      // allowed
-		makeIPv4(cIP, bIP),      // disallowed
-		makeIPv4(bIP, serverIP), // allowed (hub)
+		makeIPv4(aIP, bIP),       // allowed
+		makeIPv4(cIP, bIP),       // disallowed
+		makeIPv4(bIP, serverIP),  // allowed (hub)
 		makeIPv4(unknownIP, bIP), // disallowed
 	}
 

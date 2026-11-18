@@ -13,18 +13,18 @@ const testInfoHash = "0123456789abcdef0123456789abcdef01234567"
 
 func testClientConfig() ClientConfig {
 	return ClientConfig{
-		Version:      1,
-		InfoHash:     testInfoHash,
-		ServerPubKey: "aabbccddeeff00112233445566778899aabbccdd",
+		Version:       1,
+		InfoHash:      testInfoHash,
+		ServerPubKey:  "aabbccddeeff00112233445566778899aabbccdd",
 		ClientPrivKey: "11223344556677889900aabbccddeeff00112233",
-		ClientPubKey: "44556677889900aabbccddeeff00112233445566",
-		ClientIP:     "10.77.0.2",
-		Subnet:       "10.77.0.0/24",
-		ServerIP:     "10.77.0.1",
-		Transport:    "ext-utp",
-		SocksPort:    1080,
-		Profile:      DefaultProfile(),
-		DHTBootstrap: []string{"router.bittorrent.com:6881"},
+		ClientPubKey:  "44556677889900aabbccddeeff00112233445566",
+		ClientIP:      "10.77.0.2",
+		Subnet:        "10.77.0.0/24",
+		ServerIP:      "10.77.0.1",
+		Transport:     "ext-utp",
+		SocksPort:     1080,
+		Profile:       DefaultProfile(),
+		DHTBootstrap:  []string{"router.bittorrent.com:6881"},
 	}
 }
 
