@@ -1,0 +1,41 @@
+name: Go
+
+on: [push, pull_request]
+
+jobs:
+
+  test:
+    timeout-minutes: 30
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        go-version: [ 'stable', 'oldstable' ]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-go@v6
+      with:
+        go-version: ${{ matrix.go-version }}
+    - uses: extractions/setup-just@v2
+    - run: go version
+    - run: just test
+    - run: just bench
+
+  purego:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: [ 'stable', 'oldstable' ]
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v2
+    - uses: actions/setup-go@v6
+      with:
+        go-version: ${{ matrix.go-version }}
+    - uses: extractions/setup-just@v2
+    - run: go version
+    - run: just test-purego
+    - run: just test-purego-utp
+    - run: just test-nocgo
