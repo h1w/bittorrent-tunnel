@@ -77,7 +77,7 @@ func TestClientFullFlow(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	hubCfg := config.DefaultServerConfig()
 	hubCfg.Transport = "ext-utp"
-	hubCfg.CarrierPort = 17779
+	hubCfg.CarrierPort = 17783 // unique across parallel test packages (server: 17777-17779, e2e: 17781)
 	hubCfg.ExternalIP = "127.0.0.1"
 
 	clientPriv, clientPub, err := awg.GenerateKeyPair()
