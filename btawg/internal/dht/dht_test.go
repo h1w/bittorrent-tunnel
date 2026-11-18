@@ -184,10 +184,12 @@ func TestRunRetriesAfterBootstrapComesUp(t *testing.T) {
 }
 
 func TestListenUDPRangeFirstFreeThenEphemeral(t *testing.T) {
-	// Occupy the first three ports of the range: the helper must land on
-	// the next free one, like a torrent client whose usual port is busy.
+	// Tested on an uncommon port range to avoid cross-package parallel
+	// collisions with the production 688x binds. Occupy the first three
+	// ports of the range: the helper must land on the next free one, like a
+	// torrent client whose usual port is busy.
 	var holds []net.PacketConn
-	for p := 6882; p <= 6884; p++ {
+	for p := 38882; p <= 38884; p++ {
 		c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: p})
 		if err != nil {
 			t.Fatalf("hold %d: %v", p, err)
@@ -200,30 +202,30 @@ func TestListenUDPRangeFirstFreeThenEphemeral(t *testing.T) {
 		}
 	}()
 
-	pc, err := listenUDPRange(6882, 6889)
+	pc, err := listenUDPRange(38882, 38889)
 	if err != nil {
 		t.Fatalf("listenUDPRange: %v", err)
 	}
 	defer pc.Close()
-	if got := pc.LocalAddr().(*net.UDPAddr).Port; got != 6885 {
-		t.Fatalf("listenUDPRange port = %d, want first free 6885", got)
+	if got := pc.LocalAddr().(*net.UDPAddr).Port; got != 38885 {
+		t.Fatalf("listenUDPRange port = %d, want first free 38885", got)
 	}
 
 	// Whole range busy: fall back to an ephemeral port instead of failing.
 	pc.Close()
-	for p := 6885; p <= 6889; p++ {
+	for p := 38885; p <= 38889; p++ {
 		c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: p})
 		if err != nil {
 			t.Fatalf("hold %d: %v", p, err)
 		}
 		holds = append(holds, c)
 	}
-	pc2, err := listenUDPRange(6882, 6889)
+	pc2, err := listenUDPRange(38882, 38889)
 	if err != nil {
 		t.Fatalf("listenUDPRange fallback: %v", err)
 	}
 	defer pc2.Close()
-	if got := pc2.LocalAddr().(*net.UDPAddr).Port; got >= 6882 && got <= 6889 {
+	if got := pc2.LocalAddr().(*net.UDPAddr).Port; got >= 38882 && got <= 38889 {
 		t.Fatalf("listenUDPRange fallback port = %d inside busy range, want ephemeral", got)
 	}
 }
