@@ -1,0 +1,10 @@
+awg-direct clean40 seed=0 delivery=20/20 p95=42.115 max=42.797 bt_handshakes=0 pieces=0 invalid=0
+awg-bt-tcp clean40 seed=0 delivery=20/20 p95=42.634 max=42.867 bt_handshakes=2 pieces=148 invalid=0
+awg-bt-libutp clean40 seed=0 delivery=20/20 p95=63.530 max=96.915 bt_handshakes=2 pieces=148 invalid=0
+awg-bt-go-default clean40 seed=0 delivery=20/20 p95=65.059 max=98.174 bt_handshakes=2 pieces=148 invalid=0
+awg-bt-go-nn clean40 seed=0 delivery=20/20 p95=42.681 max=43.161 bt_handshakes=2 pieces=148 invalid=0
+awg-bt-go-nn-dup clean40 seed=0 delivery=20/20 p95=42.880 max=43.850 bt_handshakes=2 pieces=148 invalid=0
+awg-bt-go-nn-2lanes clean40 seed=0 delivery=20/20 p95=42.499 max=43.179 bt_handshakes=4 pieces=148 invalid=0
+awg-bt-ext-utp clean40 seed=0 delivery=20/20 p95=42.971 max=42.974 bt_handshakes=2 pieces=148 invalid=0
+awg-bt-ext-tcp clean40 seed=0 delivery=20/20 p95=43.367 max=43.417 bt_handshakes=2 pieces=148 invalid=0
+awg-bt-webseed clean40 seed=0 delivery=20/20 p95=43.117 max=43.529 bt_handshakes=0 pieces=148 invalid=0

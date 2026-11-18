@@ -1,0 +1,8 @@
+# Harness / local state
+.omp/
+.superpowers/
+
+# Build artifacts
+*.test
+/dist/
+/bin/

@@ -1,0 +1,18 @@
+Official amneziawg-go/v3 v3.1.20261116; actual default UDP Bind; gVisor netstack TUN; IPv4 localhost; payload=256 interval=10ms measured=1000 warmup=50; no induced delay/loss; profile: jc=4
+jmin=40
+jmax=100
+s1=32
+s2=32
+s3=32
+s4=32
+h1=101
+h2=102
+h3=103
+h4=104
+
+udp-loopback repeat=0 delivery=1000/1000 p50=0.087 p95=0.162 p99=0.247 max=0.347 first=0.080
+awg-userspace-loopback repeat=0 delivery=1000/1000 p50=0.335 p95=0.483 p99=0.635 max=0.849 first=1.987
+udp-loopback repeat=1 delivery=1000/1000 p50=0.092 p95=0.141 p99=0.196 max=0.296 first=0.061
+awg-userspace-loopback repeat=1 delivery=1000/1000 p50=0.347 p95=0.619 p99=0.754 max=0.946 first=2.374
+udp-loopback repeat=2 delivery=1000/1000 p50=0.090 p95=0.148 p99=0.195 max=0.308 first=0.169
+awg-userspace-loopback repeat=2 delivery=1000/1000 p50=0.331 p95=0.527 p99=0.725 max=0.844 first=3.029
