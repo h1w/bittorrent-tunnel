@@ -58,11 +58,13 @@ type extCarrier struct {
 }
 
 // NewExtended wraps an established connection with BEP 10 extended framing:
-// BitTorrent handshake, extension handshake, then private id-1 messages whose
-// payloads are uint16-length-prefixed AWG datagrams padded to BlockSize.
-func NewExtended(c net.Conn, infoHash, peerID [20]byte) (Transport, error) {
-	if _, err := Handshake(c, infoHash, peerID); err != nil {
-		return nil, err
+// BitTorrent handshake (the peer's ID is returned for caller-side routing),
+// extension handshake, then private id-1 messages whose payloads are
+// uint16-length-prefixed AWG datagrams padded to BlockSize.
+func NewExtended(c net.Conn, infoHash, peerID [20]byte) (Transport, [20]byte, error) {
+	theirs, err := Handshake(c, infoHash, peerID)
+	if err != nil {
+		return nil, theirs, err
 	}
 	sendErr := make(chan error, 1)
 	go func() { sendErr <- fullWrite(c, extHandshakeMsg()) }()
@@ -70,25 +72,25 @@ func NewExtended(c net.Conn, infoHash, peerID [20]byte) (Transport, error) {
 	if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
 		c.Close()
 		<-sendErr
-		return nil, fmt.Errorf("read ext handshake: %w", err)
+		return nil, theirs, fmt.Errorf("read ext handshake: %w", err)
 	}
 	n := int(binary.BigEndian.Uint32(lenBuf[:]))
 	if n == 0 || n > 4098 {
 		c.Close()
 		<-sendErr
-		return nil, fmt.Errorf("bad ext handshake length")
+		return nil, theirs, fmt.Errorf("bad ext handshake length")
 	}
 	h := make([]byte, n)
 	if _, err := io.ReadFull(c, h); err != nil {
 		c.Close()
 		<-sendErr
-		return nil, fmt.Errorf("read ext handshake body: %w", err)
+		return nil, theirs, fmt.Errorf("read ext handshake body: %w", err)
 	}
 	if err := <-sendErr; err != nil {
-		return nil, fmt.Errorf("write ext handshake: %w", err)
+		return nil, theirs, fmt.Errorf("write ext handshake: %w", err)
 	}
 	if n < 2 || h[0] != 20 || h[1] != 0 {
-		return nil, fmt.Errorf("bad ext handshake")
+		return nil, theirs, fmt.Errorf("bad ext handshake")
 	}
 	x := &extCarrier{
 		c:        c,
@@ -100,7 +102,7 @@ func NewExtended(c net.Conn, infoHash, peerID [20]byte) (Transport, error) {
 		defer x.wg.Done()
 		x.readLoop()
 	}()
-	return x, nil
+	return x, theirs, nil
 }
 
 func (x *extCarrier) readLoop() {

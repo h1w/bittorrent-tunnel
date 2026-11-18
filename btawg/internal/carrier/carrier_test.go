@@ -93,28 +93,31 @@ func TestHandshakeRejectsWrongInfoHash(t *testing.T) {
 
 type result struct {
 	tr  Transport
+	pid [20]byte
 	err error
 }
 
-func pair(t *testing.T, fa, fb func(net.Conn) (Transport, error)) (Transport, Transport) {
+type factory func(net.Conn) (Transport, [20]byte, error)
+
+func pair(t *testing.T, fa, fb factory) (Transport, Transport) {
 	t.Helper()
 	a, b := tcpPair(t)
 	ch := make(chan result, 1)
 	go func() {
-		tr, err := fa(a)
-		ch <- result{tr, err}
+		tr, pid, err := fa(a)
+		ch <- result{tr, pid, err}
 	}()
-	tb, err := fb(b)
+	rb, _, err := fb(b)
 	if err != nil {
 		t.Fatalf("carrier b: %v", err)
 	}
-	t.Cleanup(tb.Wait)
+	t.Cleanup(rb.Wait)
 	r := <-ch
 	if r.err != nil {
 		t.Fatalf("carrier a: %v", r.err)
 	}
 	t.Cleanup(r.tr.Wait)
-	return r.tr, tb
+	return r.tr, rb
 }
 
 func roundTrip(t *testing.T, ta, tb Transport) {
@@ -149,32 +152,75 @@ func roundTrip(t *testing.T, ta, tb Transport) {
 
 func TestRequestPieceRoundTrip(t *testing.T) {
 	ta, tb := pair(t,
-		func(c net.Conn) (Transport, error) { return NewRequestPiece(c, testHash, peerA, false) },
-		func(c net.Conn) (Transport, error) { return NewRequestPiece(c, testHash, peerB, true) },
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewRequestPiece(c, testHash, peerA, false)
+		},
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewRequestPiece(c, testHash, peerB, true)
+		},
 	)
 	roundTrip(t, ta, tb)
 }
 
 func TestExtendedRoundTrip(t *testing.T) {
 	ta, tb := pair(t,
-		func(c net.Conn) (Transport, error) { return NewExtended(c, testHash, peerA) },
-		func(c net.Conn) (Transport, error) { return NewExtended(c, testHash, peerB) },
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewExtended(c, testHash, peerA)
+		},
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewExtended(c, testHash, peerB)
+		},
 	)
 	roundTrip(t, ta, tb)
 }
 
+func TestPeerIDIsReturned(t *testing.T) {
+	a, b := tcpPair(t)
+	ch := make(chan [20]byte, 1)
+	go func() {
+		_, pid, err := NewExtended(a, testHash, peerA)
+		if err != nil {
+			t.Errorf("carrier a: %v", err)
+		}
+		ch <- pid
+	}()
+	_, pid, err := NewExtended(b, testHash, peerB)
+	if err != nil {
+		t.Fatalf("carrier b: %v", err)
+	}
+	if pid != peerA {
+		t.Fatalf("carrier b saw peer ID %v, want %v", pid, peerA)
+	}
+	select {
+	case got := <-ch:
+		if got != peerB {
+			t.Fatalf("carrier a saw peer ID %v, want %v", got, peerB)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("carrier a did not finish")
+	}
+}
+
 func TestOversizedSendRejected(t *testing.T) {
 	ta, tb := pair(t,
-		func(c net.Conn) (Transport, error) { return NewExtended(c, testHash, peerA) },
-		func(c net.Conn) (Transport, error) { return NewExtended(c, testHash, peerB) },
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewExtended(c, testHash, peerA)
+		},
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewExtended(c, testHash, peerB)
+		},
 	)
 	_ = tb
 	if err := ta.Send(make([]byte, BlockSize)); err == nil {
 		t.Fatal("extended Send accepted BlockSize payload, want error")
 	}
 	pa, pb := pair(t,
-		func(c net.Conn) (Transport, error) { return NewRequestPiece(c, testHash, peerA, false) },
-		func(c net.Conn) (Transport, error) { return NewRequestPiece(c, testHash, peerB, true) },
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewRequestPiece(c, testHash, peerA, false)
+		},
+		func(c net.Conn) (Transport, [20]byte, error) {
+			return NewRequestPiece(c, testHash, peerB, true)
+		},
 	)
 	_ = pb
 	if err := pa.Send(make([]byte, BlockSize)); err == nil {

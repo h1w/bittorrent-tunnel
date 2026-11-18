@@ -38,10 +38,12 @@ type requestPieceCarrier struct {
 // NewRequestPiece wraps an established connection with BEP 3 request/piece
 // framing (message ids: 1 unchoke, 2 interested, 5 bitfield, 6 request,
 // 7 piece). ownOdd selects which half of the virtual file this endpoint
-// advertises; the two ends of one connection must pass opposite values.
-func NewRequestPiece(c net.Conn, infoHash, peerID [20]byte, ownOdd bool) (Transport, error) {
-	if _, err := Handshake(c, infoHash, peerID); err != nil {
-		return nil, err
+// advertises; the two ends of one connection must pass opposite values. The
+// peer's handshake ID is returned for caller-side routing.
+func NewRequestPiece(c net.Conn, infoHash, peerID [20]byte, ownOdd bool) (Transport, [20]byte, error) {
+	theirs, err := Handshake(c, infoHash, peerID)
+	if err != nil {
+		return nil, theirs, err
 	}
 	x := &requestPieceCarrier{
 		c:        c,
@@ -51,7 +53,7 @@ func NewRequestPiece(c net.Conn, infoHash, peerID [20]byte, ownOdd bool) (Transp
 		pending:  make(map[uint32]bool),
 	}
 	x.start(ownOdd)
-	return x, nil
+	return x, theirs, nil
 }
 
 func (x *requestPieceCarrier) start(ownOdd bool) {

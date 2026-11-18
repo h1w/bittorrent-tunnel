@@ -99,23 +99,27 @@ func ParseImportString(s string) (ClientConfig, error) {
 // panel. ExternalIP is the announced carrier address; empty means autodetect
 // from the default-route interface.
 type ServerConfig struct {
-	AWGProfile AWGProfile `json:"awg_profile"`
-	Subnet     string     `json:"subnet"`
-	ServerIP   string     `json:"server_ip"`
-	Transport  string     `json:"transport"`
-	SocksPort  int        `json:"socks_port"`
-	PanelPort  int        `json:"panel_port"`
-	ExternalIP string     `json:"external_ip"`
+	AWGProfile    AWGProfile `json:"awg_profile"`
+	Subnet        string     `json:"subnet"`
+	ServerIP      string     `json:"server_ip"`
+	Transport     string     `json:"transport"`
+	CarrierPort   int        `json:"carrier_port"`
+	SocksPort     int        `json:"socks_port"`
+	PanelPort     int        `json:"panel_port"`
+	ExternalIP    string     `json:"external_ip"`
+	InfoHash      string     `json:"infohash"`       // 20-byte hex, generated at first boot
+	ServerPrivKey string     `json:"server_privkey"` // hex (secret), generated at first boot
 }
 
 // DefaultServerConfig returns the shipped defaults used when the store has no
 // saved configuration yet.
 func DefaultServerConfig() ServerConfig {
 	return ServerConfig{
-		AWGProfile: DefaultProfile(),
+		AWGProfile:  DefaultProfile(),
 		Subnet:     "10.77.0.0/24",
 		ServerIP:   "10.77.0.1",
 		Transport:  "ext-utp",
+		CarrierPort: 7777,
 		SocksPort:  1080,
 		PanelPort:  8080,
 	}
