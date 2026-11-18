@@ -23,6 +23,105 @@ go test ./...
 `purego.MatrixDisableNagle` bypasses the µTP Nagle hold (the validated
 latency win; see the benchmark for why this matters).
 
+## Quickstart (VPS + one client, from zero)
+
+### 1. Hub on a public-IP VPS
+
+```sh
+mkdir -p /var/lib/btawg
+./btawg-server -store /var/lib/btawg/btawg.db
+```
+
+First boot prints, once:
+
+```
+btawg-server: panel login admin / <password> (shown once, loopback :8080)
+btawg-server: transport=ext-utp carrier=:6881 socks=1080 infohash=<…>
+```
+
+**Save that password now** — it is never shown again. If lost, delete the db
+and re-import clients (or look into the store with the panel still logged in).
+Production runs need root (real-TUN mode). systemd unit:
+
+```ini
+[Unit]
+Description=btawg hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/btawg-server -store /var/lib/btawg/btawg.db
+Restart=on-failure
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Firewall: allow **6881/udp** inbound (carrier). Nothing else needs to be
+open — DHT, AWG and panel traffic all ride that socket or stay on loopback.
+
+### 2. Panel → first client
+
+```sh
+ssh -L 8080:127.0.0.1:8080 vps      # panel is loopback-only by design
+```
+
+Open `http://127.0.0.1:8080`, log in (`admin` + printed password), then
+**Clients → Create** → open the import page → copy the `btawg://…` string.
+It is a secret (contains the client's private key); hand it over the same
+way you would a WireGuard config.
+
+### 3. Client machine
+
+```sh
+sudo ./btawg-client 'btawg://…'      # root = btawg0 interface; without: sudo -E …
+./btawg-client -no-tun 'btawg://…'   # no interface, SOCKS5-only mode
+```
+
+The client needs no server address anywhere: it finds the hub strictly
+through the DHT (give it up to ~30 s), then serves no-auth SOCKS5 on
+`127.0.0.1:1080`.
+
+### 4. Verify
+
+```sh
+curl -4 -s --socks5-hostname 127.0.0.1:1080 https://example.com   # 200
+ip a show btawg0                                                  # 10.77.0.x present
+```
+
+Point any app's SOCKS5 at `127.0.0.1:1080` (DNS resolves at the hub — no
+client-side leak). To route specific traffic via the interface instead,
+add your own routes into `10.77.0.0/24` — btawg never touches your
+default route.
+
+### 5. Policy (panel, live)
+
+On the dashboard each client has **Internet** (egress toggle) and
+**Visible peers** (who it may talk to; mutual). Example presets:
+
+| Scenario | Internet | Visible peers |
+|---|---|---|
+| Full VPN (обход ограничений) | on, all clients | All |
+| Рабочая сеть без интернета | off, all clients | All |
+| Пары: 1↔2 и 5↔6, остальные изолированы | as needed | only each other |
+
+Saves apply immediately — no restart, no re-import. A denied peer dial
+just times out (silent drop, like a router). To isolate a client
+completely, select no peers at all.
+
+### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| Client: `dht traversal finished: no peers` | Hub not announced yet — wait for its first announce, or the network blocks DHT → use `-dht-bootstrap` + `dht_bootstrap` in the import string |
+| Client exits after ~45 s of retries | Hub unreachable (down / carrier port filtered) — check `6881/udp` and `-external-ip` |
+| `curl` fails with IPv6 target | Hub host has no IPv6 — use `curl -4` (documented limit) |
+| `tun setup (root required)` | Run with sudo or `-no-tun` |
+| Password lost | Delete the db and recreate clients (keys live in the import strings) |
+
+
 ## Run the server (VPS)
 
 ```sh

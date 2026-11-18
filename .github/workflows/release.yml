@@ -1,0 +1,35 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: btawg
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: btawg/go.mod
+      - name: test before release
+        run: go test ./... -count=1 -timeout 300s
+      - name: build
+        run: |
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/btawg-server ./cmd/btawg-server
+          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/btawg-client ./cmd/btawg-client
+          sha256sum dist/btawg-server dist/btawg-client > dist/SHA256SUMS
+      - name: release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            btawg/dist/btawg-server
+            btawg/dist/btawg-client
+            btawg/dist/SHA256SUMS
+          generate_release_notes: true
