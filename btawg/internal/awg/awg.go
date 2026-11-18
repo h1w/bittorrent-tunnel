@@ -82,3 +82,25 @@ func PeerID(pubKeyHex string) string {
 
 // ProfileString renders the AWG obfuscation profile in IpcSet form.
 func ProfileString(p config.AWGProfile) string { return p.String() }
+
+// PeerIDBytes converts a 40-char hex peer ID to its 20-byte form.
+func PeerIDBytes(hexID string) ([20]byte, error) {
+	var out [20]byte
+	b, err := hex.DecodeString(hexID)
+	if err != nil || len(b) != 20 {
+		return out, fmt.Errorf("bad peer id")
+	}
+	copy(out[:], b)
+	return out, nil
+}
+
+// InfoHashBytes converts a 40-char hex infohash to its 20-byte form.
+func InfoHashBytes(hexHash string) ([20]byte, error) {
+	var out [20]byte
+	b, err := hex.DecodeString(hexHash)
+	if err != nil || len(b) != 20 {
+		return out, fmt.Errorf("bad infohash")
+	}
+	copy(out[:], b)
+	return out, nil
+}
