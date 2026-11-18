@@ -108,6 +108,7 @@ func TestServerClientEcho(t *testing.T) {
 		ServerIP:      "10.77.0.1",
 		Transport:     "ext-utp",
 		SocksPort:     1080,
+		EgressPort:    1080,
 		Profile:       config.DefaultProfile(),
 	}
 	if err := cd.IpcSet(awg.ClientConf(ccfg)); err != nil {
@@ -136,11 +137,11 @@ func TestServerClientEcho(t *testing.T) {
 	}
 	t.Cleanup(func() { conn.Close() })
 
-	infoHash, err := ParseInfoHash(srv.InfoHash())
+	infoHash, err := awg.InfoHashBytes(srv.InfoHash())
 	if err != nil {
 		t.Fatalf("parse infohash: %v", err)
 	}
-	peerID, err := PeerIDBytes(rec.PeerID)
+	peerID, err := awg.PeerIDBytes(rec.PeerID)
 	if err != nil {
 		t.Fatalf("parse peer id: %v", err)
 	}

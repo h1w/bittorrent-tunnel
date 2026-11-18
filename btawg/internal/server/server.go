@@ -217,7 +217,11 @@ func (s *Server) Run(ctx context.Context) error {
 		func(ctx context.Context) (net.PacketConn, error) {
 			return net.ListenUDP("udp", nil)
 		},
-	)
+	).WithRelayUDP(func(net.Addr) (net.PacketConn, error) {
+		// The relay must live inside the overlay: 10.77.0.1 is a netstack
+		// address, not a host interface address.
+		return s.ns.ListenUDPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(s.cfg.ServerIP), 0))
+	})
 	go egress.Serve(runCtx, s.egressLn)
 
 	switch {
@@ -354,25 +358,9 @@ func (s *Server) closeAll() error {
 	return nil
 }
 
-// PeerIDBytes converts a hex peer ID to its 20-byte form.
-func PeerIDBytes(hexID string) ([20]byte, error) {
-	var out [20]byte
-	b, err := hex.DecodeString(hexID)
-	if err != nil || len(b) != 20 {
-		return out, fmt.Errorf("bad peer id")
-	}
-	copy(out[:], b)
-	return out, nil
-}
-
-// ParseInfoHash converts a hex infohash to its 20-byte form.
-func ParseInfoHash(hexHash string) ([20]byte, error) {
-	var out [20]byte
-	b, err := hex.DecodeString(hexHash)
-	if err != nil || len(b) != 20 {
-		return out, fmt.Errorf("bad infohash")
-	}
-	copy(out[:], b)
-	return out, nil
+// SetDHTBootstrap overrides the announcer's bootstrap node list; the next
+// announce cycle uses it (tests point it at a local relay).
+func (s *Server) SetDHTBootstrap(hosts []string) {
+	s.ann.SetBootstrap(hosts)
 }
 

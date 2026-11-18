@@ -12,19 +12,43 @@ import (
 // Client chains SOCKS5 commands to a remote no-auth SOCKS5 server. Dial
 // satisfies DialFunc, so a local Server can use the Client as its egress.
 type Client struct {
-	remote string
+	remote    string
+	dialTCP   func(ctx context.Context, addr string) (net.Conn, error)
+	listenUDP func(ctx context.Context) (net.PacketConn, error)
 }
 
 // NewClient returns a chaining client for the remote server address
-// (e.g. 10.77.0.1:1080).
+// (e.g. 10.77.0.1:1080) using the host's network stack.
 func NewClient(remote string) *Client {
-	return &Client{remote: remote}
+	return &Client{
+		remote: remote,
+		dialTCP: func(ctx context.Context, addr string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", addr)
+		},
+		listenUDP: func(ctx context.Context) (net.PacketConn, error) {
+			return net.ListenUDP("udp", nil)
+		},
+	}
+}
+
+// WithTransport replaces how the chain reaches the remote SOCKS5 server.
+// btawg's netstack-mode client passes overlay dialers here; the real-TUN
+// client keeps the kernel defaults (routes carry the overlay traffic).
+func (c *Client) WithTransport(dialTCP func(ctx context.Context, addr string) (net.Conn, error), listenUDP func(ctx context.Context) (net.PacketConn, error)) *Client {
+	if dialTCP != nil {
+		c.dialTCP = dialTCP
+	}
+	if listenUDP != nil {
+		c.listenUDP = listenUDP
+	}
+	return c
 }
 
 // Dial connects to the remote server, performs the SOCKS5 handshake and a
 // CONNECT for addr, and returns the established stream.
 func (c *Client) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", c.remote)
+	conn, err := c.dialTCP(ctx, c.remote)
 	if err != nil {
 		return nil, fmt.Errorf("socks chain dial %s: %w", c.remote, err)
 	}
@@ -39,8 +63,7 @@ func (c *Client) Dial(ctx context.Context, network, addr string) (net.Conn, erro
 // PacketConn whose WriteTo wraps datagrams in SOCKS5 UDP headers toward the
 // remote relay and whose ReadFrom unwraps responses.
 func (c *Client) DialUDP(ctx context.Context) (net.PacketConn, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", c.remote)
+	conn, err := c.dialTCP(ctx, c.remote)
 	if err != nil {
 		return nil, fmt.Errorf("socks chain dial %s: %w", c.remote, err)
 	}
@@ -49,7 +72,7 @@ func (c *Client) DialUDP(ctx context.Context) (net.PacketConn, error) {
 		conn.Close()
 		return nil, err
 	}
-	pc, err := net.ListenUDP("udp", nil)
+	pc, err := c.listenUDP(ctx)
 	if err != nil {
 		conn.Close()
 		return nil, err
@@ -162,14 +185,14 @@ func udpAssociate(conn net.Conn) (*net.UDPAddr, error) {
 // outbound datagrams in SOCKS5 UDP headers toward the remote relay and
 // unwraps inbound datagrams. Closing it tears down the control connection.
 type udpChain struct {
-	pc   *net.UDPConn
+	pc   net.PacketConn
 	dst   *net.UDPAddr
 	ctrl  net.Conn
 }
 
 func (u *udpChain) WriteTo(b []byte, addr net.Addr) (int, error) {
 	m := append(buildUDPHeader(addr), b...)
-	if _, err := u.pc.WriteToUDP(m, u.dst); err != nil {
+	if _, err := u.pc.WriteTo(m, u.dst); err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -177,7 +200,7 @@ func (u *udpChain) WriteTo(b []byte, addr net.Addr) (int, error) {
 
 func (u *udpChain) ReadFrom(b []byte) (int, net.Addr, error) {
 	buf := make([]byte, 65536)
-	n, _, err := u.pc.ReadFromUDP(buf)
+	n, _, err := u.pc.ReadFrom(buf)
 	if err != nil {
 		return 0, nil, err
 	}

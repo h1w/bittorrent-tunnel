@@ -276,3 +276,7 @@ func addrPortOf(netAddr net.Addr) netip.AddrPort {
 	}
 	return ap
 }
+
+// NewMemStore returns a correct in-memory DHT peer store, for tests that
+// stand up bare relay nodes.
+func NewMemStore() *memPeerStore { return &memPeerStore{} }

@@ -24,13 +24,29 @@ type DialUDPFunc func(ctx context.Context) (net.PacketConn, error)
 
 // Server is a no-auth SOCKS5 server.
 type Server struct {
-	dial    DialFunc
-	dialUDP DialUDPFunc
+	dial     DialFunc
+	dialUDP  DialUDPFunc
+	relayUDP func(local net.Addr) (net.PacketConn, error)
 }
 
-// NewServer builds a server whose egress is the given dialers.
+// NewServer builds a server whose egress is the given dialers. The
+// app-facing UDP relay defaults to a kernel socket on the listener's host;
+// WithRelayUDP replaces it (btawg's netstack egress binds the relay inside
+// the overlay stack).
 func NewServer(dial DialFunc, dialUDP DialUDPFunc) *Server {
-	return &Server{dial: dial, dialUDP: dialUDP}
+	return &Server{
+		dial:     dial,
+		dialUDP:  dialUDP,
+		relayUDP: func(local net.Addr) (net.PacketConn, error) { return listenUDPFor(local) },
+	}
+}
+
+// WithRelayUDP replaces the app-facing UDP relay socket factory.
+func (s *Server) WithRelayUDP(fn func(local net.Addr) (net.PacketConn, error)) *Server {
+	if fn != nil {
+		s.relayUDP = fn
+	}
+	return s
 }
 
 // ListenAndServe accepts SOCKS5 connections on addr until ctx is done.
@@ -104,7 +120,7 @@ func (s *Server) handleConnect(ctx context.Context, c net.Conn, dst net.Addr) {
 }
 
 func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ net.Addr) {
-	relay, err := listenUDPFor(c.LocalAddr())
+	relay, err := s.relayUDP(c.LocalAddr())
 	if err != nil {
 		writeReply(c, replyGeneralFailure)
 		return
@@ -123,9 +139,10 @@ func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ net.Addr)
 }
 
 // pumpUDP bridges the app-facing relay (SOCKS5-UDP framed) and the upstream
-// (raw datagrams) until the TCP control connection closes.
-func (s *Server) pumpUDP(relay *net.UDPConn, upstream net.PacketConn, ctrl net.Conn) {
-	var appAddr atomic.Value // *net.UDPAddr of the app's relay socket
+// (raw datagrams) until the TCP control connection closes. Both sides use
+// the net.PacketConn interface so kernel and netstack sockets work alike.
+func (s *Server) pumpUDP(relay net.PacketConn, upstream net.PacketConn, ctrl net.Conn) {
+	var appAddr atomic.Value // net.Addr of the app's relay socket
 	closed := make(chan struct{})
 	var once sync.Once
 	shutdown := func() { once.Do(func() { close(closed) }) }
@@ -148,7 +165,7 @@ func (s *Server) pumpUDP(relay *net.UDPConn, upstream net.PacketConn, ctrl net.C
 				continue
 			}
 			m := append(buildUDPHeader(src), buf[:n]...)
-			if _, err := relay.WriteToUDP(m, app.(*net.UDPAddr)); err != nil {
+			if _, err := relay.WriteTo(m, app.(net.Addr)); err != nil {
 				shutdown()
 				return
 			}
@@ -156,7 +173,7 @@ func (s *Server) pumpUDP(relay *net.UDPConn, upstream net.PacketConn, ctrl net.C
 	}()
 	buf := make([]byte, 65536)
 	for {
-		n, app, err := relay.ReadFromUDP(buf)
+		n, app, err := relay.ReadFrom(buf)
 		if err != nil {
 			shutdown()
 			return

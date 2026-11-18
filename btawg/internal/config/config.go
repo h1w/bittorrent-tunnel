@@ -62,7 +62,8 @@ type ClientConfig struct {
 	Subnet        string     `json:"subnet"`        // overlay, e.g. 10.77.0.0/24
 	ServerIP      string     `json:"server_ip"`     // overlay hub, e.g. 10.77.0.1
 	Transport     string     `json:"transport"`     // ext-utp|ext-tcp|req-utp|req-tcp
-	SocksPort     int        `json:"socks_port"`
+	SocksPort     int        `json:"socks_port"`    // client's local no-auth SOCKS5
+	EgressPort    int        `json:"egress_port"`   // hub's overlay SOCKS5 the chain targets
 	Profile       AWGProfile `json:"awg_profile"`
 	DHTBootstrap  []string   `json:"dht_bootstrap,omitempty"`
 }
