@@ -32,7 +32,9 @@ latency win; see the benchmark for why this matters).
 First boot generates and prints (once) the panel password and the deployment
 infohash; the panel listens on `127.0.0.1:8080` — reach it via SSH
 port-forward (`ssh -L 8080:127.0.0.1:8080 vps`). Flags:
-`-transport ext-utp|ext-tcp|req-utp|req-tcp`, `-carrier-port`, `-external-ip`.
+`-transport ext-utp|ext-tcp|req-utp|req-tcp`, `-carrier-port`,
+`-external-ip`, `-dht-bootstrap host:port[,host:port…]` (private bootstrap
+island for DHT-hostile networks; the default is the public bootstrap list).
 
 In the panel: **Server settings** (AWG profile inside BitTorrent, camouflage
 method & transport, ports), **Clients → Create** → copy the import string.
@@ -40,6 +42,13 @@ method & transport, ports), **Clients → Create** → copy the import string.
 The hub announces its carrier address in the public BitTorrent DHT under the
 deployment infohash; clients learn the current server address from the DHT
 alone. Public bootstrap nodes are baked into the client binary.
+
+Ports: the carrier listens on **6881** (the canonical BitTorrent port,
+override with `-carrier-port`), and every DHT socket in the system — hub
+announcer and client discovery — binds the first free port of the standard
+torrent client range **6881–6889**, falling back to an ephemeral port only if
+the whole range is busy. A server + client on one machine coexist in the
+range, exactly like two torrent clients would.
 
 ## Run a client (any PC)
 
@@ -96,11 +105,15 @@ hub's IP via DHT, but without AWG keys the channel stays opaque.
   served. Verified against **nDPI 6.1.0 only** (offline pcaps with
   synthesized L3/L4 headers around real outer bytes). Active probing is out
   of scope. No claim of universal undetectability.
-- DHT discovery depends on public bootstrap reachability; if a network
-  blocks the DHT, the client fails loudly after a bounded retry (a private
-  bootstrap island is the documented fallback, not built here).
-- The announced IP is the source address the DHT observes; a NAT'd hub must
-  forward its carrier port.
+- DHT discovery depends on bootstrap reachability; if a network blocks the
+  public DHT, point both sides at a private bootstrap island with
+  `-dht-bootstrap` (hub) and the import string's `dht_bootstrap` field.
+- The announced IP is the source address the DHT observes; a hub behind NAT
+  must forward 6881/udp. Clients work behind any NAT with no setup — their
+  traffic is purely outbound.
+- The hub needs a public IP (or that forward): client-to-client traffic
+  always routes through the hub, so there is no direct client↔client NAT
+  traversal in this MVP.
 - Real WAN, loss, and a production VPS were not exercised; the latency claim
   comes from the emulated 20 ms one-way channel benchmark.
 - No ACL groups, rate limits, LAN-behind-client routing, kill switch, or

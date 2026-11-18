@@ -121,7 +121,7 @@ func DefaultServerConfig() ServerConfig {
 		Subnet:     "10.77.0.0/24",
 		ServerIP:   "10.77.0.1",
 		Transport:  "ext-utp",
-		CarrierPort: 7777,
+		CarrierPort: 6881,
 		SocksPort:  1080,
 		PanelPort:  8080,
 	}

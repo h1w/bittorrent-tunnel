@@ -103,7 +103,7 @@ type Announcer struct {
 // NewAnnouncer creates the DHT node. bootstrap may be nil for the public
 // default list; it can be replaced later with SetBootstrap.
 func NewAnnouncer(infoHash [20]byte, announceAddr netip.AddrPort, bootstrap []string) (*Announcer, error) {
-	pc, err := net.ListenUDP("udp4", nil)
+	pc, err := listenUDPRange(6882, 6889)
 	if err != nil {
 		return nil, fmt.Errorf("dht listen: %w", err)
 	}
@@ -227,7 +227,7 @@ func Discover(ctx context.Context, infoHash [20]byte, bootstrap []string) ([]net
 	if len(bootstrap) == 0 {
 		bootstrap = DefaultBootstrap
 	}
-	pc, err := net.ListenUDP("udp4", nil)
+	pc, err := listenUDPRange(6881, 6889)
 	if err != nil {
 		return nil, fmt.Errorf("dht listen: %w", err)
 	}
@@ -278,6 +278,20 @@ func Discover(ctx context.Context, infoHash [20]byte, bootstrap []string) ([]net
 			}
 		}
 	}
+}
+
+// listenUDPRange binds the first free UDP port in [min, max], falling back to
+// an ephemeral port when the whole range is busy: btawg's DHT sockets must
+// sit in the standard BitTorrent client range (6881-6889) like real torrent
+// traffic, but a busy range is never fatal.
+func listenUDPRange(min, max int) (*net.UDPConn, error) {
+	for p := min; p <= max; p++ {
+		pc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: p})
+		if err == nil {
+			return pc, nil
+		}
+	}
+	return net.ListenUDP("udp4", nil)
 }
 
 func bootstrapGetter(hosts []string) anadht.StartingNodesGetter {

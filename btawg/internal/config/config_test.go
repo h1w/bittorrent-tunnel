@@ -95,3 +95,9 @@ func TestParseRejectsBareBase64(t *testing.T) {
 		t.Fatal("ParseImportString accepted input without btawg:// prefix, want error")
 	}
 }
+
+func TestDefaultCarrierPortIsStandardTorrentPort(t *testing.T) {
+	if got := DefaultServerConfig().CarrierPort; got != 6881 {
+		t.Fatalf("default CarrierPort = %d, want canonical torrent port 6881", got)
+	}
+}
