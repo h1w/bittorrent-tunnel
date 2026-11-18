@@ -6,6 +6,7 @@ package dht
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -67,9 +68,22 @@ var DefaultBootstrap = []string{
 const (
 	// announceInterval re-announces before DHT peer entries expire.
 	announceInterval = 15 * time.Minute
+	// announceRetryInterval retries an announce that reached no DHT node at
+	// all (bootstrap island down at boot, transient outage): the server must
+	// not stay silent for a full announceInterval.
+	announceRetryInterval = 20 * time.Second
 	// discoverTimeout bounds Discover when the caller sets no deadline.
 	discoverTimeout = 30 * time.Second
 )
+
+// ErrNoContact reports an announce traversal that no DHT node answered. Run
+// retries such announces instead of waiting out the full interval.
+var ErrNoContact = errors.New("dht announce reached no nodes")
+
+// errNoBootstrap bubbles out of startingNodes through anacrolix's
+// TraversalStartingNodes into Announce, marking a resolvable-but-empty
+// bootstrap list.
+var errNoBootstrap = errors.New("no reachable bootstrap nodes")
 
 // Announcer runs a DHT node that announces the carrier port under infoHash.
 // The announced IP is always the source address the DHT observes; a NAT'd
@@ -78,6 +92,9 @@ type Announcer struct {
 	srv      *anadht.Server
 	infoHash [20]byte
 	port     int
+
+	// retryInterval backs off ErrNoContact announces; overridable in tests.
+	retryInterval time.Duration
 
 	mu        sync.Mutex
 	bootstrap []string
@@ -91,17 +108,18 @@ func NewAnnouncer(infoHash [20]byte, announceAddr netip.AddrPort, bootstrap []st
 		return nil, fmt.Errorf("dht listen: %w", err)
 	}
 	a := &Announcer{
-		infoHash:  infoHash,
-		port:      int(announceAddr.Port()),
-		bootstrap: append([]string(nil), bootstrap...),
+		infoHash:      infoHash,
+		port:          int(announceAddr.Port()),
+		retryInterval: announceRetryInterval,
+		bootstrap:     append([]string(nil), bootstrap...),
 	}
 	if len(a.bootstrap) == 0 {
 		a.bootstrap = append([]string(nil), DefaultBootstrap...)
 	}
 	srv, err := anadht.NewServer(&anadht.ServerConfig{
-		Conn:        pc,
-		NoSecurity:  true,
-		PeerStore:   &memPeerStore{},
+		Conn:          pc,
+		NoSecurity:    true,
+		PeerStore:     &memPeerStore{},
 		StartingNodes: a.startingNodes,
 	})
 	if err != nil {
@@ -138,26 +156,35 @@ func (a *Announcer) startingNodes() ([]anadht.Addr, error) {
 		addrs = append(addrs, anadht.NewAddr(ua))
 	}
 	if len(addrs) == 0 {
-		return nil, fmt.Errorf("no reachable bootstrap nodes")
+		return nil, errNoBootstrap
 	}
 	return addrs, nil
 }
 
-// Run announces once immediately and then on every interval tick.
+// Run announces once immediately, then on every interval tick. An announce
+// that no DHT node answered (ErrNoContact) is retried after retryInterval;
+// only a context cancel or a hard DHT failure stops the loop.
 func (a *Announcer) Run(ctx context.Context) error {
-	if err := a.AnnounceOnce(ctx); err != nil {
-		return err
-	}
-	t := time.NewTicker(announceInterval)
-	defer t.Stop()
 	for {
+		err := a.AnnounceOnce(ctx)
+		if ctx.Err() != nil {
+			return nil
+		}
+		var wait time.Duration
+		switch {
+		case err == nil:
+			wait = announceInterval
+		case errors.Is(err, ErrNoContact):
+			wait = a.retryInterval
+		default:
+			return err
+		}
+		t := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return nil
 		case <-t.C:
-			if err := a.AnnounceOnce(ctx); err != nil {
-				return err
-			}
 		}
 	}
 }
@@ -167,6 +194,9 @@ func (a *Announcer) Run(ctx context.Context) error {
 func (a *Announcer) AnnounceOnce(ctx context.Context) error {
 	ann, err := a.srv.Announce(a.infoHash, a.port, false)
 	if err != nil {
+		if errors.Is(err, errNoBootstrap) {
+			return fmt.Errorf("%w: %v", ErrNoContact, err)
+		}
 		return fmt.Errorf("dht announce: %w", err)
 	}
 	defer ann.Close()
@@ -176,6 +206,12 @@ func (a *Announcer) AnnounceOnce(ctx context.Context) error {
 			return nil
 		case _, ok := <-ann.Peers:
 			if !ok {
+				// A traversal nobody answered looks like success unless
+				// we check the stats: a dead bootstrap must not silence
+				// the server for a full interval.
+				if ann.TraversalStats().NumResponses == 0 {
+					return ErrNoContact
+				}
 				return nil
 			}
 		}
@@ -197,8 +233,8 @@ func Discover(ctx context.Context, infoHash [20]byte, bootstrap []string) ([]net
 	}
 	defer pc.Close()
 	srv, err := anadht.NewServer(&anadht.ServerConfig{
-		Conn:         pc,
-		NoSecurity:   true,
+		Conn:          pc,
+		NoSecurity:    true,
 		StartingNodes: bootstrapGetter(bootstrap),
 	})
 	if err != nil {

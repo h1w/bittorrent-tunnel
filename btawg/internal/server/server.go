@@ -19,6 +19,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	utp "github.com/anacrolix/go-utp"
+	"github.com/anacrolix/go-utp/purego"
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/bind"
@@ -28,6 +29,10 @@ import (
 	"bittorrent-tunnel/btawg/internal/socks"
 	"bittorrent-tunnel/btawg/internal/store"
 )
+
+// The hub sends real-time tunnel traffic too: same µTP send policy as the
+// client, set once before any goroutine exists.
+func init() { purego.MatrixDisableNagle = true }
 
 // serverPeerID is the fixed BitTorrent peer ID this hub presents in every
 // carrier handshake; clients identify the deployment by infohash, not peer ID.

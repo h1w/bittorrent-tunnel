@@ -12,7 +12,6 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	utp "github.com/anacrolix/go-utp"
-	"github.com/anacrolix/go-utp/purego"
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/bind"
@@ -26,7 +25,6 @@ import (
 // listener, completes the AWG handshake, and exchanges a UDP echo with a
 // listener inside the server's overlay netstack.
 func TestServerClientEcho(t *testing.T) {
-	purego.MatrixDisableNagle = true
 
 	st, err := store.Open(t.TempDir() + "/hub.db")
 	if err != nil {

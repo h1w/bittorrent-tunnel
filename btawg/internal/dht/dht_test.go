@@ -2,8 +2,10 @@ package dht
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"strconv"
 	"testing"
 	"time"
 
@@ -13,10 +15,9 @@ import (
 
 // newRelay starts a bare DHT node standing in for the public network: it
 // stores announced peers (PeerStore) and serves them on get_peers, exactly
-// like a public BitTorrent DHT node would.
-func newRelay(t *testing.T) (*anadht.Server, string) {
+func newRelayAt(t *testing.T, addr *net.UDPAddr) *anadht.Server {
 	t.Helper()
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	conn, err := net.ListenUDP("udp4", addr)
 	if err != nil {
 		t.Fatalf("relay listen: %v", err)
 	}
@@ -32,7 +33,13 @@ func newRelay(t *testing.T) (*anadht.Server, string) {
 		t.Fatalf("relay server: %v", err)
 	}
 	t.Cleanup(srv.Close)
-	return srv, conn.LocalAddr().String()
+	return srv
+}
+
+func newRelay(t *testing.T) (*anadht.Server, string) {
+	t.Helper()
+	srv := newRelayAt(t, &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	return srv, srv.Addr().String()
 }
 
 func TestAnnounceDiscoverLoopback(t *testing.T) {
@@ -95,4 +102,83 @@ func TestDiscoverNoPeersIsExplicitError(t *testing.T) {
 	if _, err := Discover(ctx, infoHash, []string{relay}); err == nil {
 		t.Fatal("Discover for unannounced infohash succeeded, want explicit error")
 	}
+}
+
+func TestAnnounceDeadBootstrapIsNoContact(t *testing.T) {
+	if testing.Short() {
+		t.Skip("loopback DHT is UDP best-effort; skip in -short")
+	}
+	// Bind a port and close it: the bootstrap address resolves but nobody
+	// ever answers. AnnounceOnce must say so instead of reporting success.
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	dead := conn.LocalAddr().String()
+	conn.Close()
+
+	var infoHash [20]byte
+	infoHash[0] = 0xee
+	ann, err := NewAnnouncer(infoHash, netip.MustParseAddrPort("127.0.0.1:45002"), []string{dead})
+	if err != nil {
+		t.Fatalf("NewAnnouncer: %v", err)
+	}
+	t.Cleanup(ann.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	err = ann.AnnounceOnce(ctx)
+	if !errors.Is(err, ErrNoContact) {
+		t.Fatalf("AnnounceOnce with dead bootstrap = %v, want ErrNoContact", err)
+	}
+}
+
+func TestRunRetriesAfterBootstrapComesUp(t *testing.T) {
+	if testing.Short() {
+		t.Skip("loopback DHT is UDP best-effort; skip in -short")
+	}
+	// The race the runtime check caught: the server announces at boot
+	// before its bootstrap island is reachable. Run must retry shortly
+	// and recover once the relay appears, not wait the full 15 minutes.
+	var infoHash [20]byte
+	infoHash[0], infoHash[1] = 0xb7, 0x77
+	carrier := netip.MustParseAddrPort("127.0.0.1:45003")
+
+	// Reserve the relay port so the announcer's first attempt lands on a
+	// closed socket, then free it and start the real relay mid-run.
+	hold, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	relayAddr := hold.LocalAddr().String()
+
+	ann, err := NewAnnouncer(infoHash, carrier, []string{relayAddr})
+	if err != nil {
+		t.Fatalf("NewAnnouncer: %v", err)
+	}
+	t.Cleanup(ann.Close)
+	ann.retryInterval = 300 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	go func() { ann.Run(ctx) }()
+
+	// First announce attempts hit the held-but-silent socket, fail as
+	// no-contact, and schedule a retry. Give that one round time, then
+	// swap in the real relay.
+	time.Sleep(2 * time.Second)
+	hold.Close()
+	_, portStr, _ := net.SplitHostPort(relayAddr)
+	p, _ := strconv.Atoi(portStr)
+	relaySrv := newRelayAt(t, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: p})
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		stored := relaySrv.PeerStore().GetPeers(metainfo.Hash(infoHash))
+		if len(stored) > 0 {
+			return // recovered strictly via retry, no restart needed
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatal("Run never announced after the relay came up")
 }

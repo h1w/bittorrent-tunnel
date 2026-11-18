@@ -9,7 +9,6 @@ import (
 	"time"
 
 	anadht "github.com/anacrolix/dht/v2"
-	"github.com/anacrolix/go-utp/purego"
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/config"
@@ -68,7 +67,6 @@ func tcpEcho(t *testing.T) string {
 // BitTorrent carrier with AWG inside, and an app's SOCKS5 CONNECT reaches an
 // echo through the chained egress.
 func TestClientFullFlow(t *testing.T) {
-	purego.MatrixDisableNagle = true
 	relay := newRelay(t)
 
 	// Hub with one registered client.

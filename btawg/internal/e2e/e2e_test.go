@@ -9,7 +9,6 @@ import (
 	"time"
 
 	anadht "github.com/anacrolix/dht/v2"
-	"github.com/anacrolix/go-utp/purego"
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/client"
@@ -105,7 +104,6 @@ func clientConfigFor(srv *server.Server, rec *store.ClientRecord, relay, ip stri
 // internet egress via each client's SOCKS5 (TCP CONNECT and UDP ASSOCIATE)
 // and client-to-client reachability through the hub's forwarding.
 func TestEndToEndSocksAndLan(t *testing.T) {
-	purego.MatrixDisableNagle = true
 	relay := newRelay(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)

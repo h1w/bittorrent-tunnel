@@ -29,6 +29,10 @@ import (
 	"bittorrent-tunnel/btawg/internal/socks"
 )
 
+// Real-time traffic must not wait on µTP's Nagle-like holdback: set the
+// global send policy once, before any goroutine can race on it.
+func init() { purego.MatrixDisableNagle = true }
+
 // retryDelay spaces carrier reconnect attempts.
 const retryDelay = 3 * time.Second
 
@@ -237,7 +241,6 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 	var conn net.Conn
 	switch c.cfg.Transport {
 	case "ext-utp", "req-utp":
-		purego.MatrixDisableNagle = true
 		pc, err := net.ListenUDP("udp4", nil)
 		if err != nil {
 			return nil, fmt.Errorf("carrier udp: %w", err)
