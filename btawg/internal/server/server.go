@@ -53,6 +53,8 @@ type Server struct {
 	byPeerID map[string]store.ClientRecord
 	attached map[string]int // client IP -> carrier count
 
+	policy *policySnapshot
+
 	udpPC    net.PacketConn
 	sock     utp.Socket
 	tcpLn    net.Listener
@@ -103,6 +105,11 @@ func New(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 		byPeerID: make(map[string]store.ClientRecord),
 		attached: make(map[string]int),
 		closed:   make(chan struct{}),
+	}
+
+	s.policy = newPolicySnapshot()
+	if err := s.policy.reload(st, serverIP); err != nil {
+		return nil, fmt.Errorf("load policy: %w", err)
 	}
 
 	clients, err := st.ListClients()
@@ -198,8 +205,13 @@ func (s *Server) PubKey() string { return s.pubKey }
 // Config returns the active server configuration.
 func (s *Server) Config() config.ServerConfig { return s.cfg }
 
-// OverlayNet exposes the hub's userspace network stack for the panel and
-// diagnostics.
+// ReloadPolicy re-reads the current client records from the store into the
+// in-memory policy snapshot.
+func (s *Server) ReloadPolicy() error {
+	return s.policy.reload(s.st, netip.MustParseAddr(s.cfg.ServerIP))
+}
+
+// OverlayNet exposes the hub's userspace network stack for the panel and diagnostics.
 func (s *Server) OverlayNet() *netstack.Net { return s.ns }
 
 // Run serves the carrier listener and the egress SOCKS5 until ctx is done.
