@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"golang.org/x/crypto/bcrypt"
@@ -26,8 +27,8 @@ func main() {
 	transport := flag.String("transport", "", "override carrier transport (ext-utp|ext-tcp|req-utp|req-tcp)")
 	carrierPort := flag.Int("carrier-port", 0, "override carrier listen port")
 	externalIP := flag.String("external-ip", "", "override announced IP (autodetect if empty)")
+	dhtBootstrap := flag.String("dht-bootstrap", "", "override DHT bootstrap nodes, comma-separated host:port (default: public)")
 	flag.Parse()
-
 	st, err := store.Open(*storePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "btawg-server: open store: %v\n", err)
@@ -56,6 +57,26 @@ func main() {
 		os.Exit(1)
 	}
 	defer srv.Close()
+	if *dhtBootstrap != "" {
+		srv.SetDHTBootstrap(strings.Split(*dhtBootstrap, ","))
+	}
+	// New generates and persists the first-boot identity into the store;
+	// reload so the save below (admin password) carries the identity too,
+	// then re-apply the per-run CLI overrides.
+	cfg, err = st.LoadServerConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "btawg-server: reload config: %v\n", err)
+		os.Exit(1)
+	}
+	if *transport != "" {
+		cfg.Transport = *transport
+	}
+	if *carrierPort != 0 {
+		cfg.CarrierPort = *carrierPort
+	}
+	if *externalIP != "" {
+		cfg.ExternalIP = *externalIP
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
