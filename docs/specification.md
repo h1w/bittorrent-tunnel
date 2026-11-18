@@ -131,3 +131,11 @@ Full/split tunnel, DNS внутри полного туннеля. IPv6 либо
 - https://github.com/danoctavian/bit-smuggler — Problems и Protocols
 - https://github.com/ntop/nDPI/blob/dev/src/lib/protocols/bittorrent.c
 - https://www.wireguard.com/#cryptokey-routing
+
+## Реализация MVP (2026-11-18)
+
+MVP собран и проверен: `btawg/` (два бинарника, 11 пакетов, все тесты зелёные
+включая -race; e2e: DHT-обнаружение, SOCKS5-egress TCP+UDP, клиент↔клиент).
+Статус, запуск и честные ограничения: `btawg/README.md`. План и решения:
+`docs/superpowers/plans/2026-11-18-btawg-mvp.md`,
+`docs/superpowers/specs/2026-11-18-btawg-mvp-design.md`.
