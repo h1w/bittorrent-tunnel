@@ -19,6 +19,7 @@ func TestServerReloadPolicy(t *testing.T) {
 
 	cfg := config.DefaultServerConfig()
 	cfg.ServerIP = "10.77.0.1"
+	cfg.CarrierPort = 17778 // uncommon port; avoid fixed 6881 contention in parallel runs
 
 	aPriv, aPub, err := awg.GenerateKeyPair()
 	if err != nil {
