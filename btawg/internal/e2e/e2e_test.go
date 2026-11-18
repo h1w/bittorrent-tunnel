@@ -188,6 +188,26 @@ func TestEndToEndSocksAndLan(t *testing.T) {
 	}
 	conn.Close()
 
+	// --- Domain egress: a CONNECT carrying a hostname must resolve at the
+	// hub (DNS-at-hub), never on the client.
+	_, echoPort, _ := net.SplitHostPort(echoAddr)
+	dconn, err := app.Dial(ctx, "tcp", "localhost:"+echoPort)
+	if err != nil {
+		t.Fatalf("domain egress dial: %v", err)
+	}
+	defer dconn.Close()
+	if _, err := dconn.Write([]byte("byname")); err != nil {
+		t.Fatalf("domain egress write: %v", err)
+	}
+	dconn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	dbuf := make([]byte, len("byname"))
+	if _, err := readFull(dconn, dbuf); err != nil {
+		t.Fatalf("domain egress read: %v", err)
+	}
+	if string(dbuf) != "byname" {
+		t.Fatalf("domain egress echo = %q", dbuf)
+	}
+
 	// --- Internet egress via client B's SOCKS5: UDP ASSOCIATE through the chain.
 	udp := udpEcho(t)
 	pc, err := socks.NewClient(socksB).DialUDP(ctx)

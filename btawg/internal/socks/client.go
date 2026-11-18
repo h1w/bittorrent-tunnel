@@ -109,7 +109,13 @@ func handshake(conn net.Conn, cmd byte, addr string) error {
 		req = append(req, atypIPv6)
 		req = append(req, ip.To16()...)
 	} else {
-		return fmt.Errorf("socks chain requires IP destinations, got %q", host)
+		// A domain is forwarded as-is: the remote server resolves it, so
+		// the client never leaks a DNS query.
+		if len(host) > 255 {
+			return fmt.Errorf("socks domain too long: %d", len(host))
+		}
+		req = append(req, atypDomain, byte(len(host)))
+		req = append(req, host...)
 	}
 	var p [2]byte
 	binary.BigEndian.PutUint16(p[:], port)

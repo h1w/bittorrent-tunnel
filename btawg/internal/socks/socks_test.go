@@ -157,6 +157,63 @@ func TestChainedConnectRoundTrip(t *testing.T) {
 	}
 }
 
+func TestChainedConnectDomainTarget(t *testing.T) {
+	// A domain target must survive the whole chain: the app sends
+	// ATYP=domain, the egress receives the domain unresolved and resolves
+	// it itself (DNS-at-hub; the client never queries a resolver).
+	var dialed []string
+	egressLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	egress := NewServer(
+		func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialed = append(dialed, addr)
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
+		},
+		func(ctx context.Context) (net.PacketConn, error) {
+			return net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+		},
+	)
+	go egress.Serve(ctx, egressLn)
+	chain := NewClient(egressLn.Addr().String())
+
+	localLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	local := NewServer(chain.Dial, nil)
+	go local.Serve(ctx, localLn)
+
+	echo := tcpEcho(t)
+	_, port, _ := net.SplitHostPort(echo)
+	domainTarget := "localhost:" + port
+
+	app := NewClient(localLn.Addr().String())
+	conn, err := app.Dial(context.Background(), "tcp", domainTarget)
+	if err != nil {
+		t.Fatalf("app Dial domain: %v", err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("dom")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	got := make([]byte, 3)
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "dom" {
+		t.Fatalf("echo = %q, want dom", got)
+	}
+	if len(dialed) == 0 || dialed[0] != domainTarget {
+		t.Fatalf("egress dialed %v, want the unresolved domain %q", dialed, domainTarget)
+	}
+}
+
 func TestNoAuthMethods(t *testing.T) {
 	remote := startEgress(t)
 	c, err := net.Dial("tcp", remote)

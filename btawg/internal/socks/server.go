@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -97,7 +98,7 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 	}
 }
 
-func (s *Server) handleConnect(ctx context.Context, c net.Conn, dst net.Addr) {
+func (s *Server) handleConnect(ctx context.Context, c net.Conn, dst target) {
 	upstream, err := s.dial(ctx, "tcp", dst.String())
 	if err != nil {
 		writeReply(c, replyHostUnreachable)
@@ -119,7 +120,7 @@ func (s *Server) handleConnect(ctx context.Context, c net.Conn, dst net.Addr) {
 	<-done
 }
 
-func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ net.Addr) {
+func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ target) {
 	relay, err := s.relayUDP(c.LocalAddr())
 	if err != nil {
 		writeReply(c, replyGeneralFailure)
@@ -224,53 +225,72 @@ const (
 	replyHostUnreachable    = 0x04
 	replyCommandUnsupported = 0x07
 	atypIPv4                = 0x01
+	atypDomain              = 0x03
 	atypIPv6                = 0x04
 )
 
 // request is one parsed SOCKS5 request.
 type request struct {
 	cmd byte
-	dst net.Addr
+	dst target
 }
 
-func readRequest(c net.Conn) (byte, net.Addr, error) {
+// target is the parsed destination of a SOCKS5 request: an IP or a domain
+// plus a port. String is the host:port form the dialer receives.
+type target struct {
+	host string
+	port int
+}
+
+func (t target) String() string { return net.JoinHostPort(t.host, strconv.Itoa(t.port)) }
+func readRequest(c net.Conn) (byte, target, error) {
 	var head [4]byte
 	if _, err := io.ReadFull(c, head[:]); err != nil {
-		return 0, nil, err
+		return 0, target{}, err
 	}
 	if head[0] != socksVersion {
-		return 0, nil, fmt.Errorf("bad SOCKS version %d", head[0])
+		return 0, target{}, fmt.Errorf("bad SOCKS version %d", head[0])
 	}
-	addr, err := readAddr(c, head[3])
+	host, err := readAddr(c, head[3])
 	if err != nil {
-		return 0, nil, err
+		return 0, target{}, err
 	}
 	var portBuf [2]byte
 	if _, err := io.ReadFull(c, portBuf[:]); err != nil {
-		return 0, nil, err
+		return 0, target{}, err
 	}
 	port := binary.BigEndian.Uint16(portBuf[:])
-	dst := &net.TCPAddr{IP: addr, Port: int(port)}
-	return head[1], dst, nil
+	return head[1], target{host: host, port: int(port)}, nil
 }
 
-// readAddr reads a SOCKS5 address field following the given ATYP.
-func readAddr(c net.Conn, atyp byte) (net.IP, error) {
+// readAddr reads a SOCKS5 address field following the given ATYP and returns
+// it as a host string: IP text, or the domain itself.
+func readAddr(c net.Conn, atyp byte) (string, error) {
 	switch atyp {
 	case atypIPv4:
 		var ip [4]byte
 		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return nil, err
+			return "", err
 		}
-		return ip[:], nil
+		return net.IP(ip[:]).String(), nil
 	case atypIPv6:
 		var ip [16]byte
 		if _, err := io.ReadFull(c, ip[:]); err != nil {
-			return nil, err
+			return "", err
 		}
-		return ip[:], nil
+		return net.IP(ip[:]).String(), nil
+	case atypDomain:
+		var lenBuf [1]byte
+		if _, err := io.ReadFull(c, lenBuf[:]); err != nil {
+			return "", err
+		}
+		name := make([]byte, lenBuf[0])
+		if _, err := io.ReadFull(c, name); err != nil {
+			return "", err
+		}
+		return string(name), nil
 	default:
-		return nil, fmt.Errorf("unsupported ATYP %d", atyp)
+		return "", fmt.Errorf("unsupported ATYP %d", atyp)
 	}
 }
 
