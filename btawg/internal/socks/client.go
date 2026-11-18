@@ -186,8 +186,8 @@ func udpAssociate(conn net.Conn) (*net.UDPAddr, error) {
 // unwraps inbound datagrams. Closing it tears down the control connection.
 type udpChain struct {
 	pc   net.PacketConn
-	dst   *net.UDPAddr
-	ctrl  net.Conn
+	dst  *net.UDPAddr
+	ctrl net.Conn
 }
 
 func (u *udpChain) WriteTo(b []byte, addr net.Addr) (int, error) {
@@ -212,7 +212,7 @@ func (u *udpChain) ReadFrom(b []byte) (int, net.Addr, error) {
 	return len(data), src, nil
 }
 
-func (u *udpChain) LocalAddr() net.Addr                { return u.pc.LocalAddr() }
+func (u *udpChain) LocalAddr() net.Addr { return u.pc.LocalAddr() }
 func (u *udpChain) Close() error {
 	u.pc.Close()
 	return u.ctrl.Close()

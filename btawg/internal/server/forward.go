@@ -105,11 +105,11 @@ func (f *forwardingTun) Write(bufs [][]byte, offset int) (int, error) {
 	return len(bufs), nil
 }
 
-func (f *forwardingTun) MTU() (int, error)          { return f.inner.MTU() }
-func (f *forwardingTun) Name() (string, error)     { return f.inner.Name() }
-func (f *forwardingTun) Events() <-chan tun.Event   { return f.inner.Events() }
-func (f *forwardingTun) File() *os.File             { return f.inner.File() }
-func (f *forwardingTun) BatchSize() int            { return 1 }
+func (f *forwardingTun) MTU() (int, error)        { return f.inner.MTU() }
+func (f *forwardingTun) Name() (string, error)    { return f.inner.Name() }
+func (f *forwardingTun) Events() <-chan tun.Event { return f.inner.Events() }
+func (f *forwardingTun) File() *os.File           { return f.inner.File() }
+func (f *forwardingTun) BatchSize() int           { return 1 }
 func (f *forwardingTun) Close() error {
 	f.once.Do(func() { close(f.closed) })
 	return f.inner.Close()

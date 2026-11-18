@@ -254,6 +254,7 @@ func (s *Server) Run(ctx context.Context) error {
 
 // Announce publishes the carrier address in the DHT until ctx is done.
 func (s *Server) Announce(ctx context.Context) error { return s.ann.Run(ctx) }
+
 // acceptConn performs the BitTorrent handshake inside the carrier
 // constructor, identifies the client by the returned peer ID, and attaches
 // the carrier to the AWG bind under the client's overlay endpoint.
@@ -378,4 +379,3 @@ func (s *Server) closeAll() error {
 func (s *Server) SetDHTBootstrap(hosts []string) {
 	s.ann.SetBootstrap(hosts)
 }
-

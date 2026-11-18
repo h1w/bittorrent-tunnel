@@ -72,7 +72,9 @@ func New(cfg config.ClientConfig) (*Client, error) {
 		return ns.DialContextTCPAddrPort(ctx, ap)
 	}
 	c.chainUDP = func(ctx context.Context) (net.PacketConn, error) {
-		return ns.ListenUDPAddrPort(netip.MustParseAddrPort("0.0.0.0:0"))
+		// Bind the client's overlay address: an unspecified-source socket
+		// gets "no route to host" in the netstack on WriteTo.
+		return ns.ListenUDPAddrPort(netip.AddrPortFrom(clientIP, 0))
 	}
 	return c, nil
 }
@@ -103,10 +105,6 @@ func (c *Client) start(tunDev tun.Device) error {
 		c.dev.Close()
 		return fmt.Errorf("client IpcSet: %w", err)
 	}
-	if err := c.dev.Up(); err != nil {
-		c.dev.Close()
-		return fmt.Errorf("client up: %w", err)
-	}
 	infoHash, err := awg.InfoHashBytes(c.cfg.InfoHash)
 	if err != nil {
 		c.dev.Close()
@@ -130,6 +128,29 @@ func (c *Client) SetDiscovery(fn func(ctx context.Context) ([]netip.AddrPort, er
 func (c *Client) SocksAddr() string {
 	s, _ := c.socksAddr.Load().(string)
 	return s
+}
+
+// OverlayDialTCP dials a TCP address inside the overlay — another client's
+// address or the hub. This is the client-to-client path: packets route
+// through the tunnel and the hub forwards them between carriers; SOCKS5 and
+// the egress are never involved.
+func (c *Client) OverlayDialTCP(ctx context.Context, addr netip.AddrPort) (net.Conn, error) {
+	if c.ns != nil {
+		return c.ns.DialContextTCPAddrPort(ctx, addr)
+	}
+	// Real-TUN mode: the kernel routes overlay addresses via the interface.
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr.String())
+}
+
+// OverlayListenTCP starts a TCP listener inside the client's overlay
+// netstack (netstack mode only): other clients reach it at ClientIP:port
+// through the hub's forwarding — the "local network among clients".
+func (c *Client) OverlayListenTCP(port uint16) (net.Listener, error) {
+	if c.ns == nil {
+		return nil, fmt.Errorf("overlay listener requires netstack mode")
+	}
+	return c.ns.ListenTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(c.cfg.ClientIP), port))
 }
 
 // Run serves the local SOCKS5 and keeps a carrier connection to the hub

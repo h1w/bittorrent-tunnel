@@ -216,15 +216,15 @@ func serveGreeting(c net.Conn) bool {
 }
 
 const (
-	socksVersion     = 5
-	cmdConnect       = 0x01
-	cmdUDPAssociate  = 0x03
-	replySucceeded   = 0x00
-	replyGeneralFailure = 0x01
-	replyHostUnreachable = 0x04
+	socksVersion            = 5
+	cmdConnect              = 0x01
+	cmdUDPAssociate         = 0x03
+	replySucceeded          = 0x00
+	replyGeneralFailure     = 0x01
+	replyHostUnreachable    = 0x04
 	replyCommandUnsupported = 0x07
-	atypIPv4         = 0x01
-	atypIPv6         = 0x04
+	atypIPv4                = 0x01
+	atypIPv6                = 0x04
 )
 
 // request is one parsed SOCKS5 request.
