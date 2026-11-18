@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	bolt "go.etcd.io/bbolt"
+
 	"bittorrent-tunnel/btawg/internal/config"
 )
 
@@ -20,7 +22,7 @@ func testStore(t *testing.T) *Store {
 }
 
 func client(id, ip, peerID string) ClientRecord {
-	return ClientRecord{ID: id, Name: "client-" + id, PubKey: id + "pub", PrivKey: id + "priv", IP: ip, PeerID: peerID, Created: time.Unix(1, 0)}
+	return ClientRecord{ID: id, Name: "client-" + id, PubKey: id + "pub", PrivKey: id + "priv", IP: ip, PeerID: peerID, Created: time.Unix(1, 0), VisiblePeers: []string{"*"}}
 }
 
 func TestServerConfigRoundTrip(t *testing.T) {
@@ -109,5 +111,79 @@ func TestCreateRejectsDuplicateIP(t *testing.T) {
 	}
 	if _, err := s.GetClient("id-b"); !errors.Is(err, ErrNotFound) {
 		t.Fatal("rejected client id-b was stored")
+	}
+}
+
+func TestPolicyFieldsRoundTripAndLegacyDefaults(t *testing.T) {
+	s := testStore(t)
+
+	// Round-trip: policy fields survive CreateClient/GetClient.
+	want := client("id-policy", "10.77.0.5", "peerid-policy")
+	want.NoInternet = true
+	want.VisiblePeers = []string{"c2"}
+	if err := s.CreateClient(want); err != nil {
+		t.Fatalf("CreateClient: %v", err)
+	}
+	got, err := s.GetClient(want.ID)
+	if err != nil {
+		t.Fatalf("GetClient: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("policy round trip mismatch:\n got %+v\nwant %+v", got, want)
+	}
+
+	// Round-trip: an explicit empty VisiblePeers slice means "no peers" and
+	// must stay distinct from the nil/legacy "all peers" default.
+	empty := client("id-empty", "10.77.0.6", "peerid-empty")
+	empty.VisiblePeers = []string{}
+	if err := s.CreateClient(empty); err != nil {
+		t.Fatalf("CreateClient empty peers: %v", err)
+	}
+	gotEmpty, err := s.GetClient(empty.ID)
+	if err != nil {
+		t.Fatalf("GetClient empty peers: %v", err)
+	}
+	if gotEmpty.VisiblePeers == nil || len(gotEmpty.VisiblePeers) != 0 {
+		t.Fatalf("empty VisiblePeers round trip = %v, want non-nil zero-length slice", gotEmpty.VisiblePeers)
+	}
+
+	// Legacy record written as raw JSON without the new fields.
+	legacyID := "id-legacy"
+	legacyRaw := []byte(`{"id":"id-legacy","name":"client-legacy","pubkey":"legacypub","privkey":"legacypriv","ip":"10.77.0.9","peer_id":"peerid-legacy","created":"1970-01-01T00:00:01Z","revoked":false}`)
+	if err := s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketClients).Put([]byte(legacyID), legacyRaw)
+	}); err != nil {
+		t.Fatalf("legacy raw write: %v", err)
+	}
+
+	got, err = s.GetClient(legacyID)
+	if err != nil {
+		t.Fatalf("GetClient legacy: %v", err)
+	}
+	if got.NoInternet {
+		t.Errorf("legacy NoInternet = true, want false")
+	}
+	if !reflect.DeepEqual(got.VisiblePeers, []string{"*"}) {
+		t.Errorf("legacy VisiblePeers = %v, want [\"*\"]", got.VisiblePeers)
+	}
+
+	list, err := s.ListClients()
+	if err != nil {
+		t.Fatalf("ListClients: %v", err)
+	}
+	var found bool
+	for _, r := range list {
+		if r.ID == legacyID {
+			found = true
+			if r.NoInternet {
+				t.Errorf("ListClients legacy NoInternet = true, want false")
+			}
+			if !reflect.DeepEqual(r.VisiblePeers, []string{"*"}) {
+				t.Errorf("ListClients legacy VisiblePeers = %v, want [\"*\"]", r.VisiblePeers)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("legacy client not found in ListClients")
 	}
 }

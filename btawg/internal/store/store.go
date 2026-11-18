@@ -30,17 +30,20 @@ var (
 	ErrDuplicatePeerID = errors.New("client peer ID already in use")
 )
 
-// ClientRecord is one deployed client: its AWG key pair, overlay address and
-// the BitTorrent peer ID the server uses to recognize its carrier handshake.
+// ClientRecord is one deployed client: its AWG key pair, overlay address,
+// the BitTorrent peer ID the server uses to recognize its carrier handshake,
+// and the hub-enforced routing policy applied to this client.
 type ClientRecord struct {
-	ID      string    `json:"id"`
-	Name    string    `json:"name"`
-	PubKey  string    `json:"pubkey"`
-	PrivKey string    `json:"privkey"` // secret
-	IP      string    `json:"ip"`
-	PeerID  string    `json:"peer_id"`
-	Created time.Time `json:"created"`
-	Revoked bool      `json:"revoked"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	PubKey       string    `json:"pubkey"`
+	PrivKey      string    `json:"privkey"` // secret
+	IP           string    `json:"ip"`
+	PeerID       string    `json:"peer_id"`
+	Created      time.Time `json:"created"`
+	Revoked      bool      `json:"revoked"`
+	NoInternet   bool      `json:"no_internet"`
+	VisiblePeers []string  `json:"visible_peers"`
 }
 
 // Store wraps the bbolt database.
@@ -133,6 +136,7 @@ func (s *Store) ListClients() ([]ClientRecord, error) {
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return err
 			}
+			normalizeClientRecord(&rec)
 			recs = append(recs, rec)
 			return nil
 		})
@@ -148,7 +152,11 @@ func (s *Store) GetClient(id string) (ClientRecord, error) {
 		if raw == nil {
 			return ErrNotFound
 		}
-		return json.Unmarshal(raw, &rec)
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return err
+		}
+		normalizeClientRecord(&rec)
+		return nil
 	})
 	return rec, err
 }
@@ -165,6 +173,7 @@ func (s *Store) RevokeClient(id string) error {
 		if err := json.Unmarshal(raw, &rec); err != nil {
 			return err
 		}
+		normalizeClientRecord(&rec)
 		rec.Revoked = true
 		return b.Put([]byte(id), mustJSON(rec))
 	})
@@ -186,4 +195,13 @@ func mustJSON(v any) []byte {
 		panic(err)
 	}
 	return b
+}
+
+// normalizeClientRecord applies legacy defaults to records that predate the
+// policy fields. A nil VisiblePeers list means "all peers" (the legacy default);
+// an explicit empty slice means "no peers" and is left untouched.
+func normalizeClientRecord(rec *ClientRecord) {
+	if rec.VisiblePeers == nil {
+		rec.VisiblePeers = []string{"*"}
+	}
 }
