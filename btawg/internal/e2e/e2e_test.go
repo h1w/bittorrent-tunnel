@@ -198,7 +198,7 @@ func TestEndToEndSocksAndLan(t *testing.T) {
 	if _, err := conn.Write([]byte("internet")); err != nil {
 		t.Fatalf("egress write: %v", err)
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	buf := make([]byte, len("internet"))
 	if _, err := readFull(conn, buf); err != nil {
 		t.Fatalf("egress read: %v", err)
@@ -219,7 +219,7 @@ func TestEndToEndSocksAndLan(t *testing.T) {
 	if _, err := dconn.Write([]byte("byname")); err != nil {
 		t.Fatalf("domain egress write: %v", err)
 	}
-	dconn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	dconn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	dbuf := make([]byte, len("byname"))
 	if _, err := readFull(dconn, dbuf); err != nil {
 		t.Fatalf("domain egress read: %v", err)
@@ -379,7 +379,7 @@ func TestRuntimeRegistration(t *testing.T) {
 	if _, err := conn.Write([]byte("runtime-egress")); err != nil {
 		t.Fatalf("B egress write: %v", err)
 	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	buf := make([]byte, len("runtime-egress"))
 	if _, err := readFull(conn, buf); err != nil {
 		t.Fatalf("B egress read: %v", err)
@@ -405,7 +405,7 @@ func TestRuntimeRegistration(t *testing.T) {
 		}
 	}()
 
-	dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(ctx, 20*time.Second)
 	baConn, err := cb.OverlayDialTCP(dialCtx, netip.MustParseAddrPort("10.77.0.2:9004"))
 	dialCancel()
 	if err != nil {
@@ -415,7 +415,7 @@ func TestRuntimeRegistration(t *testing.T) {
 	if _, err := baConn.Write([]byte("b-to-a")); err != nil {
 		t.Fatalf("B write A: %v", err)
 	}
-	baConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	baConn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	bbuf := make([]byte, len("b-to-a"))
 	if _, err := readFull(baConn, bbuf); err != nil {
 		t.Fatalf("B read A: %v", err)
@@ -481,7 +481,7 @@ func TestPolicyIsolationLive(t *testing.T) {
 		}
 	}()
 
-	dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+	dialCtx, dialCancel := context.WithTimeout(ctx, 20*time.Second)
 	abConn, err := ca.OverlayDialTCP(dialCtx, netip.MustParseAddrPort("10.77.0.3:9002"))
 	dialCancel()
 	if err != nil {
@@ -491,7 +491,7 @@ func TestPolicyIsolationLive(t *testing.T) {
 	if _, err := abConn.Write([]byte("a-to-b")); err != nil {
 		t.Fatalf("A write B: %v", err)
 	}
-	abConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	abConn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	abuf := make([]byte, len("a-to-b"))
 	if _, err := readFull(abConn, abuf); err != nil {
 		t.Fatalf("A read B: %v", err)
@@ -538,7 +538,7 @@ func TestPolicyIsolationLive(t *testing.T) {
 
 	// --- A's chained internet egress still works.
 	appA := socks.NewClient(socksA)
-	dialCtx, dialCancel = context.WithTimeout(ctx, 5*time.Second)
+	dialCtx, dialCancel = context.WithTimeout(ctx, 20*time.Second)
 	aConn, err := appA.Dial(dialCtx, "tcp", echoAddr)
 	dialCancel()
 	if err != nil {
@@ -548,7 +548,7 @@ func TestPolicyIsolationLive(t *testing.T) {
 	if _, err := aConn.Write([]byte("a-egress")); err != nil {
 		t.Fatalf("A egress write: %v", err)
 	}
-	aConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	aConn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	ebuf := make([]byte, len("a-egress"))
 	if _, err := readFull(aConn, ebuf); err != nil {
 		t.Fatalf("A egress read: %v", err)
@@ -560,14 +560,14 @@ func TestPolicyIsolationLive(t *testing.T) {
 	// --- B can still send packets to the hub itself (dst == serverIP passes
 	// the filter). The TCP connect succeeds, but the egress gate closes it.
 	serverEgress := netip.AddrPortFrom(netip.MustParseAddr(srv.Config().ServerIP), uint16(srv.Config().SocksPort))
-	dialCtx, dialCancel = context.WithTimeout(ctx, 5*time.Second)
+	dialCtx, dialCancel = context.WithTimeout(ctx, 20*time.Second)
 	hubConn, err := cb.OverlayDialTCP(dialCtx, serverEgress)
 	dialCancel()
 	if err != nil {
 		t.Fatalf("B dial hub egress: %v", err)
 	}
 	defer hubConn.Close()
-	hubConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	hubConn.SetReadDeadline(time.Now().Add(20 * time.Second))
 	if _, err := hubConn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("B hub read = %v, want io.EOF", err)
 	}

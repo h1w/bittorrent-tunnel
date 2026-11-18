@@ -25,6 +25,16 @@ func client(id, ip, peerID string) ClientRecord {
 	return ClientRecord{ID: id, Name: "client-" + id, PubKey: id + "pub", PrivKey: id + "priv", IP: ip, PeerID: peerID, Created: time.Unix(1, 0), VisiblePeers: []string{"*"}}
 }
 
+// canon makes a record comparable after a store round-trip: a time.Time
+// that went through JSON unmarshalling carries a nil location while
+// time.Unix carries Local, and reflect.DeepEqual on that is TZ-dependent
+// (fails under TZ=UTC). Normalizing both sides to UTC keeps the whole
+// suite runnable in any timezone.
+func canon(r ClientRecord) ClientRecord {
+	r.Created = r.Created.UTC()
+	return r
+}
+
 func TestServerConfigRoundTrip(t *testing.T) {
 	s := testStore(t)
 	def, err := s.LoadServerConfig()
@@ -63,14 +73,14 @@ func TestClientCRUD(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListClients: %v", err)
 	}
-	if len(list) != 2 || !reflect.DeepEqual(list[0], a) || !reflect.DeepEqual(list[1], b) {
+	if len(list) != 2 || !reflect.DeepEqual(canon(list[0]), canon(a)) || !reflect.DeepEqual(canon(list[1]), canon(b)) {
 		t.Fatalf("ListClients = %+v, want [a b]", list)
 	}
 	got, err := s.GetClient("id-a")
 	if err != nil {
 		t.Fatalf("GetClient: %v", err)
 	}
-	if !reflect.DeepEqual(got, a) {
+	if !reflect.DeepEqual(canon(got), canon(a)) {
 		t.Fatalf("GetClient = %+v, want %+v", got, a)
 	}
 	if err := s.RevokeClient("id-a"); err != nil {
@@ -128,7 +138,7 @@ func TestPolicyFieldsRoundTripAndLegacyDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetClient: %v", err)
 	}
-	if !reflect.DeepEqual(got, want) {
+	if !reflect.DeepEqual(canon(got), canon(want)) {
 		t.Fatalf("policy round trip mismatch:\n got %+v\nwant %+v", got, want)
 	}
 
