@@ -1,9 +1,12 @@
 # btawg: routing policy, TUN on both sides, camouflage apply — design
 
-> Status: implemented and verified in branch `btawg-routing-policy`
-> (commits `998d368`..`ecf8840` plus Task 8 docs/live run). The live runtime
-> verification on the non-root dev host uses `-no-tun`; hub real-TUN mode is
-> covered by the root-gated `internal/tunsetup` unit tests and design review.
+> Status: enforcement completed in branch `btawg-routing-policy` after the
+> final whole-branch review. The review found and fixed four integration gaps:
+> UDP relay source-locking, real-TUN egress overlay-subnet refusal, runtime
+> policy snapshot updates for register/revoke, and panel peer-selection
+> semantics for isolated clients. The live runtime verification on the
+> non-root dev host uses `-no-tun`; hub real-TUN mode is covered by the
+> root-gated `internal/tunsetup` unit tests and design review.
 
 ## Intent
 
@@ -38,21 +41,23 @@ Owner requirements (conversation, 2026-11-18):
 
 ### Policy model (store + enforcement)
 
-`ClientRecord` gains two fields:
+`ClientRecord` stores the policy as:
 
 ```go
-Internet      bool     `json:"internet"`       // default true
-VisiblePeers  []string `json:"visible_peers"`  // client IDs; ["*"] = all
+NoInternet   bool     `json:"no_internet"`   // false = internet allowed
+VisiblePeers []string `json:"visible_peers"` // nil or ["*"] = all peers, [] = nobody
 ```
 
-Records predating the fields (missing/empty list) read as `internet: true`,
-`visible_peers: ["*"]` — existing deployments keep today's behavior.
+Records predating the fields (missing list) read as `no_internet: false`,
+`visible_peers: ["*"]` — existing deployments keep today's open behavior. An
+explicit empty slice means the client sees **no peers**.
 
 Rules, evaluated on the hub:
 
-- **Client A→client B** allowed iff A can see B (A.list is `*` or contains B)
-  **and** B can see A (mutual, matching "клиент 1 к клиенту 2 и обратно").
-- **Client A→internet** allowed iff `A.internet`.
+- **Client A→client B** allowed iff A can see B (`VisiblePeers` is `["*"]` or
+  contains B's ID) **and** B can see A (mutual, matching
+  "клиент 1 к клиенту 2 и обратно").
+- **Client A→internet** allowed iff `!A.NoInternet`.
 - **Client→hub host (10.77.0.1)** always allowed: the hub is the router and a
 Enforcement lives entirely on the hub (all client traffic physically transits
 it; AWG crypto means clients cannot bypass):
@@ -68,8 +73,11 @@ it; AWG crypto means clients cannot bypass):
    the re-injection path would bypass it.
 2. **Egress gate.** The egress SOCKS5 maps `RemoteAddr` (overlay source IP,
    identical in both modes) to a client and closes immediately when that
-   client's `internet` is false. Source `10.77.0.1` (the hub host itself) is
-   exempt; unknown source IPs are denied (fail closed).
+   client's `NoInternet` is true. Source `10.77.0.1` (the hub host itself) is
+   exempt; unknown source IPs are denied (fail closed). The egress dialers
+   also refuse destinations inside the overlay subnet, so a hostname that
+   resolves to an overlay client's IP cannot bypass the mutual-visibility
+   policy.
 3. **Live reload wiring.** The panel's `Registry` interface gains
    `ReloadPolicy()`; `Server.ReloadPolicy()` re-reads the store into the
    snapshot. `POST /clients/policy` saves the record and calls it — no
@@ -88,9 +96,10 @@ implementation. Restart creates a fresh TUN device as the client mode
 already does.
 
 The hub holds a mutex-guarded policy snapshot (`IP → record`); legacy records
-missing the new fields normalize to `internet: true`,
+missing the new fields normalize to `no_internet: false`,
 `visible_peers: ["*"]` at load. Import strings never change — policy is not
-in client keys.
+in client keys. An explicit empty `visible_peers` list means the client sees
+nobody.
 
 ### Server TUN mode
 

@@ -27,7 +27,7 @@ type DialUDPFunc func(ctx context.Context) (net.PacketConn, error)
 type Server struct {
 	dial     DialFunc
 	dialUDP  DialUDPFunc
-	relayUDP func(local net.Addr) (net.PacketConn, error)
+	relayUDP func(local, remote net.Addr) (net.PacketConn, error)
 }
 
 // NewServer builds a server whose egress is the given dialers. The
@@ -38,12 +38,14 @@ func NewServer(dial DialFunc, dialUDP DialUDPFunc) *Server {
 	return &Server{
 		dial:     dial,
 		dialUDP:  dialUDP,
-		relayUDP: func(local net.Addr) (net.PacketConn, error) { return listenUDPFor(local) },
+		relayUDP: func(local, remote net.Addr) (net.PacketConn, error) { return listenUDPFor(local) },
 	}
 }
 
-// WithRelayUDP replaces the app-facing UDP relay socket factory.
-func (s *Server) WithRelayUDP(fn func(local net.Addr) (net.PacketConn, error)) *Server {
+// WithRelayUDP replaces the app-facing UDP relay socket factory. The factory
+// receives both the TCP listener's local address and the control connection's
+// remote address so per-association source filtering can be applied.
+func (s *Server) WithRelayUDP(fn func(local, remote net.Addr) (net.PacketConn, error)) *Server {
 	if fn != nil {
 		s.relayUDP = fn
 	}
@@ -121,7 +123,7 @@ func (s *Server) handleConnect(ctx context.Context, c net.Conn, dst target) {
 }
 
 func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ target) {
-	relay, err := s.relayUDP(c.LocalAddr())
+	relay, err := s.relayUDP(c.LocalAddr(), c.RemoteAddr())
 	if err != nil {
 		writeReply(c, replyGeneralFailure)
 		return

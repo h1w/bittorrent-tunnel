@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -30,8 +31,9 @@ func (c *closableConn) Close() error {
 
 // fakeListener returns connections from a channel in order.
 type fakeListener struct {
-	conns chan net.Conn
-	addr  net.Addr
+	conns     chan net.Conn
+	addr      net.Addr
+	closeOnce sync.Once
 }
 
 func newFakeListener(cap int) *fakeListener {
@@ -49,7 +51,10 @@ func (l *fakeListener) Accept() (net.Conn, error) {
 	return c, nil
 }
 
-func (l *fakeListener) Close() error   { close(l.conns); return nil }
+func (l *fakeListener) Close() error {
+	l.closeOnce.Do(func() { close(l.conns) })
+	return nil
+}
 func (l *fakeListener) Addr() net.Addr { return l.addr }
 
 func makePipeConn(remote netip.Addr) *closableConn {

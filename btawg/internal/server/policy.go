@@ -23,6 +23,27 @@ func newPolicySnapshot() *policySnapshot {
 	}
 }
 
+// upsert adds or replaces a single normalized client record in the snapshot.
+// It is used for live runtime registrations without a full store reload.
+func (p *policySnapshot) upsert(rec store.ClientRecord, serverIP netip.Addr) {
+	store.NormalizeClientRecord(&rec)
+	ip, err := netip.ParseAddr(rec.IP)
+	if err != nil {
+		return
+	}
+	p.mu.Lock()
+	p.serverIP = serverIP
+	p.byIP[ip] = rec
+	p.mu.Unlock()
+}
+
+// remove deletes a client record from the snapshot by overlay IP.
+func (p *policySnapshot) remove(ip netip.Addr) {
+	p.mu.Lock()
+	delete(p.byIP, ip)
+	p.mu.Unlock()
+}
+
 // reload rebuilds the snapshot from the current store contents.
 func (p *policySnapshot) reload(st *store.Store, serverIP netip.Addr) error {
 	clients, err := st.ListClients()

@@ -409,6 +409,123 @@ func TestUpdateClientPolicyInternetPresence(t *testing.T) {
 	}
 }
 
+func TestUpdateClientPolicyEmptyPeersIsNobody(t *testing.T) {
+	srv, st, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	id := createClientForTest(t, c, srv.URL, "A")
+
+	csrf := csrfOf(t, c, srv.URL, "/clients")
+	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf": {csrf},
+		"id":   {id},
+		// peers intentionally omitted -> [] (nobody)
+	})
+	if err != nil {
+		t.Fatalf("post policy: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("post policy = %d, want 302", resp.StatusCode)
+	}
+
+	rec, err := st.GetClient(id)
+	if err != nil {
+		t.Fatalf("get client: %v", err)
+	}
+	if len(rec.VisiblePeers) != 0 {
+		t.Fatalf("VisiblePeers = %v, want []", rec.VisiblePeers)
+	}
+
+	// Saving the same record again with no peer selection must preserve isolation.
+	csrf = csrfOf(t, c, srv.URL, "/clients")
+	resp, err = c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf": {csrf},
+		"id":   {id},
+	})
+	if err != nil {
+		t.Fatalf("post policy again: %v", err)
+	}
+	resp.Body.Close()
+	rec, err = st.GetClient(id)
+	if err != nil {
+		t.Fatalf("get client: %v", err)
+	}
+	if len(rec.VisiblePeers) != 0 {
+		t.Fatalf("VisiblePeers after re-save = %v, want []", rec.VisiblePeers)
+	}
+}
+
+func TestUpdateClientPolicyAllOptionIsAll(t *testing.T) {
+	srv, st, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	id := createClientForTest(t, c, srv.URL, "A")
+
+	csrf := csrfOf(t, c, srv.URL, "/clients")
+	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf":  {csrf},
+		"id":    {id},
+		"peers": {"*"},
+	})
+	if err != nil {
+		t.Fatalf("post policy: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("post policy = %d, want 302", resp.StatusCode)
+	}
+
+	rec, err := st.GetClient(id)
+	if err != nil {
+		t.Fatalf("get client: %v", err)
+	}
+	if len(rec.VisiblePeers) != 1 || rec.VisiblePeers[0] != "*" {
+		t.Fatalf("VisiblePeers = %v, want [*]", rec.VisiblePeers)
+	}
+}
+
+func TestUpdateClientPolicyEditInternetKeepsIsolation(t *testing.T) {
+	srv, st, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	id := createClientForTest(t, c, srv.URL, "A")
+
+	// First isolate the client.
+	csrf := csrfOf(t, c, srv.URL, "/clients")
+	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf": {csrf},
+		"id":   {id},
+	})
+	if err != nil {
+		t.Fatalf("isolate: %v", err)
+	}
+	resp.Body.Close()
+
+	// Now edit only the internet checkbox; peers stays unselected.
+	csrf = csrfOf(t, c, srv.URL, "/clients")
+	resp, err = c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf":     {csrf},
+		"id":       {id},
+		"internet": {"on"},
+	})
+	if err != nil {
+		t.Fatalf("enable internet: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("post policy = %d, want 302", resp.StatusCode)
+	}
+
+	rec, err := st.GetClient(id)
+	if err != nil {
+		t.Fatalf("get client: %v", err)
+	}
+	if rec.NoInternet {
+		t.Fatalf("NoInternet = %v, want false", rec.NoInternet)
+	}
+	if len(rec.VisiblePeers) != 0 {
+		t.Fatalf("VisiblePeers = %v, want []", rec.VisiblePeers)
+	}
+}
+
 func TestUpdateClientPolicyUnknownID(t *testing.T) {
 	srv, _, _ := newTestPanel(t)
 	c := login(t, srv.URL)

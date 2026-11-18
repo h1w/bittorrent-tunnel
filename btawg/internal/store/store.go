@@ -136,7 +136,7 @@ func (s *Store) ListClients() ([]ClientRecord, error) {
 			if err := json.Unmarshal(v, &rec); err != nil {
 				return err
 			}
-			normalizeClientRecord(&rec)
+			NormalizeClientRecord(&rec)
 			recs = append(recs, rec)
 			return nil
 		})
@@ -155,7 +155,7 @@ func (s *Store) GetClient(id string) (ClientRecord, error) {
 		if err := json.Unmarshal(raw, &rec); err != nil {
 			return err
 		}
-		normalizeClientRecord(&rec)
+		NormalizeClientRecord(&rec)
 		return nil
 	})
 	return rec, err
@@ -173,7 +173,7 @@ func (s *Store) RevokeClient(id string) error {
 		if err := json.Unmarshal(raw, &rec); err != nil {
 			return err
 		}
-		normalizeClientRecord(&rec)
+		NormalizeClientRecord(&rec)
 		rec.Revoked = true
 		return b.Put([]byte(id), mustJSON(rec))
 	})
@@ -181,7 +181,7 @@ func (s *Store) RevokeClient(id string) error {
 
 // SaveClient persists an updated client record. It rejects unknown IDs.
 func (s *Store) SaveClient(rec ClientRecord) error {
-	normalizeClientRecord(&rec)
+	NormalizeClientRecord(&rec)
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketClients)
 		if b.Get([]byte(rec.ID)) == nil {
@@ -209,10 +209,10 @@ func mustJSON(v any) []byte {
 	return b
 }
 
-// normalizeClientRecord applies legacy defaults to records that predate the
+// NormalizeClientRecord applies legacy defaults to records that predate the
 // policy fields. A nil VisiblePeers list means "all peers" (the legacy default);
 // an explicit empty slice means "no peers" and is left untouched.
-func normalizeClientRecord(rec *ClientRecord) {
+func NormalizeClientRecord(rec *ClientRecord) {
 	if rec.VisiblePeers == nil {
 		rec.VisiblePeers = []string{"*"}
 	}

@@ -120,6 +120,20 @@ func clientConfigFor(srv *server.Server, rec *store.ClientRecord, relay, ip stri
 	}
 }
 
+// waitConnected blocks until the hub reports at least one carrier attached
+// for the given overlay IP.
+func waitConnected(t *testing.T, srv *server.Server, ip string) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.ConnectedCount()[ip] > 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("client %s never attached a carrier", ip)
+}
+
 // waitSocksAddr blocks until the client's local SOCKS5 listener is up.
 func waitSocksAddr(t *testing.T, c *client.Client) string {
 	t.Helper()
@@ -292,12 +306,126 @@ func TestEndToEndSocksAndLan(t *testing.T) {
 	}
 }
 
+// TestRuntimeRegistration proves that a client registered after server.New
+// (the panel create path) is immediately usable: its chained internet egress
+// works and it can reach permitted overlay peers without any restart or
+// explicit policy reload.
+func TestRuntimeRegistration(t *testing.T) {
+	relay := newRelay(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	t.Cleanup(cancel)
+
+	srv, st, recs := hubWithClients(t, ctx, relay, []clientSpec{
+		{id: "e2e-a", ip: "10.77.0.2"},
+	})
+	recA := recs[0]
+
+	// Bring client A online in the normal pre-registered path.
+	ca, err := client.New(clientConfigFor(srv, recA, relay, "10.77.0.2"))
+	if err != nil {
+		t.Fatalf("client a: %v", err)
+	}
+	t.Cleanup(ca.Close)
+	go ca.Run(ctx)
+	_ = waitSocksAddr(t, ca)
+	waitConnected(t, srv, "10.77.0.2")
+
+	// Register client B at runtime, exactly like the panel does.
+	bPriv, bPub, err := awg.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("B key: %v", err)
+	}
+	recB := &store.ClientRecord{
+		ID:      "e2e-b",
+		Name:    "e2e-b",
+		PubKey:  bPub,
+		PrivKey: bPriv,
+		IP:      "10.77.0.3",
+		PeerID:  awg.PeerID(bPub),
+		Created: time.Unix(1, 0),
+	}
+	if err := st.CreateClient(*recB); err != nil {
+		t.Fatalf("create B in store: %v", err)
+	}
+	if err := srv.RegisterClient(*recB); err != nil {
+		t.Fatalf("runtime register B: %v", err)
+	}
+
+	cb, err := client.New(clientConfigFor(srv, recB, relay, "10.77.0.3"))
+	if err != nil {
+		t.Fatalf("client b: %v", err)
+	}
+	t.Cleanup(cb.Close)
+	go cb.Run(ctx)
+	socksB := waitSocksAddr(t, cb)
+	waitConnected(t, srv, "10.77.0.3")
+
+	// B's chained internet egress works immediately.
+	echoAddr := tcpEcho(t)
+	appB := socks.NewClient(socksB)
+	deadline := time.Now().Add(20 * time.Second)
+	var conn net.Conn
+	for conn == nil {
+		dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+		conn, err = appB.Dial(dialCtx, "tcp", echoAddr)
+		dialCancel()
+		if err != nil {
+			if time.Now().After(deadline) {
+				t.Fatalf("B egress dial never succeeded: %v", err)
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+	if _, err := conn.Write([]byte("runtime-egress")); err != nil {
+		t.Fatalf("B egress write: %v", err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, len("runtime-egress"))
+	if _, err := readFull(conn, buf); err != nil {
+		t.Fatalf("B egress read: %v", err)
+	}
+	if string(buf) != "runtime-egress" {
+		t.Fatalf("B egress echo = %q", buf)
+	}
+	conn.Close()
+
+	// B can reach A over the overlay (mutual visibility by default).
+	lanALn, err := ca.OverlayListenTCP(9004)
+	if err != nil {
+		t.Fatalf("A lan listen: %v", err)
+	}
+	defer lanALn.Close()
+	go func() {
+		for {
+			c, err := lanALn.Accept()
+			if err != nil {
+				return
+			}
+			go copyEcho(c)
+		}
+	}()
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
+	baConn, err := cb.OverlayDialTCP(dialCtx, netip.MustParseAddrPort("10.77.0.2:9004"))
+	dialCancel()
+	if err != nil {
+		t.Fatalf("B dial A: %v", err)
+	}
+	defer baConn.Close()
+	if _, err := baConn.Write([]byte("b-to-a")); err != nil {
+		t.Fatalf("B write A: %v", err)
+	}
+	baConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	bbuf := make([]byte, len("b-to-a"))
+	if _, err := readFull(baConn, bbuf); err != nil {
+		t.Fatalf("B read A: %v", err)
+	}
+	if string(bbuf) != "b-to-a" {
+		t.Fatalf("B<->A echo = %q", bbuf)
+	}
+}
+
 // TestPolicyIsolationLive proves hub-enforced routing policy end-to-end:
-//   - visible-peer mutual isolation (A reaches B, A cannot reach C),
-//   - internet gating (B cannot use the egress, A can),
-//   - filter passthrough to the hub itself (B can reach 10.77.0.1, but the
-//     egress gate closes the connection),
-//   - live policy reload without restarting the server (C becomes visible).
 func TestPolicyIsolationLive(t *testing.T) {
 	relay := newRelay(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)

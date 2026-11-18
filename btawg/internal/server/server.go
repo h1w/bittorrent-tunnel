@@ -283,23 +283,33 @@ func (s *Server) Run(ctx context.Context) error {
 		cancel()
 	}()
 
+	prefix := overlayPrefix(s.cfg)
 	egress := socks.NewServer(
-		func(ctx context.Context, network, addr string) (net.Conn, error) {
-			var d net.Dialer
-			return d.DialContext(ctx, network, addr)
-		},
+		newEgressDialer(prefix, net.DefaultResolver),
 		func(ctx context.Context) (net.PacketConn, error) {
-			return net.ListenUDP("udp", nil)
+			return newEgressUDP(prefix)
 		},
-	).WithRelayUDP(func(net.Addr) (net.PacketConn, error) {
+	).WithRelayUDP(func(local, remote net.Addr) (net.PacketConn, error) {
 		// The relay must live inside the overlay. In netstack mode that is a
 		// netstack address; in real-TUN mode the kernel interface owns the
 		// overlay prefix, so bind the relay to it on the host network.
 		serverIP := netip.MustParseAddr(s.cfg.ServerIP)
+		var relay net.PacketConn
+		var err error
 		if s.ns != nil {
-			return s.ns.ListenUDPAddrPort(netip.AddrPortFrom(serverIP, 0))
+			relay, err = s.ns.ListenUDPAddrPort(netip.AddrPortFrom(serverIP, 0))
+		} else {
+			relay, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(serverIP.String())})
 		}
-		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(serverIP.String())})
+		if err != nil {
+			return nil, err
+		}
+		remoteIP, ok := addrIP(remote)
+		if !ok {
+			relay.Close()
+			return nil, fmt.Errorf("relay: cannot parse control remote address %v", remote)
+		}
+		return &sourceLockedRelay{PacketConn: relay, allow: remoteIP}, nil
 	})
 	gated := &gatedListener{inner: s.egressLn, policy: s.policy}
 	go egress.Serve(runCtx, gated)
@@ -380,34 +390,164 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
 	}()
 }
 
-// RegisterClient adds a client at runtime (panel create): AWG peer entry plus
-// carrier routing by peer ID.
+// RegisterClient adds a client at runtime (panel create): AWG peer entry,
+// carrier routing by peer ID, and an in-memory policy snapshot update so the
+// new client is immediately enforceable without a reload or restart.
 func (s *Server) RegisterClient(rec store.ClientRecord) error {
 	if rec.PeerID == "" {
 		rec.PeerID = awg.PeerID(rec.PubKey)
 	}
+	store.NormalizeClientRecord(&rec)
 	if err := s.dev.IpcSet(awg.ServerPeerLine(rec.PubKey, rec.IP)); err != nil {
 		return fmt.Errorf("ipc add peer: %w", err)
 	}
 	s.mu.Lock()
 	s.byPeerID[rec.PeerID] = rec
 	s.mu.Unlock()
+	s.policy.upsert(rec, netip.MustParseAddr(s.cfg.ServerIP))
 	return nil
 }
 
 // RevokeClient removes a client at runtime (panel revoke): the AWG peer is
-// dropped, its carrier detached, and future handshakes from its peer ID are
-// rejected.
+// dropped, its carrier detached, future handshakes from its peer ID are
+// rejected, and the policy snapshot is updated to drop the revoked record.
 func (s *Server) RevokeClient(rec store.ClientRecord) error {
 	ipc := fmt.Sprintf("public_key=%s\nremove=true\n", rec.PubKey)
 	if err := s.dev.IpcSet(ipc); err != nil {
 		return fmt.Errorf("ipc remove peer: %w", err)
 	}
-	s.bd.Detach(bind.Endpoint(netip.MustParseAddr(rec.IP)))
+	ip := netip.MustParseAddr(rec.IP)
+	s.bd.Detach(bind.Endpoint(ip))
 	s.mu.Lock()
 	delete(s.byPeerID, rec.PeerID)
 	s.mu.Unlock()
+	s.policy.remove(ip)
 	return nil
+}
+
+// overlayPrefix returns the hub's overlay subnet (ServerIP/24).
+func overlayPrefix(cfg config.ServerConfig) netip.Prefix {
+	p, err := netip.MustParseAddr(cfg.ServerIP).Prefix(24)
+	if err != nil {
+		// A /24 is always valid for an IPv4 address; panic on programmer error.
+		panic(fmt.Sprintf("overlay prefix: %v", err))
+	}
+	return p
+}
+
+// hostResolver is the minimal resolver surface the egress dialer needs.
+type hostResolver interface {
+	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
+}
+
+// overlayFilteredPacketConn wraps an upstream UDP socket and refuses writes
+// to destinations inside the overlay subnet. SOCKS/egress is internet-only;
+// client-to-client traffic must use the filtered OverlayDialTCP path.
+type overlayFilteredPacketConn struct {
+	net.PacketConn
+	prefix netip.Prefix
+}
+
+func (c *overlayFilteredPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if ip, ok := addrIP(addr); ok && c.prefix.Contains(ip) {
+		return 0, fmt.Errorf("egress refused: UDP destination %v is inside overlay subnet", addr)
+	}
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+// sourceLockedRelay wraps the app-facing UDP relay socket of a single SOCKS5
+// UDP ASSOCIATE. It only accepts datagrams from the overlay IP that opened
+// the TCP control connection; datagrams from any other source are dropped
+// before pumpUDP can forward them upstream. This prevents a malicious or
+// NoInternet client from hijacking another client's UDP relay association.
+type sourceLockedRelay struct {
+	net.PacketConn
+	allow netip.Addr
+}
+
+func (r *sourceLockedRelay) ReadFrom(p []byte) (int, net.Addr, error) {
+	for {
+		n, src, err := r.PacketConn.ReadFrom(p)
+		if err != nil {
+			return n, src, err
+		}
+		ip, ok := addrIP(src)
+		if ok && ip == r.allow {
+			return n, src, nil
+		}
+		// Datagram from an unauthorized source: drop and keep reading.
+	}
+}
+
+// newEgressDialer returns a TCP dialer that refuses overlay destinations.
+// For literal IPs the check is direct; for hostnames it resolves the name and
+// refuses if any returned IP lies inside the overlay subnet. After the check
+// succeeds, the dial uses the resolved address so the guard cannot be bypassed
+// by a name that resolves differently at dial time.
+func newEgressDialer(prefix netip.Prefix, resolver hostResolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, fmt.Errorf("egress: malformed destination %q: %w", addr, err)
+		}
+		dialHost := host
+
+		if ip, err := netip.ParseAddr(host); err == nil {
+			if prefix.Contains(ip) {
+				return nil, fmt.Errorf("egress refused: destination %s is inside overlay subnet", addr)
+			}
+		} else {
+			ips, err := resolver.LookupIP(ctx, "ip", host)
+			if err != nil {
+				return nil, fmt.Errorf("egress: resolve %s: %w", host, err)
+			}
+			var addrs []string
+			for _, ip := range ips {
+				a, ok := netip.AddrFromSlice(ip)
+				if !ok {
+					continue
+				}
+				a = a.Unmap()
+				if prefix.Contains(a) {
+					return nil, fmt.Errorf("egress refused: hostname %s resolved to overlay IP %s", host, a)
+				}
+				addrs = append(addrs, net.JoinHostPort(a.String(), port))
+			}
+			if len(addrs) == 0 {
+				return nil, fmt.Errorf("egress: no usable IP for %s", host)
+			}
+
+			var d net.Dialer
+			var firstErr error
+			for _, addr := range addrs {
+				conn, err := d.DialContext(ctx, network, addr)
+				if err == nil {
+					return conn, nil
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+				}
+			}
+			return nil, firstErr
+		}
+
+		var d net.Dialer
+		return d.DialContext(ctx, network, net.JoinHostPort(dialHost, port))
+	}
+}
+
+// newEgressUDP returns an upstream UDP socket that refuses overlay destinations.
+func newEgressUDP(prefix netip.Prefix) (net.PacketConn, error) {
+	pc, err := net.ListenUDP("udp", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &overlayFilteredPacketConn{PacketConn: pc, prefix: prefix}, nil
 }
 
 // ConnectedCount reports how many carriers are attached per overlay IP.

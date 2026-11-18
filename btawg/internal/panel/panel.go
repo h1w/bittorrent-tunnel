@@ -356,11 +356,14 @@ func (p *Panel) clientPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec.NoInternet = len(r.PostForm["internet"]) == 0
-	peers := r.PostForm["peers"]
-	if len(peers) == 0 || (len(peers) == 1 && peers[0] == "*") {
+	peers, peersPresent := r.PostForm["peers"]
+	switch {
+	case len(peers) == 1 && peers[0] == "*":
 		rec.VisiblePeers = []string{"*"}
-	} else {
+	case peersPresent:
 		rec.VisiblePeers = peers
+	default:
+		rec.VisiblePeers = []string{}
 	}
 
 	if err := p.st.SaveClient(rec); err != nil {
