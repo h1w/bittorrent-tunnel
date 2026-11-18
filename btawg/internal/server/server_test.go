@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -199,5 +200,30 @@ func TestServerClientEcho(t *testing.T) {
 	}
 	if string(buf[:n]) != "ping" {
 		t.Fatalf("echo = %q, want ping", buf[:n])
+	}
+}
+
+// TestNewRealTUNRequiresRoot guards the hub real-TUN constructor. Without root
+// the kernel TUN creation fails; the error must name the requested interface.
+// When running as root the live path is validated manually instead.
+func TestNewRealTUNRequiresRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root: live TUN creation would succeed")
+	}
+	st, err := store.Open(t.TempDir() + "/hub.db")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	cfg := config.DefaultServerConfig()
+	cfg.Transport = "ext-tcp" // avoid carrier UDP setup on this error path
+	tunName := "btawgroot0"
+	_, err = NewRealTUN(cfg, st, tunName)
+	if err == nil {
+		t.Fatal("expected NewRealTUN to fail without root")
+	}
+	if !strings.Contains(err.Error(), tunName) {
+		t.Fatalf("error %q does not name the TUN interface %q", err, tunName)
 	}
 }

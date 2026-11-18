@@ -28,6 +28,8 @@ func main() {
 	carrierPort := flag.Int("carrier-port", 0, "override carrier listen port")
 	externalIP := flag.String("external-ip", "", "override announced IP (autodetect if empty)")
 	dhtBootstrap := flag.String("dht-bootstrap", "", "override DHT bootstrap nodes, comma-separated host:port (default: public)")
+	noTun := flag.Bool("no-tun", false, "userspace netstack mode: no OS interface is created")
+	tunName := flag.String("tun", "btawg0", "TUN interface name in real-TUN mode")
 	flag.Parse()
 	st, err := store.Open(*storePath)
 	if err != nil {
@@ -51,10 +53,19 @@ func main() {
 		cfg.ExternalIP = *externalIP
 	}
 
-	srv, err := server.New(cfg, st)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "btawg-server: %v\n", err)
-		os.Exit(1)
+	var srv *server.Server
+	if *noTun {
+		srv, err = server.New(cfg, st)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "btawg-server: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		srv, err = server.NewRealTUN(cfg, st, *tunName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "btawg-server: tun setup (root required): %v\n", err)
+			os.Exit(1)
+		}
 	}
 	defer srv.Close()
 	if *dhtBootstrap != "" {

@@ -11,13 +11,13 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
 
 	"bittorrent-tunnel/btawg/internal/client"
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
 
 func main() {
@@ -49,7 +49,13 @@ func main() {
 	if *noTun {
 		c, err = client.New(cfg)
 	} else {
-		if err := setupTUN(*tunName, cfg); err != nil {
+		subnet, err := netip.ParsePrefix(cfg.Subnet)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "btawg-client: parse subnet: %v\n", err)
+			os.Exit(1)
+		}
+		addr := netip.PrefixFrom(netip.MustParseAddr(cfg.ClientIP), subnet.Bits())
+		if err := tunsetup.Setup(*tunName, addr, &subnet, 1420, false); err != nil {
 			fmt.Fprintf(os.Stderr, "btawg-client: tun setup (root required): %v\n", err)
 			os.Exit(1)
 		}
@@ -85,38 +91,3 @@ func main() {
 	}
 }
 
-// setupTUN creates the overlay interface: the client's address and the
-// subnet route ONLY — never a default route, so system traffic is untouched
-// and apps opt in through SOCKS5 or the overlay address.
-func setupTUN(name string, cfg config.ClientConfig) error {
-	addr := netip.MustParseAddr(cfg.ClientIP)
-	prefix, err := netip.ParsePrefix(cfg.Subnet)
-	if err != nil {
-		return fmt.Errorf("parse subnet: %w", err)
-	}
-	if run("ip", "addr", "add", cfg.ClientIP+"/"+maskOf(prefix), "dev", name) != nil {
-		// The interface may not exist until the TUN device is opened.
-		if err := run("ip", "tuntap", "add", "dev", name, "mode", "tun"); err != nil {
-			return err
-		}
-		if err := run("ip", "addr", "add", cfg.ClientIP+"/"+maskOf(prefix), "dev", name); err != nil {
-			return err
-		}
-	}
-	if err := run("ip", "link", "set", "dev", name, "up"); err != nil {
-		return err
-	}
-	_ = addr
-	return run("ip", "route", "add", cfg.Subnet, "dev", name)
-}
-
-func maskOf(p netip.Prefix) string {
-	return fmt.Sprintf("%d", p.Bits())
-}
-
-func run(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
