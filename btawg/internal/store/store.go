@@ -179,6 +179,17 @@ func (s *Store) RevokeClient(id string) error {
 	})
 }
 
+// SaveClient persists an updated client record. It rejects unknown IDs.
+func (s *Store) SaveClient(rec ClientRecord) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(bucketClients)
+		if b.Get([]byte(rec.ID)) == nil {
+			return ErrNotFound
+		}
+		return b.Put([]byte(rec.ID), mustJSON(rec))
+	})
+}
+
 // DeleteClient removes a client record permanently.
 func (s *Store) DeleteClient(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {

@@ -26,6 +26,7 @@ import (
 type Registry interface {
 	RegisterClient(store.ClientRecord) error
 	RevokeClient(store.ClientRecord) error
+	ReloadPolicy() error
 	ConnectedCount() map[string]int
 	InfoHash() string
 	PubKey() string
@@ -84,6 +85,7 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("GET /clients", p.auth(p.clientsPage))
 	mux.HandleFunc("POST /clients/create", p.auth(p.clientCreate))
 	mux.HandleFunc("POST /clients/revoke", p.auth(p.clientRevoke))
+	mux.HandleFunc("POST /clients/policy", p.auth(p.clientPolicy))
 	mux.HandleFunc("GET /clients/import", p.auth(p.clientImport))
 	return mux
 }
@@ -343,6 +345,33 @@ func (p *Panel) clientRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Redirect(w, r, "/clients", http.StatusFound)
+}
+
+func (p *Panel) clientPolicy(w http.ResponseWriter, r *http.Request) {
+	id := r.PostFormValue("id")
+	rec, err := p.st.GetClient(id)
+	if err != nil {
+		http.Error(w, "unknown client", http.StatusNotFound)
+		return
+	}
+
+	rec.NoInternet = r.PostFormValue("internet") != "on"
+	peers := r.PostForm["peers"]
+	if len(peers) == 0 || (len(peers) == 1 && peers[0] == "*") {
+		rec.VisiblePeers = []string{"*"}
+	} else {
+		rec.VisiblePeers = peers
+	}
+
+	if err := p.st.SaveClient(rec); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := p.reg.ReloadPolicy(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func (p *Panel) clientImport(w http.ResponseWriter, r *http.Request) {

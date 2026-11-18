@@ -98,6 +98,7 @@ const dashboardTmpl = `{{define "content"}}
 const serverTmpl = `{{define "content"}}
 <h1>Server settings</h1>
 {{if .Saved}}<div class="tag ok">saved — carrier/transport/port changes apply after restart</div>{{end}}
+<div class="note">Settings apply after a server restart; a changed AWG profile requires clients to re-import (import page regenerates strings with the current profile).</div>
 <form method="post" action="/server">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
 <div class="card"><h2>AWG profile (inside BitTorrent)</h2>
@@ -151,11 +152,24 @@ const clientsTmpl = `{{define "content"}}
 </div>
 <div class="card"><h2>Deployed</h2>
 {{if .Clients}}
-<table><tr><th>Name</th><th>Overlay IP</th><th>Status</th><th></th><th></th></tr>
+<table><tr><th>Name</th><th>Overlay IP</th><th>Status</th><th>Policy</th><th></th><th></th></tr>
 {{$cs := .Connected}}
 {{range .Clients}}
 <tr><td>{{.Name}}</td><td>{{.IP}}</td>
 <td>{{if index $cs .IP}}<span class="tag ok">connected</span>{{else if .Revoked}}<span class="tag off">revoked</span>{{else}}<span class="tag off">offline</span>{{end}}</td>
+<td>{{if not .Revoked}}
+<form method="post" action="/clients/policy" style="display:flex;gap:8px;align-items:center">
+<input type="hidden" name="csrf" value="{{$.CSRF}}">
+<input type="hidden" name="id" value="{{.ID}}">
+<label style="white-space:nowrap;font-size:12px;color:var(--muted)"><input type="checkbox" name="internet" value="on" {{if not .NoInternet}}checked{{end}}> internet</label>
+<select name="peers" multiple size="2" style="min-width:120px">
+<option value="*" {{if contains .VisiblePeers "*"}}selected{{end}}>All</option>
+{{$self := .ID}}{{$vp := .VisiblePeers}}
+{{range $.Clients}}{{if ne .ID $self}}<option value="{{.ID}}" {{if contains $vp .ID}}selected{{end}}>{{.Name}}</option>{{end}}{{end}}
+</select>
+<button>Save</button>
+</form>
+{{end}}</td>
 <td><a href="/clients/import?id={{.ID}}">import string</a></td>
 <td>{{if not .Revoked}}<form method="post" action="/clients/revoke" onsubmit="return confirm('Revoke this client?')">
 <input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}">
@@ -182,6 +196,16 @@ var layoutTmpl = template.Must(template.New("layout").Parse(layout))
 var pages = map[string]*template.Template{}
 
 func init() {
+	funcs := template.FuncMap{
+		"contains": func(haystack []string, needle string) bool {
+			for _, s := range haystack {
+				if s == needle {
+					return true
+				}
+			}
+			return false
+		},
+	}
 	for name, body := range map[string]string{
 		"login":     loginTmpl,
 		"dashboard": dashboardTmpl,
@@ -193,6 +217,7 @@ func init() {
 		if err != nil {
 			panic(err)
 		}
+		clone.Funcs(funcs)
 		pages[name] = template.Must(clone.Parse(body))
 	}
 }

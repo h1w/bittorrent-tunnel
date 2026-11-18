@@ -15,8 +15,9 @@ import (
 )
 
 type fakeRegistry struct {
-	registered []store.ClientRecord
-	revoked    []store.ClientRecord
+	registered  []store.ClientRecord
+	revoked     []store.ClientRecord
+	reloadCalls int
 }
 
 func (f *fakeRegistry) RegisterClient(rec store.ClientRecord) error {
@@ -26,6 +27,11 @@ func (f *fakeRegistry) RegisterClient(rec store.ClientRecord) error {
 
 func (f *fakeRegistry) RevokeClient(rec store.ClientRecord) error {
 	f.revoked = append(f.revoked, rec)
+	return nil
+}
+
+func (f *fakeRegistry) ReloadPolicy() error {
+	f.reloadCalls++
 	return nil
 }
 
@@ -311,5 +317,101 @@ func TestCSRFRequired(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("post without csrf = %d, want 403", resp.StatusCode)
+	}
+}
+
+func createClientForTest(t *testing.T, c *http.Client, base, name string) string {
+	t.Helper()
+	csrf := csrfOf(t, c, base, "/clients")
+	resp, err := c.PostForm(base+"/clients/create", map[string][]string{"csrf": {csrf}, "name": {name}})
+	if err != nil {
+		t.Fatalf("create %s: %v", name, err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("create %s = %d, want 302", name, resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	const prefix = "/clients/import?id="
+	if !strings.HasPrefix(loc, prefix) {
+		t.Fatalf("create %s redirect = %q, want import page", name, loc)
+	}
+	return loc[len(prefix):]
+}
+
+func TestUpdateClientPolicy(t *testing.T) {
+	srv, st, reg := newTestPanel(t)
+	c := login(t, srv.URL)
+	idA := createClientForTest(t, c, srv.URL, "A")
+	idB := createClientForTest(t, c, srv.URL, "B")
+
+	csrf := csrfOf(t, c, srv.URL, "/clients")
+	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf":    {csrf},
+		"id":      {idA},
+		"peers":   {idB},
+	})
+	if err != nil {
+		t.Fatalf("post policy: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("post policy = %d, want 302", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != "/" {
+		t.Fatalf("redirect = %q, want /", loc)
+	}
+
+	rec, err := st.GetClient(idA)
+	if err != nil {
+		t.Fatalf("get client: %v", err)
+	}
+	if !rec.NoInternet {
+		t.Fatalf("NoInternet = %v, want true", rec.NoInternet)
+	}
+	if len(rec.VisiblePeers) != 1 || rec.VisiblePeers[0] != idB {
+		t.Fatalf("VisiblePeers = %v, want [%s]", rec.VisiblePeers, idB)
+	}
+	if reg.reloadCalls != 1 {
+		t.Fatalf("ReloadPolicy calls = %d, want 1", reg.reloadCalls)
+	}
+}
+
+func TestUpdateClientPolicyUnknownID(t *testing.T) {
+	srv, _, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	csrf := csrfOf(t, c, srv.URL, "/clients")
+	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf":  {csrf},
+		"id":    {"no-such-client"},
+		"peers": {"*"},
+	})
+	if err != nil {
+		t.Fatalf("post policy: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("post policy unknown id = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestServerPageShowsApplyBanner(t *testing.T) {
+	srv, _, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	resp, err := c.Get(srv.URL + "/server")
+	if err != nil {
+		t.Fatalf("get server: %v", err)
+	}
+	defer resp.Body.Close()
+	pageBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read server page: %v", err)
+	}
+	page := string(pageBytes)
+	if !strings.Contains(page, "restart") {
+		t.Fatalf("server page missing 'restart'; page:\n%s", page)
+	}
+	if !strings.Contains(page, "re-import") {
+		t.Fatalf("server page missing 're-import'; page:\n%s", page)
 	}
 }
