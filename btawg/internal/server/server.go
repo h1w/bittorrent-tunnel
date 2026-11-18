@@ -134,7 +134,8 @@ func New(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 	}
 	s.ns = ns
 	fwd := newForwardingTun(tunDev, serverIP)
-	s.dev = device.NewDevice(fwd, s.bd, device.NewLogger(device.LogLevelError, "btawg-server: "))
+	filtered := &filterTun{inner: fwd, policy: s.policy}
+	s.dev = device.NewDevice(filtered, s.bd, device.NewLogger(device.LogLevelError, "btawg-server: "))
 	ipc := fmt.Sprintf("private_key=%s\n%s%s", cfg.ServerPrivKey, cfg.AWGProfile.String(), peerConf)
 	if err := s.dev.IpcSet(ipc); err != nil {
 		s.dev.Close()
