@@ -187,3 +187,25 @@ func TestPolicyFieldsRoundTripAndLegacyDefaults(t *testing.T) {
 		t.Errorf("legacy client not found in ListClients")
 	}
 }
+
+func TestSaveClientNormalizesNilVisiblePeers(t *testing.T) {
+	s := testStore(t)
+	rec := client("id-save", "10.77.0.10", "peerid-save")
+	if err := s.CreateClient(rec); err != nil {
+		t.Fatalf("CreateClient: %v", err)
+	}
+	rec.VisiblePeers = nil
+	if err := s.SaveClient(rec); err != nil {
+		t.Fatalf("SaveClient: %v", err)
+	}
+	got, err := s.GetClient(rec.ID)
+	if err != nil {
+		t.Fatalf("GetClient: %v", err)
+	}
+	if !reflect.DeepEqual(got.VisiblePeers, []string{"*"}) {
+		t.Fatalf("VisiblePeers = %v, want [\"*\"]", got.VisiblePeers)
+	}
+	if err := s.SaveClient(ClientRecord{ID: "missing"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SaveClient missing = %v, want ErrNotFound", err)
+	}
+}

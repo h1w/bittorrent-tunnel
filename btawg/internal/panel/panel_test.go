@@ -377,6 +377,38 @@ func TestUpdateClientPolicy(t *testing.T) {
 	}
 }
 
+func TestUpdateClientPolicyInternetPresence(t *testing.T) {
+	srv, st, reg := newTestPanel(t)
+	c := login(t, srv.URL)
+	id := createClientForTest(t, c, srv.URL, "A")
+
+	csrf := csrfOf(t, c, srv.URL, "/clients")
+	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
+		"csrf":    {csrf},
+		"id":      {id},
+		"internet": {"1"},
+		"peers":   {"*"},
+	})
+	if err != nil {
+		t.Fatalf("post policy: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("post policy = %d, want 302", resp.StatusCode)
+	}
+
+	rec, err := st.GetClient(id)
+	if err != nil {
+		t.Fatalf("get client: %v", err)
+	}
+	if rec.NoInternet {
+		t.Fatalf("NoInternet = %v, want false when internet field is present", rec.NoInternet)
+	}
+	if reg.reloadCalls != 1 {
+		t.Fatalf("ReloadPolicy calls = %d, want 1", reg.reloadCalls)
+	}
+}
+
 func TestUpdateClientPolicyUnknownID(t *testing.T) {
 	srv, _, _ := newTestPanel(t)
 	c := login(t, srv.URL)

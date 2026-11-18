@@ -355,7 +355,7 @@ func (p *Panel) clientPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rec.NoInternet = r.PostFormValue("internet") != "on"
+	rec.NoInternet = len(r.PostForm["internet"]) == 0
 	peers := r.PostForm["peers"]
 	if len(peers) == 0 || (len(peers) == 1 && peers[0] == "*") {
 		rec.VisiblePeers = []string{"*"}
