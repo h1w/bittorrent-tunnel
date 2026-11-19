@@ -59,8 +59,13 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 WantedBy=multi-user.target
 ```
 
-Firewall: allow **6881/udp** inbound (carrier). Nothing else needs to be
-open — DHT, AWG and panel traffic all ride that socket or stay on loopback.
+Firewall: allow **6881/udp** inbound (carrier) and, when a firewall filters
+per-interface with a drop policy (e.g. `ufw default deny`), also **in on the
+hub's TUN** — `ufw allow in on btawg0`. Overlay packets the AWG device writes
+into the kernel arrive on that interface and never reach the SOCKS egress
+without an allow rule; the symptom is a handshake that completes (keepalives
+flow) while every SOCKS dial times out. Nothing else needs to be open — DHT,
+AWG and panel traffic all ride the carrier socket or stay on loopback.
 
 ### 2. Panel → first client
 

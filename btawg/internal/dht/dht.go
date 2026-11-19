@@ -227,6 +227,16 @@ func Discover(ctx context.Context, infoHash [20]byte, bootstrap []string) ([]net
 	if len(bootstrap) == 0 {
 		bootstrap = DefaultBootstrap
 	}
+
+	// The whole call — bootstrap included — must be bounded when the caller
+	// sets no deadline: an unbounded BootstrapContext stalls the client's
+	// first discovery for good on a slow public DHT, with the AWG device
+	// logging "no carrier" forever.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, discoverTimeout)
+		defer cancel()
+	}
 	pc, err := listenUDPRange(6881, 6889)
 	if err != nil {
 		return nil, fmt.Errorf("dht listen: %w", err)
@@ -249,11 +259,7 @@ func Discover(ctx context.Context, infoHash [20]byte, bootstrap []string) ([]net
 		return nil, fmt.Errorf("dht traversal: %w", err)
 	}
 	defer ann.Close()
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, discoverTimeout)
-		defer cancel()
-	}
+
 	var out []netip.AddrPort
 	seen := make(map[netip.AddrPort]bool)
 	for {

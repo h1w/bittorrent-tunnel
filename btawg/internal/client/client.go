@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -104,7 +105,13 @@ func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
 }
 
 func (c *Client) start(tunDev tun.Device) error {
-	c.dev = device.NewDevice(tunDev, c.bd, device.NewLogger(device.LogLevelError, "btawg-client: "))
+	level := device.LogLevelError
+	if os.Getenv("BTAWG_AWG_VERBOSE") != "" {
+		// Field debugging: shows handshake initiation/response exchange on
+		// the wire when the tunnel does not come up.
+		level = device.LogLevelVerbose
+	}
+	c.dev = device.NewDevice(tunDev, c.bd, device.NewLogger(level, "btawg-client: "))
 	if err := c.dev.IpcSet(awg.ClientConf(c.cfg)); err != nil {
 		c.dev.Close()
 		return fmt.Errorf("client IpcSet: %w", err)
@@ -203,6 +210,9 @@ func (c *Client) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			// Field debugging: silent retry loops made "no carrier"
+			// errors undiagnosable (dial failures vs discovery gaps).
+			fmt.Printf("btawg-client: carrier dial %s: %v; retrying\n", addrs[0], err)
 			select {
 			case <-ctx.Done():
 				return nil
@@ -210,6 +220,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		fmt.Printf("btawg-client: carrier connected to %s\n", addrs[0])
 		c.bd.Attach(serverEp, t)
 		select {
 		case <-t.Done():

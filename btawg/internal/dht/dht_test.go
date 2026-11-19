@@ -229,3 +229,45 @@ func TestListenUDPRangeFirstFreeThenEphemeral(t *testing.T) {
 		t.Fatalf("listenUDPRange fallback port = %d inside busy range, want ephemeral", got)
 	}
 }
+
+func TestDiscoverBoundsUndeadlinedContext(t *testing.T) {
+	if testing.Short() {
+		t.Skip("loopback DHT is UDP best-effort; skip in -short")
+	}
+	// The caller's context carries no deadline (the real client only wires
+	// signal cancellation): Discover must bound itself around the dead
+	// bootstrap instead of hanging in BootstrapContext forever. Regression
+	// guard for the "no carrier" client stall on a slow public DHT.
+	var infoHash [20]byte
+	infoHash[0] = 0x77
+
+	// A port that exists but never speaks DHT: bind and immediately close so
+	// nothing answers, then point the bootstrap at it.
+	dead, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("dead listener: %v", err)
+	}
+	deadAddr := dead.LocalAddr().String()
+	dead.Close()
+
+	type result struct {
+		err error
+	}
+	res := make(chan result, 1)
+	go func() {
+		_, err := Discover(context.Background(), infoHash, []string{deadAddr})
+		res <- result{err}
+	}()
+	// The bound is discoverTimeout; allow generous slack for scheduling but
+	// fail long before the old behavior (which never returned).
+	slack := 45 * time.Second
+	select {
+	case r := <-res:
+		// Any explicit outcome is fine: bootstrap error or no-peers error.
+		if r.err == nil {
+			t.Fatal("Discover with dead bootstrap succeeded, want error")
+		}
+	case <-time.After(slack):
+		t.Fatalf("Discover with deadline-less ctx did not return within %v", slack)
+	}
+}
