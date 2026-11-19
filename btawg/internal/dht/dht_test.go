@@ -66,7 +66,14 @@ func TestAnnounceDiscoverLoopback(t *testing.T) {
 	}
 
 	// The relay must have stored the announced peer, like a public node.
-	stored := relaySrv.PeerStore().GetPeers(metainfo.Hash(infoHash))
+	// UDP is best-effort: the announce_peer round-trip can land slightly
+	// after the traversal reports responses (CI runners widen the race),
+	// so poll briefly instead of asserting synchronously.
+	var stored = relaySrv.PeerStore().GetPeers(metainfo.Hash(infoHash))
+	for waitDeadline := time.Now().Add(5 * time.Second); len(stored) == 0 && time.Now().Before(waitDeadline); {
+		time.Sleep(50 * time.Millisecond)
+		stored = relaySrv.PeerStore().GetPeers(metainfo.Hash(infoHash))
+	}
 	if len(stored) == 0 {
 		t.Fatal("relay peer store empty after AnnounceOnce")
 	}
