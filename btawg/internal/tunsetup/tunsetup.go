@@ -16,13 +16,18 @@ import (
 // Setup brings up the named TUN interface with the overlay address, optional
 // subnet route, link MTU, and (for the hub) IPv4 forwarding. The address is
 // given as a prefix so the interface mask is set correctly; route is nil for
-// the hub because it owns the prefix directly.
+// the hub because it owns the prefix directly. A route whose prefix equals
+// the address prefix is skipped: assigning the address already installs the
+// connected route, and an explicit "ip route add" for it fails with
+// "File exists". Repeated calls are idempotent — a leftover device or
+// address from a previous run must not turn into an error.
 func Setup(name string, addr netip.Prefix, route *netip.Prefix, mtu int, ipForward bool) error {
-	if run("ip", "addr", "add", addr.String(), "dev", name) != nil {
-		// Interface does not exist yet; create a persistent TUN and retry.
+	if !deviceExists(name) {
 		if err := run("ip", "tuntap", "add", "dev", name, "mode", "tun"); err != nil {
 			return err
 		}
+	}
+	if !hasAddr(name, addr) {
 		if err := run("ip", "addr", "add", addr.String(), "dev", name); err != nil {
 			return err
 		}
@@ -33,7 +38,7 @@ func Setup(name string, addr netip.Prefix, route *netip.Prefix, mtu int, ipForwa
 	if err := run("ip", "link", "set", "dev", name, "mtu", fmt.Sprintf("%d", mtu)); err != nil {
 		return err
 	}
-	if route != nil {
+	if route != nil && route.Masked() != addr.Masked() {
 		if err := run("ip", "route", "add", route.String(), "dev", name); err != nil {
 			return err
 		}
@@ -44,6 +49,19 @@ func Setup(name string, addr netip.Prefix, route *netip.Prefix, mtu int, ipForwa
 		}
 	}
 	return nil
+}
+
+// deviceExists reports whether the named link is present. Best-effort and
+// quiet: only used to decide whether creation is needed.
+func deviceExists(name string) bool {
+	return exec.Command("ip", "link", "show", "dev", name).Run() == nil
+}
+
+// hasAddr reports whether the interface already carries the exact prefix.
+// Best-effort and quiet: only used to decide whether assignment is needed.
+func hasAddr(name string, addr netip.Prefix) bool {
+	out, err := exec.Command("ip", "addr", "show", "dev", name).Output()
+	return err == nil && strings.Contains(string(out), addr.String())
 }
 
 func run(name string, args ...string) error {

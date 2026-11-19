@@ -49,16 +49,18 @@ func main() {
 	if *noTun {
 		c, err = client.New(cfg)
 	} else {
-		subnet, err := netip.ParsePrefix(cfg.Subnet)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "btawg-client: parse subnet: %v\n", err)
+		subnet, perr := netip.ParsePrefix(cfg.Subnet)
+		if perr != nil {
+			fmt.Fprintf(os.Stderr, "btawg-client: parse subnet: %v\n", perr)
 			os.Exit(1)
 		}
 		addr := netip.PrefixFrom(netip.MustParseAddr(cfg.ClientIP), subnet.Bits())
-		if err := tunsetup.Setup(*tunName, addr, &subnet, 1420, false); err != nil {
-			fmt.Fprintf(os.Stderr, "btawg-client: tun setup (root required): %v\n", err)
+		if serr := tunsetup.Setup(*tunName, addr, &subnet, 1420, false); serr != nil {
+			fmt.Fprintf(os.Stderr, "btawg-client: tun setup (root required): %v\n", serr)
 			os.Exit(1)
 		}
+		// Deliberately assigns the outer err: the failure of NewRealTUN
+		// must reach the check below, not a shadowed copy.
 		c, err = client.NewRealTUN(cfg, *tunName)
 	}
 	if err != nil {

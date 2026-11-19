@@ -55,6 +55,12 @@ func TestSetupRequiresRoot(t *testing.T) {
 		t.Fatalf("Setup failed: %v", err)
 	}
 
+	// Re-running with the device, address, and connected route already in
+	// place must succeed (leftover state after a crashed run).
+	if err := Setup(name, addr, &route, 1420, true); err != nil {
+		t.Fatalf("second Setup failed: %v", err)
+	}
+
 	out, err := exec.Command("ip", "addr", "show", "dev", name).Output()
 	if err != nil {
 		t.Fatalf("ip addr show: %v", err)
