@@ -111,11 +111,11 @@ func NewRealTUN(cfg config.ServerConfig, st *store.Store, tunName string) (*Serv
 	}
 	filtered := &filterTun{inner: tunDev, policy: s.policy}
 
-	addr, err := serverIP.Prefix(24)
-	if err != nil {
-		tunDev.Close()
-		return nil, fmt.Errorf("server ip prefix: %w", err)
-	}
+	// PrefixFrom keeps the host bits: Addr.Prefix masks the address down to
+	// the network number (10.77.0.0/24), and iproute2 silently assigns that,
+	// leaving the hub address absent — the egress bind then fails with
+	// EADDRNOTAVAIL.
+	addr := netip.PrefixFrom(serverIP, 24)
 	if err := tunsetup.Setup(tunName, addr, nil, 1420, true); err != nil {
 		tunDev.Close()
 		return nil, fmt.Errorf("setup tun: %w", err)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -388,6 +389,40 @@ func TestNewRealTUNRequiresRoot(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), tunName) {
 		t.Fatalf("error %q does not name the TUN interface %q", err, tunName)
+	}
+}
+
+// TestNewRealTUNLive runs the hub real-TUN constructor with full privileges
+// and asserts the overlay address actually lands on the interface with its
+// host bits intact. Regression guard for the Addr.Prefix masking bug where
+// iproute2 silently assigned the network number (10.77.0.0) and the egress
+// bind then failed with EADDRNOTAVAIL. Skipped without root; runnable
+// rootless via `unshare -Urn go test ...`.
+func TestNewRealTUNLive(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (or a user namespace): live TUN creation")
+	}
+	st, err := store.Open(t.TempDir() + "/hub.db")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	cfg := config.DefaultServerConfig()
+	cfg.Transport = "ext-tcp"
+	tunName := "btawglive0"
+	s, err := NewRealTUN(cfg, st, tunName)
+	if err != nil {
+		t.Fatalf("NewRealTUN: %v", err)
+	}
+	defer s.closeAll()
+
+	out, err := exec.Command("ip", "addr", "show", "dev", tunName).CombinedOutput()
+	if err != nil {
+		t.Fatalf("ip addr show: %v: %s", err, out)
+	}
+	if !strings.Contains(string(out), cfg.ServerIP+"/24") {
+		t.Fatalf("tun %s missing %q, has:\n%s", tunName, cfg.ServerIP+"/24", out)
 	}
 }
 
