@@ -256,9 +256,12 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 		if err != nil {
 			return nil, fmt.Errorf("carrier udp: %w", err)
 		}
+		// 100 ms target delay is the library default (what the rest of the
+		// µTP network uses); buffers are 4 MiB so the window can cover the
+		// bandwidth-delay product of fast WAN paths. The 64 KiB / 5 ms
+		// tuning formerly here strangled throughput to ~400 KiB/s.
 		sock, err := utp.NewSocketFromPacketConn(pc,
-			utp.WithTargetDelay(5*time.Millisecond),
-			utp.WithBufferSizes(65536, 65536))
+			utp.WithBufferSizes(4<<20, 4<<20))
 		if err != nil {
 			pc.Close()
 			return nil, fmt.Errorf("carrier utp socket: %w", err)

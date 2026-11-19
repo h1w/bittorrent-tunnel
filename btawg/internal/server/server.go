@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
@@ -223,9 +222,12 @@ func (s *Server) finish(tunDev tun.Device, egressLn net.Listener, peerConf strin
 			return fmt.Errorf("carrier listen: %w", err)
 		}
 		s.udpPC = pc
+		// 100 ms target delay is the library default (what the rest of the
+		// µTP network uses); buffers are 4 MiB so the window can cover the
+		// bandwidth-delay product of fast WAN paths. The 64 KiB / 5 ms
+		// tuning formerly here strangled throughput to ~400 KiB/s.
 		sock, err := utp.NewSocketFromPacketConn(pc,
-			utp.WithTargetDelay(5*time.Millisecond),
-			utp.WithBufferSizes(65536, 65536))
+			utp.WithBufferSizes(4<<20, 4<<20))
 		if err != nil {
 			return fmt.Errorf("utp socket: %w", err)
 		}
