@@ -350,3 +350,190 @@ func TestNewRealTUNLive(t *testing.T) {
 		t.Fatalf("tun %s missing %q, has:\n%s", tunName, cfg.ServerIP+"/24", out)
 	}
 }
+
+func testServerWithClient(t *testing.T) (*Server, *store.Store, store.ClientRecord) {
+	t.Helper()
+	st, err := store.Open(t.TempDir() + "/flow.db")
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	cfg := config.DefaultServerConfig()
+	cfg.CarrierPort = 18777
+	cfg.AWGPort, cfg.WGPort = 18801, 18802
+
+	clientPriv, clientPub, err := awg.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("client key: %v", err)
+	}
+	rec := store.ClientRecord{
+		ID:      "c1",
+		Name:    "flow-client",
+		PubKey:  clientPub,
+		PrivKey: clientPriv,
+		IP:      "10.77.0.2",
+		PeerID:  awg.PeerID(clientPub),
+		Created: time.Unix(1, 0),
+	}
+	if err := st.CreateClient(rec); err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	srv, err := New(cfg, st)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	return srv, st, rec
+}
+
+// TestReverseFlowPinnedToIngressEngine proves that when a client sends a
+// packet through one mode's engine, the reverse flow returns to that same
+// engine even if the per-IP primary route points elsewhere.
+func TestReverseFlowPinnedToIngressEngine(t *testing.T) {
+	srv, _, rec := testServerWithClient(t)
+	clientIP := netip.MustParseAddr(rec.IP)
+	gatewayIP := netip.MustParseAddr(srv.cfg.ServerIP)
+
+	extTCP := srv.router.engines[config.ModeExtTCP]
+	extUTP := srv.router.engines[config.ModeExtUTP]
+	if extTCP == nil || extUTP == nil {
+		t.Fatal("missing per-mode engines")
+	}
+
+	// Make extUTP the primary route for the client IP.
+	srv.router.remember(clientIP, extUTP, time.Now().UnixNano())
+
+	// Client sends through extTCP. This should pin the reverse flow to extTCP.
+	fwd := makeTCPPacket(clientIP.String(), gatewayIP.String(), 12345, 443)
+	if _, err := extTCP.Write([][]byte{fwd}, 0); err != nil {
+		t.Fatalf("extTCP Write: %v", err)
+	}
+
+	// Verify the flow table pinned the reverse to extTCP.
+	fwdKey, _ := flowKeyFromPacket(fwd)
+	revKey := fwdKey.reverse()
+	if pinned, ok := srv.router.flows.lookup(revKey, time.Now()); !ok || pinned != extTCP {
+		t.Fatalf("reverse flow not pinned to extTCP: %v %v", pinned, ok)
+	}
+
+	// Gateway replies. lookupDestinationEngine must return extTCP even though
+	// the primary route is extUTP.
+	rev := makeTCPPacket(gatewayIP.String(), clientIP.String(), 443, 12345)
+	eng := srv.router.lookupDestinationEngine(gatewayIP, clientIP, rev, time.Now())
+	if eng != extTCP {
+		t.Fatalf("reverse flow routed to %v, want extTCP", eng)
+	}
+
+	// The queued packet must be accepted by extTCP.Read and rejected by extUTP.
+	pktBuf := make([]byte, len(rev)+tunOffset)
+	copy(pktBuf[tunOffset:], rev)
+	if !extTCP.enqueue(pktBuf[:len(rev)+tunOffset]) {
+		t.Fatal("extTCP enqueue failed")
+	}
+	out := make([][]byte, 1)
+	out[0] = make([]byte, 2048)
+	sizes := make([]int, 1)
+	if _, err := extTCP.Read(out, sizes, 0); err != nil || sizes[0] != len(rev) || !bytes.Equal(out[0][:sizes[0]], rev) {
+		t.Fatalf("extTCP.Read did not deliver reverse packet: err=%v sizes=%d", err, sizes[0])
+	}
+
+	// extUTP must reject the packet because it is not the flow owner.
+	pktBuf2 := make([]byte, len(rev)+tunOffset)
+	copy(pktBuf2[tunOffset:], rev)
+	if !extUTP.enqueue(pktBuf2[:len(rev)+tunOffset]) {
+		t.Fatal("extUTP enqueue failed")
+	}
+	out[0] = make([]byte, 2048)
+	sizes[0] = 0
+	done := make(chan struct{})
+	go func() {
+		extUTP.Read(out, sizes, 0)
+		close(done)
+	}()
+	select {
+	case <-done:
+		if sizes[0] > 0 {
+			t.Fatal("extUTP accepted a packet owned by extTCP")
+		}
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestStaleModeClosureReleasesFlows verifies that closing a mode's engine
+// invalidates its pinned flows, so traffic falls back to the current primary
+// route instead of being black-holed on a dead engine.
+func TestStaleModeClosureReleasesFlows(t *testing.T) {
+	srv, _, rec := testServerWithClient(t)
+	clientIP := netip.MustParseAddr(rec.IP)
+	gatewayIP := netip.MustParseAddr(srv.cfg.ServerIP)
+
+	extTCP := srv.router.engines[config.ModeExtTCP]
+	extUTP := srv.router.engines[config.ModeExtUTP]
+
+	// Establish a flow on extTCP.
+	fwd := makeTCPPacket(clientIP.String(), gatewayIP.String(), 12345, 443)
+	if _, err := extTCP.Write([][]byte{fwd}, 0); err != nil {
+		t.Fatalf("extTCP Write: %v", err)
+	}
+
+	// Close extTCP and make extUTP the primary route.
+	if err := extTCP.Close(); err != nil {
+		t.Fatalf("extTCP Close: %v", err)
+	}
+	srv.router.remember(clientIP, extUTP, time.Now().UnixNano())
+
+	// Gateway reply should fall back to extUTP now that extTCP is gone.
+	rev := makeTCPPacket(gatewayIP.String(), clientIP.String(), 443, 12345)
+	eng := srv.router.lookupDestinationEngine(gatewayIP, clientIP, rev, time.Now())
+	if eng != extUTP {
+		t.Fatalf("reverse flow routed to %v after extTCP close, want extUTP", eng)
+	}
+}
+
+// TestUnauthenticatedSessionCannotSpoof proves that a TLS engine whose
+// authSource is one client cannot pin flows using a different client's source
+// address.
+func TestUnauthenticatedSessionCannotSpoof(t *testing.T) {
+	srv, st, rec := testServerWithClient(t)
+	clientIP := netip.MustParseAddr(rec.IP)
+	otherIP := netip.MustParseAddr("10.77.0.3")
+
+	// Create a second client record.
+	otherPriv, otherPub, err := awg.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("other key: %v", err)
+	}
+	other := store.ClientRecord{
+		ID:      "c2",
+		Name:    "other",
+		PubKey:  otherPub,
+		PrivKey: otherPriv,
+		IP:      otherIP.String(),
+		PeerID:  awg.PeerID(otherPub),
+		Created: time.Unix(1, 0),
+	}
+	if err := st.CreateClient(other); err != nil {
+		t.Fatalf("create other: %v", err)
+	}
+	if err := srv.RegisterClient(other); err != nil {
+		t.Fatalf("RegisterClient: %v", err)
+	}
+
+	// A TLS engine authenticated as the first client.
+	eng := srv.router.newEngine(clientIP)
+	defer eng.Close()
+
+	// Attempt to send a packet spoofing the second client.
+	spoof := makeTCPPacket(otherIP.String(), clientIP.String(), 12345, 443)
+	if _, err := eng.Write([][]byte{spoof}, 0); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// No flow should be pinned for the spoofed source.
+	key, _ := flowKeyFromPacket(spoof)
+	if _, ok := srv.router.flows.lookup(key.reverse(), time.Now()); ok {
+		t.Fatal("unauthenticated engine pinned a spoofed flow")
+	}
+}

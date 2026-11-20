@@ -33,9 +33,9 @@ func testManaged(t *testing.T, cfg config.ClientConfig) *managed {
 func TestManagedReservesDisabledPortsAndRotatesAuth(t *testing.T) {
 	cfg := config.ClientConfig{ClientIP: "10.77.0.2", ServerIP: "10.77.0.1", Subnet: "10.77.0.0/24"}
 	m := testManaged(t, cfg)
-	m.SetDialer(config.ModeWG, func(context.Context, string, string) (net.Conn, error) {
+	m.SetProxy(config.ModeWG, ModeProxy{TCP: func(context.Context, netip.AddrPort) (net.Conn, error) {
 		return nil, errNoTunnel
-	})
+	}})
 	auth := Credentials{Username: "operator", Password: "before"}
 	if err := m.Apply([]string{config.ModeWG}, auth); err != nil {
 		t.Fatal(err)

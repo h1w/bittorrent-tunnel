@@ -32,8 +32,12 @@ func ManagedPorts() []int {
 	return ports
 }
 
-// DialerFunc dials a target through one transport's tunnel.
-type DialerFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+// ModeProxy is one transport's upstream: TCP CONNECT and UDP datagrams,
+// both routed through that mode's tunnel.
+type ModeProxy struct {
+	TCP func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
+	UDP func(ctx context.Context) (net.PacketConn, error)
+}
 
 // managedSlot owns one fixed-port SOCKS5 inbound. The listener stays bound
 // whether or not the mode is enabled so the port is never reassigned; a
@@ -54,7 +58,7 @@ type managedSlot struct {
 type managed struct {
 	cfg     config.ClientConfig
 	slots   []*managedSlot
-	dialers map[string]DialerFunc
+	proxies map[string]ModeProxy
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -73,7 +77,7 @@ func newManaged(ctx context.Context, cfg config.ClientConfig, listenIP netip.Add
 	mctx, cancel := context.WithCancel(ctx)
 	m := &managed{
 		cfg:     cfg,
-		dialers: make(map[string]DialerFunc, len(modes)),
+		proxies: make(map[string]ModeProxy, len(modes)),
 		ctx:     mctx,
 		cancel:  cancel,
 	}
@@ -100,11 +104,11 @@ func newManaged(ctx context.Context, cfg config.ClientConfig, listenIP netip.Add
 	return m, nil
 }
 
-// SetDialer attaches the upstream tunnel dialer for one mode.
-func (m *managed) SetDialer(mode string, dial DialerFunc) {
+// SetProxy attaches the upstream tunnel proxy for one mode.
+func (m *managed) SetProxy(mode string, p ModeProxy) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.dialers[mode] = dial
+	m.proxies[mode] = p
 }
 
 // Apply enables the listed modes and installs the shared credential pair. A
@@ -205,15 +209,19 @@ func (m *managed) track(s *managedSlot, c net.Conn) bool {
 // serve runs one authenticated SOCKS5 session against the mode's tunnel.
 func (m *managed) serve(ctx context.Context, s *managedSlot, c net.Conn) {
 	m.mu.Lock()
-	auth, dial := m.auth, m.dialers[s.mode]
+	auth, proxy := m.auth, m.proxies[s.mode]
 	m.mu.Unlock()
-	if dial == nil {
+	if proxy.TCP == nil {
 		c.Close()
 		return
 	}
 	srv := socks.NewServer(func(ctx context.Context, _, addr string) (net.Conn, error) {
-		return dial(ctx, "tcp", addr)
-	}, nil).WithCredentials(auth.Username, auth.Password)
+		ap, err := netip.ParseAddrPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		return proxy.TCP(ctx, ap)
+	}, proxy.UDP).WithCredentials(auth.Username, auth.Password)
 	srv.ServeConn(ctx, c)
 }
 

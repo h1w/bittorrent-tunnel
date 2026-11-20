@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,14 +70,21 @@ func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 	}
 
 	// Reach the gateway listener from inside the overlay netstack.
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err = client.Get("http://" + gatewayAddr.String())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := srv.OverlayNet().DialContextTCPAddrPort(ctx, ap)
 	if err != nil {
-		t.Fatalf("gateway request: %v", err)
+		t.Fatalf("gateway dial: %v", err)
 	}
-	body, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if string(body) != "ok" {
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "GET / HTTP/1.0\r\nHost: %s\r\n\r\n", gatewayAddr.String()); err != nil {
+		t.Fatalf("gateway write: %v", err)
+	}
+	body, err = io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("gateway read: %v", err)
+	}
+	if !strings.Contains(string(body), "ok") {
 		t.Fatalf("gateway body = %q", body)
 	}
 }

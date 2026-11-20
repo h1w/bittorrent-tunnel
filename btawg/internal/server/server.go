@@ -56,6 +56,7 @@ type Server struct {
 	tunName  string
 
 	modeCarriers map[string]carrier.Transport // mode/IP -> current carrier
+	managed      bool                          // true when run by the managed systemd path
 
 	mu           sync.Mutex
 	applyMu      sync.Mutex
@@ -366,6 +367,21 @@ func (s *Server) TLSServerKey() string { return s.tlsIdentity.Pin() }
 
 // Config returns the active server configuration.
 func (s *Server) Config() config.ServerConfig { return s.cfg }
+
+// Managed reports whether the hub was started by the managed systemd path.
+func (s *Server) Managed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.managed
+}
+
+// SetManaged marks the hub as managed by the systemd service path. It is not
+// safe to call after listeners have been started.
+func (s *Server) SetManaged(managed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.managed = managed
+}
 
 // ReloadPolicy applies stored group addresses, peer addresses and access rules.
 func (s *Server) ReloadPolicy() (err error) {

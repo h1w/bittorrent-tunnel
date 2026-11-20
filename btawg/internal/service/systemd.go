@@ -15,6 +15,16 @@ var systemctlRunner = func(ctx context.Context, args ...string) (string, error) 
 	return string(out), err
 }
 
+// SystemctlRunner returns the current systemctl runner. Exposed for cmd tests.
+func SystemctlRunner() func(context.Context, ...string) (string, error) {
+	return systemctlRunner
+}
+
+// SetSystemctlRunner replaces the systemctl runner. Exposed for cmd tests.
+func SetSystemctlRunner(f func(context.Context, ...string) (string, error)) {
+	systemctlRunner = f
+}
+
 func daemonReload() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

@@ -25,8 +25,12 @@ import (
 
 const (
 	managedStorePath = "/var/lib/btawg/server.db"
-	pendingPassPath  = "/etc/btawg/.admin-password"
 )
+
+var pendingPassPath = "/etc/btawg/.admin-password"
+
+// setPendingPassPath is used by tests to avoid writing to /etc.
+func setPendingPassPath(p string) { pendingPassPath = p }
 
 func installCmd(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
@@ -35,7 +39,7 @@ func installCmd(args []string) error {
 		return err
 	}
 
-	if os.Geteuid() != 0 {
+	if installRequiresRoot && os.Geteuid() != 0 {
 		return errors.New("install must run as root")
 	}
 
@@ -123,6 +127,9 @@ func runCmd(args []string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if *managed {
+		srv.SetManaged(true)
 	}
 	defer func() {
 		_ = srv.Close()
@@ -237,4 +244,20 @@ func listenerAddrs(listeners []net.Listener) []string {
 		out[i] = ln.Addr().String()
 	}
 	return out
+}
+
+var installRequiresRoot = true
+
+// setInstallRequiresRoot is used by tests to bypass the root check.
+func setInstallRequiresRoot(v bool) { installRequiresRoot = v }
+
+// randomPassword returns a 16-char alphanumeric password.
+func randomPassword() string {
+	const alphabet = "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	b := make([]byte, 16)
+	rand.Read(b)
+	for i := range b {
+		b[i] = alphabet[int(b[i])%len(alphabet)]
+	}
+	return string(b)
 }

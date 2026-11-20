@@ -294,7 +294,13 @@ func (r *packetRouter) fanoutEvents() {
 			}
 			r.awg.sendEvent(ev)
 			r.wg.sendEvent(ev)
+			r.routesMu.RLock()
+			engines := make([]*engineTun, 0, len(r.engines))
 			for _, e := range r.engines {
+				engines = append(engines, e)
+			}
+			r.routesMu.RUnlock()
+			for _, e := range engines {
 				e.sendEvent(ev)
 			}
 		case <-r.closed:

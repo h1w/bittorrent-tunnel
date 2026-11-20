@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -94,6 +95,26 @@ func TestControlActions(t *testing.T) {
 	}
 	if err := Server.Control("bad"); err == nil {
 		t.Fatal("Control bad should error")
+	}
+}
+
+func TestUnitPassesSystemdAnalyze(t *testing.T) {
+	oldBinDir := binDir
+	binDir = t.TempDir()
+	t.Cleanup(func() { binDir = oldBinDir })
+	dummy := filepath.Join(binDir, "btawg-server")
+	if err := os.WriteFile(dummy, []byte("#!/bin/sh\necho ok"), 0o755); err != nil {
+		t.Fatalf("write dummy binary: %v", err)
+	}
+
+	unit := Server.renderUnit(nil)
+	path := filepath.Join(t.TempDir(), "btawg-server.service")
+	if err := os.WriteFile(path, []byte(unit), 0o644); err != nil {
+		t.Fatalf("write unit: %v", err)
+	}
+	out, err := exec.Command("systemd-analyze", "verify", path).CombinedOutput()
+	if err != nil {
+		t.Fatalf("systemd-analyze verify: %v\n%s", err, string(out))
 	}
 }
 

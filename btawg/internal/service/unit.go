@@ -24,6 +24,12 @@ var (
 	binDir  = "/usr/local/bin"
 )
 
+// UnitDirs returns the current unit and binary directories. Exposed for cmd tests.
+func UnitDirs() (string, string) { return unitDir, binDir }
+
+// SetUnitDirs overrides the unit and binary directories. Exposed for cmd tests.
+func SetUnitDirs(u, b string) { unitDir, binDir = u, b }
+
 func (u Unit) binaryName() string { return "btawg-" + string(u) }
 func (u Unit) unitName() string   { return u.binaryName() + ".service" }
 func (u Unit) binaryPath() string { return filepath.Join(binDir, u.binaryName()) }

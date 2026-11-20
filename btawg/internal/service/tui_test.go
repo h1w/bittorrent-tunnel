@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kr/pty"
 )
 
 func TestTUIQuitsOnQ(t *testing.T) {
@@ -126,3 +128,39 @@ func TestTUIExtraCallback(t *testing.T) {
 		t.Fatalf("missing error message: %s", out.String())
 	}
 }
+
+func TestTUIRunsOnPTY(t *testing.T) {
+	tuiRefreshInterval = time.Hour
+	t.Cleanup(func() { tuiRefreshInterval = time.Second })
+
+	tuiState = func(u Unit) (string, bool, error) { return "active", true, nil }
+	t.Cleanup(func() {
+		tuiState = func(u Unit) (string, bool, error) { return u.State() }
+	})
+
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Skipf("pty not available: %v", err)
+	}
+	defer master.Close()
+	defer slave.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- runTUI(slave, slave, Server, nil, nil)
+	}()
+
+	if _, err := master.Write([]byte("q")); err != nil {
+		t.Fatalf("write pty: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runTUI on pty: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TUI did not exit on pty")
+	}
+}
+
