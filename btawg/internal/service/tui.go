@@ -91,10 +91,16 @@ func runTUI(in io.Reader, out io.Writer, unit Unit, client func() ([]string, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	// Stop the refresh goroutine before returning so it cannot read the UI
+	// hooks after the caller regains control (LIFO: cancel runs before Wait).
+	defer wg.Wait()
 	defer cancel()
 
 	// Refresh state periodically so the UI shows live systemd status.
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		tick := time.NewTicker(tuiRefreshInterval)
 		defer tick.Stop()
 		for {
