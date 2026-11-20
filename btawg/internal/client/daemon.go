@@ -41,8 +41,9 @@ type ControlResponse struct {
 // a root-only Unix socket. Enabled modes and credentials change in place and
 // are persisted so they survive a restart.
 type Daemon struct {
-	m    *Managed
-	path string
+	m       *Managed
+	path    string
+	cfgPath string
 
 	mu sync.Mutex
 	cfg ManagedConfig
@@ -52,6 +53,10 @@ type Daemon struct {
 // socket, and reports readiness to systemd. It returns when ctx is done or the
 // client fails irrecoverably.
 func RunManaged(ctx context.Context, cfg ManagedConfig, realTUN bool, tunName string) error {
+	return runManagedAt(ctx, cfg, ManagedConfigPath, ControlSocketPath, realTUN, tunName)
+}
+
+func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath string, realTUN bool, tunName string) error {
 	importCfg, err := config.ParseImportString(cfg.Import)
 	if err != nil {
 		return fmt.Errorf("parse import: %w", err)
@@ -66,7 +71,7 @@ func RunManaged(ctx context.Context, cfg ManagedConfig, realTUN bool, tunName st
 	}
 	defer m.Close()
 
-	d := &Daemon{m: m, path: ControlSocketPath, cfg: cfg}
+	d := &Daemon{m: m, path: socketPath, cfgPath: cfgPath, cfg: cfg}
 	ln, err := d.listen()
 	if err != nil {
 		return err
