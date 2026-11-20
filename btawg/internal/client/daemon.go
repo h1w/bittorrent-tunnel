@@ -148,7 +148,7 @@ func (d *Daemon) handle(req ControlRequest) ControlResponse {
 			return ControlResponse{OK: false, Error: err.Error()}
 		}
 		d.cfg.Enabled = canonicalModes(req.Enabled)
-		if err := d.cfg.Save(ManagedConfigPath); err != nil {
+		if err := d.cfg.Save(d.cfgPath); err != nil {
 			return ControlResponse{OK: false, Error: err.Error()}
 		}
 		return d.snapshotLocked()
@@ -161,7 +161,7 @@ func (d *Daemon) handle(req ControlRequest) ControlResponse {
 			return ControlResponse{OK: false, Error: err.Error()}
 		}
 		d.cfg.Credentials = creds
-		if err := d.cfg.Save(ManagedConfigPath); err != nil {
+		if err := d.cfg.Save(d.cfgPath); err != nil {
 			return ControlResponse{OK: false, Error: err.Error()}
 		}
 		resp := d.snapshotLocked()
