@@ -49,6 +49,12 @@ func (s *Server) WithUDPResolver(resolve func(context.Context, netip.Addr, strin
 	return s
 }
 
+// ServeConn handles one accepted SOCKS5 session. It owns c until the
+// session ends and closes it when ctx is canceled.
+func (s *Server) ServeConn(ctx context.Context, c net.Conn) {
+	s.handle(ctx, c)
+}
+
 // Serve accepts SOCKS5 connections on ln until ctx is done.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer ln.Close()

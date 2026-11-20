@@ -46,12 +46,16 @@ type Server struct {
 	pubKey      string
 	tlsIdentity *iptunnel.Identity
 
-	bd      *bind.Hybrid
-	dev, wg *device.Device
-	ns      *netstack.Net
-	router  *packetRouter
-	kernel  *tunsetup.Hub
-	tunName string
+	dev     *device.Device // native AWG
+	wg      *device.Device // native WG
+	modeDevs map[string]*device.Device // AWG crypto per carrier mode
+	modeBinds map[string]*bind.Bind    // stream bind per carrier mode
+	ns       *netstack.Net
+	router   *packetRouter
+	kernel   *tunsetup.Hub
+	tunName  string
+
+	modeCarriers map[string]carrier.Transport // mode/IP -> current carrier
 
 	mu           sync.Mutex
 	applyMu      sync.Mutex
@@ -233,18 +237,20 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:         cfg,
-		st:          st,
-		infoHash:    [20]byte(ih),
-		pubKey:      serverPub,
-		tlsIdentity: tlsIdentity,
-		bd:          bind.NewHybrid(),
-		peers:       make(map[string]store.ClientRecord),
-		sessions:    make(map[string]map[carrier.Transport]struct{}),
-		tlsSessions: make(map[string]carrier.Transport),
-		byPeerID:    make(map[string]store.ClientRecord),
-		attached:    make(map[string]int),
-		closed:      make(chan struct{}),
+		cfg:          cfg,
+		st:           st,
+		infoHash:     [20]byte(ih),
+		pubKey:       serverPub,
+		tlsIdentity:  tlsIdentity,
+		peers:        make(map[string]store.ClientRecord),
+		sessions:     make(map[string]map[carrier.Transport]struct{}),
+		tlsSessions:  make(map[string]carrier.Transport),
+		modeDevs:     make(map[string]*device.Device),
+		modeBinds:    make(map[string]*bind.Bind),
+		modeCarriers: make(map[string]carrier.Transport),
+		byPeerID:     make(map[string]store.ClientRecord),
+		attached:     make(map[string]int),
+		closed:       make(chan struct{}),
 	}
 
 	s.policy = newPolicySnapshot()
@@ -267,8 +273,21 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 }
 
 func (s *Server) finish() error {
-	s.dev = device.NewDevice(s.router.awg, s.bd, device.NewLogger(device.LogLevelError, "btawg-awg: "))
+	// Native AWG and WG use dedicated UDP binds; each BitTorrent carrier mode
+	// gets its own AWG crypto engine on a stream-only bind so no native UDP
+	// socket is allocated per carrier mode.
+	s.dev = device.NewDevice(s.router.awg, bind.NewHybrid(), device.NewLogger(device.LogLevelError, "btawg-awg: "))
 	s.wg = device.NewDevice(s.router.wg, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "btawg-wg: "))
+	for _, mode := range []string{config.ModeExtUTP, config.ModeExtTCP, config.ModeReqUTP, config.ModeReqTCP} {
+		eng := s.router.engineForMode(mode)
+		b := bind.New()
+		d := device.NewDevice(eng, b, device.NewLogger(device.LogLevelError, "btawg-"+mode+": "))
+		if err := d.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n%s", s.cfg.ServerPrivKey, s.cfg.AWGPort, s.cfg.AWGProfile.String())); err != nil {
+			return fmt.Errorf("configure %s device: %w", mode, err)
+		}
+		s.modeDevs[mode] = d
+		s.modeBinds[mode] = b
+	}
 	if err := s.dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n%s", s.cfg.ServerPrivKey, s.cfg.AWGPort, s.cfg.AWGProfile.String())); err != nil {
 		return err
 	}
@@ -283,6 +302,11 @@ func (s *Server) finish() error {
 	}
 	if err := s.wg.Up(); err != nil {
 		return fmt.Errorf("WG: %w", err)
+	}
+	for mode, d := range s.modeDevs {
+		if err := d.Up(); err != nil {
+			return fmt.Errorf("%s: %w", mode, err)
+		}
 	}
 	listen := net.ListenConfig{Control: carrier.TCPControl}
 	var err error
@@ -407,15 +431,22 @@ func (s *Server) Run(ctx context.Context) error {
 		cancel()
 	}()
 
-	listeners := []func() (net.Conn, error){s.tcpLn.Accept, s.sock.Accept}
+	type listener struct {
+		accept func() (net.Conn, error)
+		proto  string
+	}
+	listeners := []listener{
+		{accept: s.tcpLn.Accept, proto: "tcp"},
+		{accept: s.sock.Accept, proto: "utp"},
+	}
 	errs := make(chan error, len(listeners)+1)
 	if s.dnsLn != nil {
 		go func() { errs <- tunneldns.Serve(runCtx, s.dnsLn, s.policy.allowDNS) }()
 	}
-	for _, accept := range listeners {
-		go func() {
+	for _, ln := range listeners {
+		go func(ln listener) {
 			for {
-				c, err := accept()
+				c, err := ln.accept()
 				if err != nil {
 					errs <- err
 					return
@@ -428,10 +459,10 @@ func (s *Server) Run(ctx context.Context) error {
 					return
 				default:
 				}
-				s.carrierWG.Go(func() { s.acceptConn(runCtx, c) })
+				s.carrierWG.Go(func() { s.acceptConn(runCtx, c, ln.proto) })
 				s.mu.Unlock()
 			}
-		}()
+		}(ln)
 	}
 	select {
 	case <-runCtx.Done():
@@ -464,7 +495,35 @@ func (s *Server) Announce(ctx context.Context) error {
 	}
 }
 
-func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
+// carrierMode maps the carrier framing family and listener protocol to the
+// canonical client mode used for per-mode crypto engines and session keys.
+func carrierMode(family, proto string) string {
+	switch family {
+	case "ext":
+		if proto == "tcp" {
+			return config.ModeExtTCP
+		}
+		return config.ModeExtUTP
+	case "req":
+		if proto == "tcp" {
+			return config.ModeReqTCP
+		}
+		return config.ModeReqUTP
+	case "ext-tls":
+		if proto == "tcp" {
+			return config.ModeTLSExtTCP
+		}
+		return config.ModeTLSExtUTP
+	case "req-tls":
+		if proto == "tcp" {
+			return config.ModeTLSReqTCP
+		}
+		return config.ModeTLSReqUTP
+	}
+	return ""
+}
+
+func (s *Server) acceptConn(ctx context.Context, c net.Conn, proto string) {
 	defer c.Close()
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
 	defer stop()
@@ -481,6 +540,10 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
 	rec, ok := s.byPeerID[id]
 	s.mu.Unlock()
 	if !ok {
+		return
+	}
+	mode := carrierMode(family, proto)
+	if mode == "" {
 		return
 	}
 	var secure *tls.Conn
@@ -518,7 +581,7 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
 	default:
 	}
 	var eng *engineTun
-	var detach func()
+	modeKey := mode + "/" + rec.IP
 	if secure != nil {
 		now := time.Now()
 		if !s.policy.handshake(ip, rec.PubKey, now) {
@@ -528,12 +591,19 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
 		}
 		eng = s.router.newEngine(ip)
 		s.router.remember(ip, eng, now.UnixNano())
-		if old := s.tlsSessions[id]; old != nil {
+		if old := s.tlsSessions[modeKey]; old != nil {
 			old.Close()
 		}
-		s.tlsSessions[id] = t
+		s.tlsSessions[modeKey] = t
 	} else {
-		detach = s.bd.AddCarrier(ip, t)
+		b := s.modeBinds[mode]
+		if b == nil {
+			s.mu.Unlock()
+			s.applyMu.Unlock()
+			return
+		}
+		s.modeCarriers[modeKey] = t
+		b.Attach(bind.Endpoint(ip), t)
 	}
 	if s.sessions[id] == nil {
 		s.sessions[id] = make(map[carrier.Transport]struct{})
@@ -550,11 +620,18 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
 		case <-ctx.Done():
 		case <-s.closed:
 		}
-		detach()
+		s.mu.Lock()
+		if s.modeCarriers[modeKey] == t {
+			delete(s.modeCarriers, modeKey)
+			if b := s.modeBinds[mode]; b != nil {
+				b.Detach(bind.Endpoint(ip))
+			}
+		}
+		s.mu.Unlock()
 	}
 	s.mu.Lock()
-	if s.tlsSessions[id] == t {
-		delete(s.tlsSessions, id)
+	if s.tlsSessions[modeKey] == t {
+		delete(s.tlsSessions, modeKey)
 	}
 	delete(s.sessions[id], t)
 	if len(s.sessions[id]) == 0 {
@@ -634,10 +711,7 @@ func (s *Server) reloadPeers() error {
 		s.policy.remove(ip)
 		s.router.forget(ip)
 		line := fmt.Sprintf("public_key=%s\nremove=true\n", old.PubKey)
-		if err := s.dev.IpcSet(line); err != nil {
-			return err
-		}
-		if err := s.wg.IpcSet(line); err != nil {
+		if err := s.ipcSetAll(line); err != nil {
 			return err
 		}
 	}
@@ -646,15 +720,49 @@ func (s *Server) reloadPeers() error {
 			continue
 		}
 		line := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s/32\n", r.PubKey, r.IP)
-		if err := s.dev.IpcSet(line); err != nil {
-			return err
-		}
-		if err := s.wg.IpcSet(line); err != nil {
+		if err := s.ipcSetAll(line); err != nil {
 			return err
 		}
 	}
 	s.peers = next
 	return nil
+}
+
+// ipcSetAll applies an IPC command to every device that shares the peer key
+// namespace: native AWG, native WG, and one AWG device per carrier mode.
+func (s *Server) ipcSetAll(line string) error {
+	if s.dev != nil {
+		if err := s.dev.IpcSet(line); err != nil {
+			return err
+		}
+	}
+	if s.wg != nil {
+		if err := s.wg.IpcSet(line); err != nil {
+			return err
+		}
+	}
+	for mode, d := range s.modeDevs {
+		if err := d.IpcSet(line); err != nil {
+			return fmt.Errorf("%s: %w", mode, err)
+		}
+	}
+	return nil
+}
+
+// allDevices returns the native AWG/WG devices plus every per-mode carrier
+// device. The caller must not modify the returned slice.
+func (s *Server) allDevices() []*device.Device {
+	out := make([]*device.Device, 0, 2+len(s.modeDevs))
+	if s.dev != nil {
+		out = append(out, s.dev)
+	}
+	if s.wg != nil {
+		out = append(out, s.wg)
+	}
+	for _, d := range s.modeDevs {
+		out = append(out, d)
+	}
+	return out
 }
 
 // RegisterClient applies an enrollment already persisted by the panel.
@@ -702,11 +810,8 @@ func (s *Server) Close() error {
 		if s.dnsLn != nil {
 			_ = s.dnsLn.Close()
 		}
-		if s.dev != nil {
-			s.dev.Close()
-		}
-		if s.wg != nil {
-			s.wg.Close()
+		for _, d := range s.allDevices() {
+			d.Close()
 		}
 		if s.kernel != nil {
 			s.closeErr = s.kernel.Close()

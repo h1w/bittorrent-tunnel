@@ -29,6 +29,7 @@ type Registry interface {
 	RevokeClient(store.ClientRecord) error
 	ReloadPolicy() error
 	Config() config.ServerConfig
+	Managed() bool
 	Traffic() map[string]store.Traffic
 	InfoHash() string
 	PubKey() string
@@ -231,6 +232,7 @@ func (p *Panel) serverPage(w http.ResponseWriter, r *http.Request) {
 		"CSRF":      p.session(r).csrf,
 		"Cfg":       pending,
 		"ActiveCfg": p.reg.Config(),
+		"Managed":   p.reg.Managed(),
 		"Modes":     config.ClientModes(),
 		"Saved":     r.URL.Query().Get("saved") == "1",
 		"Active":    "server",
@@ -261,9 +263,15 @@ func (p *Panel) serverSubmit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad transport", http.StatusBadRequest)
 		return
 	}
-	cfg.CarrierPort = get("carrier_port")
-	cfg.AWGPort = get("awg_port")
-	cfg.WGPort = get("wg_port")
+	if p.reg.Managed() {
+		cfg.CarrierPort = config.DefaultServerConfig().CarrierPort
+		cfg.AWGPort = config.DefaultServerConfig().AWGPort
+		cfg.WGPort = config.DefaultServerConfig().WGPort
+	} else {
+		cfg.CarrierPort = get("carrier_port")
+		cfg.AWGPort = get("awg_port")
+		cfg.WGPort = get("wg_port")
+	}
 	cfg.PanelPort = get("panel_port")
 	cfg.ExternalIP = strings.TrimSpace(r.PostFormValue("external_ip"))
 	if cfg.CarrierPort <= 0 || cfg.CarrierPort > 65535 ||

@@ -117,16 +117,17 @@ const serverTmpl = `{{define "content"}}
 {{$t := .Cfg.Transport}}
 {{range .Modes}}<option value="{{.}}" {{if eq $t .}}selected{{end}}>{{.}}</option>{{end}}
 </select></label></div>
-<div><label>Carrier port<input name="carrier_port" value="{{.Cfg.CarrierPort}}"></label></div>
+<div><label>Carrier port{{if .Managed}}<input readonly value="{{.Cfg.CarrierPort}}">{{else}}<input name="carrier_port" value="{{.Cfg.CarrierPort}}">{{end}}</label></div>
 <div><label>External IP (announce &amp; native)<input name="external_ip" value="{{.Cfg.ExternalIP}}" placeholder="autodetect"></label></div>
 </div>
 <div class="note">Carrier modes use the BitTorrent framing. Native modes require ExternalIP to be set.</div>
 {{if ne .Cfg.Transport .ActiveCfg.Transport}}<div class="note">Transport differs from active config — restart required.</div>{{end}}
 </div>
 <div class="card"><h2>Ports</h2>
+{{if .Managed}}<div class="note">Managed service: carrier, AWG and WG ports are fixed. Only the panel port is editable.</div>{{end}}
 <div class="row">
-<div><label>Native AWG UDP<input name="awg_port" value="{{.Cfg.AWGPort}}"></label></div>
-<div><label>Native WG UDP<input name="wg_port" value="{{.Cfg.WGPort}}"></label></div>
+<div><label>Native AWG UDP{{if .Managed}}<input readonly value="{{.Cfg.AWGPort}}">{{else}}<input name="awg_port" value="{{.Cfg.AWGPort}}">{{end}}</label></div>
+<div><label>Native WG UDP{{if .Managed}}<input readonly value="{{.Cfg.WGPort}}">{{else}}<input name="wg_port" value="{{.Cfg.WGPort}}">{{end}}</label></div>
 <div><label>Panel (loopback)<input name="panel_port" value="{{.Cfg.PanelPort}}"></label></div>
 </div>
 {{if or (ne .Cfg.CarrierPort .ActiveCfg.CarrierPort) (ne .Cfg.AWGPort .ActiveCfg.AWGPort) (ne .Cfg.WGPort .ActiveCfg.WGPort) (ne .Cfg.PanelPort .ActiveCfg.PanelPort)}}<div class="note">Port changes differ from active config — restart required.</div>{{end}}
@@ -184,7 +185,7 @@ const importTmpl = `{{define "content"}}
 <h1>Import string — {{.Client.Name}}</h1>
 <div class="card"><h2>btawg:// client bootstrap</h2>
 <p>This string is a <b>secret</b>: it carries the client's private key. Run on any PC:</p>
-<pre class="mono" id="import-command">btawg-client '{{.Import}}'</pre>
+<pre class="mono" id="import-command">btawg-client run '{{.Import}}'</pre>
 <p><button type="button" class="quiet" data-copy="import-command">Copy command</button> <span class="sub" data-copy-status role="status"></span></p>
 <p class="note">Copy it over a trusted channel. New imports connect directly. Select a carrier with <code>-transport</code> and use <code>-dht</code> when you want carrier discovery instead.</p>
 </div>

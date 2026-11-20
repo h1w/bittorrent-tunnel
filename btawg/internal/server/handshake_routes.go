@@ -11,6 +11,8 @@ import (
 
 // refreshHandshakeRoutes learns routes for idle peers without trusting carrier
 // headers. The device only publishes a handshake timestamp after authentication.
+// Each device maps to its own engine so a handshake on one mode cannot rewrite
+// an active flow owned by another mode.
 func (s *Server) refreshHandshakeRoutes() {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
@@ -26,8 +28,8 @@ func (s *Server) refreshHandshakeRoutes() {
 			}
 		case <-tick.C:
 			s.applyMu.Lock()
-			for i, d := range []*device.Device{s.dev, s.wg} {
-				state, err := d.IpcGet()
+			for _, pair := range s.deviceEnginePairs() {
+				state, err := pair.dev.IpcGet()
 				if err != nil {
 					continue
 				}
@@ -48,15 +50,33 @@ func (s *Server) refreshHandshakeRoutes() {
 						}
 					}
 					if sec > 0 {
-						eng := s.router.awg
-						if i == 1 {
-							eng = s.router.wg
-						}
-						s.router.observeHandshake(ip, key, eng, time.Unix(sec, nsec))
+						s.router.observeHandshake(ip, key, pair.eng, time.Unix(sec, nsec))
 					}
 				}
 			}
 			s.applyMu.Unlock()
 		}
 	}
+}
+
+type deviceEnginePair struct {
+	dev *device.Device
+	eng *engineTun
+}
+
+// deviceEnginePairs returns every device together with the engine it feeds.
+// Native AWG/WG map to their dedicated engines; each carrier mode maps to its
+// own engine so handshakes update only that mode's primary route.
+func (s *Server) deviceEnginePairs() []deviceEnginePair {
+	out := make([]deviceEnginePair, 0, 2+len(s.modeDevs))
+	if s.dev != nil {
+		out = append(out, deviceEnginePair{s.dev, s.router.awg})
+	}
+	if s.wg != nil {
+		out = append(out, deviceEnginePair{s.wg, s.router.wg})
+	}
+	for mode, d := range s.modeDevs {
+		out = append(out, deviceEnginePair{d, s.router.engines[mode]})
+	}
+	return out
 }

@@ -17,22 +17,26 @@ const routerBufSize = 2048
 var tunOffset = device.MessageTransportOffsetContent // 16 bytes of virtio/transport headroom
 
 // packetRouter multiplexes one shared inner TUN across cryptographic engines:
-// the AWG and WG devices plus one engine per authenticated TLS session.
-// Outbound packets read from the inner TUN are routed to the engine that owns
-// the destination overlay address. Inbound packets from an engine are
-// filtered, have their source recorded, and are forwarded to the inner TUN
-// (gateway or internet traffic) or injected directly into the owning engine of
-// the peer (client-to-client).
+// one AWG device per BitTorrent carrier mode, separate native AWG and WG
+// devices, and one engine per authenticated TLS session. Outbound packets read
+// from the inner TUN are routed to the engine that owns the destination overlay
+// address, with per-flow reverse routing taking precedence over the per-IP
+// primary route. Inbound packets from an engine are filtered, have their source
+// recorded, and are forwarded to the inner TUN (gateway or internet traffic) or
+// injected directly into the owning engine of the peer (client-to-client).
 type packetRouter struct {
 	inner    tun.Device
 	isKernel bool
 	policy   *policySnapshot
 
-	awg *engineTun
-	wg  *engineTun
+	awg     *engineTun
+	wg      *engineTun
+	engines map[string]*engineTun // keyed by canonical carrier mode
 
 	routesMu sync.RWMutex
 	routes   map[netip.Addr]activeRoute
+
+	flows *flowTable
 
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -41,6 +45,7 @@ type packetRouter struct {
 	pool    sync.Pool
 	readWg  sync.WaitGroup
 	eventWg sync.WaitGroup
+	flowWg  sync.WaitGroup
 }
 
 type activeRoute struct {
@@ -70,6 +75,8 @@ func newPacketRouter(inner tun.Device, isKernel bool, policy *policySnapshot) *p
 		isKernel: isKernel,
 		policy:   policy,
 		routes:   make(map[netip.Addr]activeRoute),
+		engines:  make(map[string]*engineTun),
+		flows:    newFlowTable(),
 		closed:   make(chan struct{}),
 	}
 	r.pool.New = func() interface{} {
@@ -82,7 +89,23 @@ func newPacketRouter(inner tun.Device, isKernel bool, policy *policySnapshot) *p
 	go r.dispatchLoop()
 	r.eventWg.Add(1)
 	go r.fanoutEvents()
+	r.flowWg.Add(1)
+	go r.flowCleanupLoop()
 	return r
+}
+
+// engineForMode returns the engine associated with a canonical carrier mode,
+// creating it on first use. The caller must not use this concurrently with
+// mode creation during server startup.
+func (r *packetRouter) engineForMode(mode string) *engineTun {
+	r.routesMu.Lock()
+	defer r.routesMu.Unlock()
+	e, ok := r.engines[mode]
+	if !ok {
+		e = r.newEngine(netip.Addr{})
+		r.engines[mode] = e
+	}
+	return e
 }
 
 // newEngine creates a queue. For TLS, authSource pins the enrolled IP.
@@ -97,13 +120,15 @@ func (r *packetRouter) newEngine(authSource netip.Addr) *engineTun {
 	return e
 }
 
-// removeEngine drops the route only if this session still owns it.
+// removeEngine drops the route only if this session still owns it and
+// invalidates any pinned flows for the engine.
 func (r *packetRouter) removeEngine(e *engineTun) {
 	r.routesMu.Lock()
 	if r.routes[e.authSource].eng == e {
 		delete(r.routes, e.authSource)
 	}
 	r.routesMu.Unlock()
+	r.flows.removeForEngine(e)
 }
 
 // close shuts down the router and the shared inner TUN once. It is safe to
@@ -117,8 +142,26 @@ func (r *packetRouter) close() error {
 		r.eventWg.Wait()
 		r.drainQueue(r.awg.packets)
 		r.drainQueue(r.wg.packets)
+		for _, e := range r.engines {
+			r.drainQueue(e.packets)
+		}
+		r.flowWg.Wait()
 	})
 	return r.closeErr
+}
+
+func (r *packetRouter) flowCleanupLoop() {
+	defer r.flowWg.Done()
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-tick.C:
+			r.flows.cleanup(time.Now())
+		case <-r.closed:
+			return
+		}
+	}
 }
 
 func (r *packetRouter) remember(ip netip.Addr, e *engineTun, now int64) {
@@ -147,12 +190,13 @@ func (r *packetRouter) observeHandshake(raw, key string, e *engineTun, at time.T
 	r.routesMu.Unlock()
 }
 
-// forget unconditionally drops the route for ip, used when a client is
-// revoked or moves to a new overlay address.
+// forget unconditionally drops the route and all pinned flows for ip, used
+// when a client is revoked or moves to a new overlay address.
 func (r *packetRouter) forget(ip netip.Addr) {
 	r.routesMu.Lock()
 	delete(r.routes, ip)
 	r.routesMu.Unlock()
+	r.flows.removeForIP(ip)
 }
 
 // dispatchLoop reads batches from the shared inner TUN and routes each valid
@@ -183,6 +227,7 @@ func (r *packetRouter) dispatchLoop() {
 		if err != nil {
 			return
 		}
+		now := time.Now()
 		for i := range n {
 			if sizes[i] < 1 || sizes[i] > len(bufs[i])-tunOffset {
 				continue
@@ -196,8 +241,8 @@ func (r *packetRouter) dispatchLoop() {
 			if !r.policy.downlink(src, dst, 0) {
 				continue
 			}
-			eng, ok := r.lookup(dst)
-			if !ok {
+			eng := r.lookupDestinationEngine(src, dst, packet, now)
+			if eng == nil {
 				continue // unknown path: drop
 			}
 			if eng.enqueue(bufs[i][:tunOffset+sizes[i]]) {
@@ -210,6 +255,26 @@ func (r *packetRouter) dispatchLoop() {
 			}
 		}
 	}
+}
+
+// lookupDestinationEngine selects the engine that should receive a packet
+// addressed to dst. Per-flow reverse routing takes precedence over the per-IP
+// primary route. The returned engine is nil when no path is known.
+func (r *packetRouter) lookupDestinationEngine(src, dst netip.Addr, packet []byte, now time.Time) *engineTun {
+	if fragKey, ok := fragmentKeyFromPacket(packet); ok {
+		if eng, ok := r.flows.lookupFragment(fragKey, now); ok {
+			return eng
+		}
+	}
+	if key, ok := flowKeyFromPacket(packet); ok {
+		if eng, ok := r.flows.lookup(key, now); ok {
+			return eng
+		}
+	}
+	if eng, ok := r.lookup(dst); ok {
+		return eng
+	}
+	return nil
 }
 
 // fanoutEvents copies events from the inner TUN to each engine's event
@@ -229,6 +294,9 @@ func (r *packetRouter) fanoutEvents() {
 			}
 			r.awg.sendEvent(ev)
 			r.wg.sendEvent(ev)
+			for _, e := range r.engines {
+				e.sendEvent(ev)
+			}
 		case <-r.closed:
 			return
 		}
@@ -282,9 +350,11 @@ func (r *packetRouter) drainQueue(ch <-chan []byte) {
 	}
 }
 
-// Read returns one queued packet for this engine. Client-to-client packets
-// are rechecked against the current policy so revocation takes effect even
-// for packets already queued.
+// Read returns one queued packet for this engine. Packets are accepted if
+// this engine owns the destination according to either the per-flow reverse
+// route or the per-IP primary route. Client-to-client packets are rechecked
+// against the current policy so revocation takes effect even for packets
+// already queued.
 func (e *engineTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	if len(bufs) == 0 || len(sizes) < len(bufs) || len(bufs[0]) <= offset {
 		return 0, errShortBuffer
@@ -307,8 +377,20 @@ func (e *engineTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			}
 			src, srcOK := ipv4Src(packet)
 			dst, dstOK := ipv4Dst(packet)
-			eng, active := e.router.lookup(dst)
-			if !srcOK || !dstOK || !active || eng != e || !e.router.policy.downlink(src, dst, min(len(packet), len(bufs[0])-offset)) {
+			if !srcOK || !dstOK {
+				e.router.pool.Put(p[:cap(p)])
+				continue
+			}
+			now := time.Now()
+			owner := e.router.lookupDestinationEngine(src, dst, packet, now)
+			if owner != e {
+				// Primary route may have moved; drop stale packet rather than
+				// deliver to the wrong engine. The sender will retry through
+				// the current owner.
+				e.router.pool.Put(p[:cap(p)])
+				continue
+			}
+			if !e.router.policy.downlink(src, dst, min(len(packet), len(bufs[0])-offset)) {
 				e.router.pool.Put(p[:cap(p)])
 				continue
 			}
@@ -320,10 +402,12 @@ func (e *engineTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	}
 }
 
-// Write receives decrypted packets from the engine, filters them, records the
-// authenticated source, and forwards them toward their destination.
+// Write receives decrypted packets from the engine, filters them, pins the
+// authenticated reverse flow to this engine, and forwards them toward their
+// destination.
 func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 	var innerBufs [][]byte
+	now := time.Now()
 	for _, b := range bufs {
 		if len(b) < offset+ipv4.HeaderLen {
 			continue
@@ -340,10 +424,13 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 			}
 		}
 		direct := e.router.isKernel && !e.router.policy.isClient(dst) && !e.router.policy.isGateway(dst)
-		now := time.Now()
 		if !e.router.policy.upload(src, dst, direct, len(packet), now) {
 			continue
 		}
+		// Pin the reverse flow so replies return to this engine. This is the
+		// only moment a flow's ownership is established; route changes and
+		// later handshakes cannot steal an active flow.
+		e.pinReverseFlow(packet, now)
 		if !e.authSource.IsValid() {
 			e.router.remember(src, e, now.UnixNano())
 		}
@@ -352,8 +439,8 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 			continue
 		}
 		if e.router.policy.isClient(dst) {
-			eng, ok := e.router.lookup(dst)
-			if !ok {
+			eng := e.router.lookupClientEngine(src, dst, packet, now)
+			if eng == nil {
 				continue
 			}
 			e.router.inject(eng, packet)
@@ -368,13 +455,46 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 	return len(bufs), nil
 }
 
+// pinReverseFlow records that return traffic for packet belongs to this
+// engine. For fragmented packets the IP ID is also pinned so all fragments
+// follow the same path.
+func (e *engineTun) pinReverseFlow(packet []byte, now time.Time) {
+	if key, ok := flowKeyFromPacket(packet); ok {
+		e.router.flows.pin(key.reverse(), e, now)
+	}
+	if fragKey, ok := fragmentKeyFromPacket(packet); ok {
+		e.router.flows.pinFragment(fragKey, e)
+	}
+}
+
+// lookupClientEngine selects the engine that should receive a
+// client-to-client packet addressed to dst. Per-flow routing takes precedence
+// (the destination may have initiated to the source), falling back to the
+// destination's current primary route.
+func (r *packetRouter) lookupClientEngine(src, dst netip.Addr, packet []byte, now time.Time) *engineTun {
+	if fragKey, ok := fragmentKeyFromPacket(packet); ok {
+		if eng, ok := r.flows.lookupFragment(fragKey, now); ok {
+			return eng
+		}
+	}
+	if key, ok := flowKeyFromPacket(packet); ok {
+		if eng, ok := r.flows.lookup(key, now); ok {
+			return eng
+		}
+	}
+	if eng, ok := r.lookup(dst); ok {
+		return eng
+	}
+	return nil
+}
+
 // Close shuts down this engine's virtual view. It closes the engine's event
 // stream so the owning device can finish its close sequence, but it does not
 // close the shared inner TUN; the parent owns that.
 func (e *engineTun) Close() error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.closedFlag {
+		e.mu.Unlock()
 		return nil
 	}
 	e.closedFlag = true
@@ -383,6 +503,8 @@ func (e *engineTun) Close() error {
 	if e.authSource.IsValid() {
 		e.router.drainQueue(e.packets)
 	}
+	e.mu.Unlock()
+	e.router.flows.removeForEngine(e)
 	return nil
 }
 

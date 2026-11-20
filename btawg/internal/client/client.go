@@ -272,6 +272,19 @@ func (c *Client) Run(ctx context.Context) error {
 	local := c.localProxy()
 	go local.Serve(ctx, ln)
 
+	return c.runTunnel(ctx)
+}
+
+// runTunnel keeps only the selected network path alive; managed clients
+// separately own all their SOCKS listeners.
+func (c *Client) runTunnel(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if c.ip != nil {
+		stop := context.AfterFunc(c.ip.life, cancel)
+		defer stop()
+	}
+
 	if config.IsNativeMode(c.cfg.Transport) {
 		<-ctx.Done()
 		return nil
