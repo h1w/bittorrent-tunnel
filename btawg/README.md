@@ -28,49 +28,47 @@ latency win; see the benchmark for why this matters).
 ### 1. Hub on a public-IP VPS
 
 ```sh
-mkdir -p /var/lib/btawg
-./btawg-server -store /var/lib/btawg/btawg.db
+sudo ./btawg-server install
 ```
 
-First boot prints, once:
+One command copies the binary to `/usr/local/bin`, writes and enables the
+`btawg-server` systemd unit, and starts it. State lives under `/var/lib/btawg`
+and `/etc/btawg`, surviving upgrades and restarts. Re-running `install` upgrades
+the binary without touching the database, client imports, or the admin password.
+
+The first install prints, once:
 
 ```
-btawg-server: panel login admin / <password> (shown once, loopback :8080)
-btawg-server: modes=ext-tcp,req-tcp,ext-utp,req-utp,awg,wg carrier=:6881 awg=:51821/udp wg=:51820/udp …
+btawg-server: panel login admin / <password> (shown once)
 ```
 
 **Save that password now** — it is never shown again. If lost, delete the db
 and re-import clients (or look into the store with the panel still logged in).
-Production runs need root (real-TUN mode). systemd unit:
 
-```ini
-[Unit]
-Description=btawg hub
-After=network-online.target
-Wants=network-online.target
+Manage the service and see its status from the TUI:
 
-[Service]
-ExecStart=/usr/local/bin/btawg-server -store /var/lib/btawg/btawg.db
-Restart=on-failure
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
-
-[Install]
-WantedBy=multi-user.target
+```sh
+btawg-server            # TUI: status, start/stop/restart, autostart
 ```
 
 Open **6881/TCP**, **6881/UDP**, **51821/UDP** (AWG), and **51820/UDP**
 (WG) on the hub, or the configured equivalents. DHT also needs outbound
-UDP. The admin panel stays on loopback. Real-TUN mode requires `ip`,
-`sysctl`, and `nft` (with kernel IPv4 NAT support). If the host firewall
-drops traffic, allow **1053/TCP only on the hub TUN** for DNS and allow
-forwarding from the TUN to the WAN plus established return traffic.
-btawg does not override the host firewall. There is no SOCKS5 port on the hub.
+UDP. Real-TUN mode requires `ip`, `sysctl`, and `nft` (with kernel IPv4 NAT
+support). If the host firewall drops traffic, allow **1053/TCP only on the hub
+TUN** for DNS and allow forwarding from the TUN to the WAN plus established
+return traffic. btawg configures routing, overlay addresses, and scoped NAT
+automatically, but it **does not open host firewall ports** — add those
+yourself.
 
 ### 2. Panel → first client
 
+The panel listens on **localhost** and the **hub's VPN address** (e.g.
+`http://10.77.0.1:8080`) — never the public IP. Before any client exists,
+reach it via SSH port-forward; once a client is connected, open it directly
+over the VPN.
+
 ```sh
-ssh -L 8080:127.0.0.1:8080 vps      # panel is loopback-only by design
+ssh -L 8080:127.0.0.1:8080 vps      # or open http://10.77.0.1:8080 over the VPN
 ```
 
 Open `http://127.0.0.1:8080`, log in (`admin` + printed password), then
@@ -81,27 +79,49 @@ share it as you would a WireGuard config.
 ### 3. Client machine
 
 ```sh
-sudo ./btawg-client 'btawg://…'      # root = btawg0 interface; without: sudo -E …
-./btawg-client -no-tun 'btawg://…'   # no interface, SOCKS5-only mode
+sudo ./btawg-client install -import-file client.txt   # or run without -import-file to paste it
 ```
 
-New imports contain the public hub endpoint and connect directly by default.
-For a BitTorrent carrier, `-dht` chooses discovery instead; earlier imports
-without an endpoint continue to use DHT. By default, SOCKS5 listens on `127.0.0.1:1080`.
+One command stores the import and generated credentials in `/etc/btawg`, then
+installs, enables, and starts the `btawg-client` systemd service. The mode from
+the import is enabled at first; the rest start reserved-but-off. Re-running
+`install` upgrades the binary without losing config or credentials.
 
-To share SOCKS5 with other devices on a trusted LAN, put `-socks-listen`
-before the import string:
+Run `btawg-client` with no arguments for the TUI:
+
+```text
+btawg-client  active / enabled
+[x] 1080  socks5-awg-ext-utp   active
+[ ] 1081  socks5-awg-ext-tcp   reserved
+...
+Space: toggle   v: show SOCKS5 login   g: regenerate
+s:start  t:stop  r:restart  b:autostart  q:quit
+```
+
+Each connection mode has a **fixed** local SOCKS5 port (1080 = first mode,
+1081 = second, …). Toggling a mode off closes its sessions but keeps its port
+reserved so nothing else can take it; the other ports keep working. The port
+mapping is permanent across toggles and restarts:
+
+| Port | Mode | Port | Mode |
+|---:|---|---:|---|
+| 1080 | AWG · ext-utp | 1085 | WG · udp |
+| 1081 | AWG · ext-tcp | 1086 | TLS · ext-utp |
+| 1082 | AWG · req-utp | 1087 | TLS · ext-tcp |
+| 1083 | AWG · req-tcp | 1088 | TLS · req-utp |
+| 1084 | AWG · udp | 1089 | TLS · req-tcp |
+
+All inbounds share **one SOCKS5 username/password** (RFC 1929). The TUI shows
+the pair (`v`) and regenerates it (`g`); rotation is immediate across every
+port and closes existing sessions. No-auth is refused. The SOCKS5 protocol
+does not encrypt these credentials — expose the ports only to a trusted LAN.
+
+For a single foreground connection (no service), the old form still works:
 
 ```sh
-sudo ./btawg-client -socks-listen 192.168.1.10 'btawg://…'  # use this machine's LAN IPv4
-sudo ./btawg-client -socks-listen 0.0.0.0 'btawg://…'       # all IPv4 interfaces
+sudo ./btawg-client 'btawg://…'      # one mode, btawg0 interface
+./btawg-client -no-tun 'btawg://…'   # no interface, SOCKS5-only mode
 ```
-
-Point the other devices at the client's LAN IP and SOCKS port (default `1080`).
-The flag also works with `-no-tun` and does not require re-importing the config.
-The proxy has no authentication: restrict inbound TCP to trusted LAN devices.
-If you use SOCKS5 UDP ASSOCIATE, allow its dynamically allocated UDP relay
-ports from those devices on the client as well.
 
 ### 4. Verify
 
@@ -144,8 +164,9 @@ import. Denied peer traffic is silently dropped.
 ```
 
 First boot generates and prints (once) the panel password and the deployment
-infohash; the panel listens on `127.0.0.1:8080` — reach it via SSH
-port-forward (`ssh -L 8080:127.0.0.1:8080 vps`). Flags:
+infohash; the panel listens on `127.0.0.1:8080` **and** the hub's VPN address
+(e.g. `10.77.0.1:8080`) — not the public IP. Reach it over the VPN, or via SSH
+port-forward (`ssh -L 8080:127.0.0.1:8080 vps`) before a client exists. Flags:
 `-transport` sets the preferred client mode, not which listeners are
 enabled. `-carrier-port` and `-dht-bootstrap host:port[,host:port…]` apply
 to the eight BitTorrent modes. `-external-ip` is the public IPv4 written into
@@ -187,10 +208,12 @@ or `./btawg-client -config file.txt`. The client then:
 - for a BitTorrent mode, connects to the imported endpoint or discovers it
   through DHT when requested; for the two native modes, connects directly over UDP
   to the selected native endpoint;
-- serves **no-auth SOCKS5 on 127.0.0.1:1080 by default**. Traffic
+- serves **SOCKS5 on 127.0.0.1:1080**. Traffic
   goes directly into the tunnel as IPv4 packets; the hub routes and NATs
   them. The client resolves SOCKS domain targets via the hub's overlay-only
-  DNS service, without asking the client's system DNS resolver;
+  DNS service, without asking the client's system DNS resolver. This single
+  foreground form is an unauthenticated debug path; the managed service
+  (`btawg-client install`) provides the authenticated per-mode inbounds;
 - with real TUN, creates `btawg0` with the assigned VPN address and the
   managed IPv4 subnet routes from the import. Only sockets bound to that
   interface use its private egress routing table; the host default route
