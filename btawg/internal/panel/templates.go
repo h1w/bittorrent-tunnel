@@ -115,12 +115,7 @@ const serverTmpl = `{{define "content"}}
 <div><label>Mode
 <select name="transport">
 {{$t := .Cfg.Transport}}
-<option value="ext-utp" {{if eq $t "ext-utp"}}selected{{end}}>extended (BEP 10) over µTP no-Nagle</option>
-<option value="ext-tcp" {{if eq $t "ext-tcp"}}selected{{end}}>extended (BEP 10) over TCP</option>
-<option value="req-utp" {{if eq $t "req-utp"}}selected{{end}}>request/piece over µTP no-Nagle</option>
-<option value="req-tcp" {{if eq $t "req-tcp"}}selected{{end}}>request/piece over TCP</option>
-<option value="awg" {{if eq $t "awg"}}selected{{end}}>native AmneziaWG UDP</option>
-<option value="wg" {{if eq $t "wg"}}selected{{end}}>native WireGuard UDP</option>
+{{range .Modes}}<option value="{{.}}" {{if eq $t .}}selected{{end}}>{{.}}</option>{{end}}
 </select></label></div>
 <div><label>Carrier port<input name="carrier_port" value="{{.Cfg.CarrierPort}}"></label></div>
 <div><label>External IP (announce &amp; native)<input name="external_ip" value="{{.Cfg.ExternalIP}}" placeholder="autodetect"></label></div>
@@ -197,8 +192,8 @@ const importTmpl = `{{define "content"}}
 <div class="card"><h2>Native config export</h2>
 <p>For standard WireGuard/AmneziaWG apps (requires ExternalIP):</p>
 <p>
-<a href="/clients/native?id={{.Client.ID}}&mode=awg"><button>AWG config</button></a>
-<a href="/clients/native?id={{.Client.ID}}&mode=wg"><button>WG config</button></a>
+<a href="/clients/native?id={{.Client.ID}}&mode=socks5-awg-udp"><button>Standalone AmneziaWG config</button></a>
+<a href="/clients/native?id={{.Client.ID}}&mode=socks5-wg-udp"><button>Standalone WireGuard config</button></a>
 </p>
 </div>
 <p><a href="/clients">← back to clients</a></p>

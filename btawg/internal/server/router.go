@@ -16,12 +16,13 @@ const routerBufSize = 2048
 
 var tunOffset = device.MessageTransportOffsetContent // 16 bytes of virtio/transport headroom
 
-// packetRouter multiplexes one shared inner TUN across two cryptographic
-// engines: index 0 is AWG, index 1 is WG. Outbound packets read from the
-// inner TUN are routed to the engine that last authenticated the destination
-// overlay address. Inbound packets from an engine are filtered, have their
-// source recorded, and are forwarded to the inner TUN (gateway or internet
-// traffic) or injected directly into the peer engine's queue (peer-to-peer).
+// packetRouter multiplexes one shared inner TUN across cryptographic engines:
+// the AWG and WG devices plus one engine per authenticated TLS session.
+// Outbound packets read from the inner TUN are routed to the engine that owns
+// the destination overlay address. Inbound packets from an engine are
+// filtered, have their source recorded, and are forwarded to the inner TUN
+// (gateway or internet traffic) or injected directly into the owning engine of
+// the peer (client-to-client).
 type packetRouter struct {
 	inner    tun.Device
 	isKernel bool
@@ -43,14 +44,17 @@ type packetRouter struct {
 }
 
 type activeRoute struct {
-	engine int
-	at     int64
+	eng *engineTun
+	at  int64
 }
 
-// engineTun is the tun.Device presented to one cryptographic engine.
+// engineTun is the tun.Device presented to one cryptographic engine. For the
+// AWG and WG devices authSource is zero and the engine is trusted to assert
+// the source address; a TLS session sets authSource to its enrolled overlay IP
+// so a client cannot spoof another client's source.
 type engineTun struct {
 	router     *packetRouter
-	index      int
+	authSource netip.Addr
 	packets    chan []byte
 	events     chan tun.Event
 	closed     chan struct{}
@@ -58,11 +62,8 @@ type engineTun struct {
 	closedFlag bool
 }
 
-// newPacketRouter creates a router around the shared inner TUN. isKernel is
-// retained for diagnostics but does not change routing: peer-to-peer traffic
-// is always routed directly between engines to avoid host-forward/firewall
-// dependencies. The caller must call Up() on each assembled device
-// explicitly; event fanout is handled here.
+// newPacketRouter creates a router around the shared inner TUN. Peer traffic
+// moves directly between engines; only gateway and routed egress use the TUN.
 func newPacketRouter(inner tun.Device, isKernel bool, policy *policySnapshot) *packetRouter {
 	r := &packetRouter{
 		inner:    inner,
@@ -74,20 +75,8 @@ func newPacketRouter(inner tun.Device, isKernel bool, policy *policySnapshot) *p
 	r.pool.New = func() interface{} {
 		return make([]byte, routerBufSize)
 	}
-	r.awg = &engineTun{
-		router:  r,
-		index:   0,
-		packets: make(chan []byte, 256),
-		events:  make(chan tun.Event, 8),
-		closed:  make(chan struct{}),
-	}
-	r.wg = &engineTun{
-		router:  r,
-		index:   1,
-		packets: make(chan []byte, 256),
-		events:  make(chan tun.Event, 8),
-		closed:  make(chan struct{}),
-	}
+	r.awg = r.newEngine(netip.Addr{})
+	r.wg = r.newEngine(netip.Addr{})
 
 	r.readWg.Add(1)
 	go r.dispatchLoop()
@@ -96,16 +85,29 @@ func newPacketRouter(inner tun.Device, isKernel bool, policy *policySnapshot) *p
 	return r
 }
 
-// device returns the tun.Device for the requested engine: 0 for AWG, 1 for WG.
-func (r *packetRouter) device(index int) *engineTun {
-	if index == 0 {
-		return r.awg
+// newEngine creates a queue. For TLS, authSource pins the enrolled IP.
+func (r *packetRouter) newEngine(authSource netip.Addr) *engineTun {
+	e := &engineTun{
+		router:     r,
+		authSource: authSource,
+		packets:    make(chan []byte, 256),
+		events:     make(chan tun.Event, 8),
+		closed:     make(chan struct{}),
 	}
-	return r.wg
+	return e
+}
+
+// removeEngine drops the route only if this session still owns it.
+func (r *packetRouter) removeEngine(e *engineTun) {
+	r.routesMu.Lock()
+	if r.routes[e.authSource].eng == e {
+		delete(r.routes, e.authSource)
+	}
+	r.routesMu.Unlock()
 }
 
 // close shuts down the router and the shared inner TUN once. It is safe to
-// call multiple times; the parent is responsible for calling this after both
+// call multiple times; the parent is responsible for calling this after the
 // engine devices have been closed.
 func (r *packetRouter) close() error {
 	r.closeOnce.Do(func() {
@@ -119,28 +121,20 @@ func (r *packetRouter) close() error {
 	return r.closeErr
 }
 
-// forget removes any learned route for ip, used when a client or proxy
-// session is revoked.
-func (r *packetRouter) forget(ip netip.Addr) {
+func (r *packetRouter) remember(ip netip.Addr, e *engineTun, now int64) {
 	r.routesMu.Lock()
-	delete(r.routes, ip)
+	r.routes[ip] = activeRoute{eng: e, at: now}
 	r.routesMu.Unlock()
 }
 
-func (r *packetRouter) remember(ip netip.Addr, idx int, now time.Time) {
-	r.routesMu.Lock()
-	r.routes[ip] = activeRoute{engine: idx, at: now.UnixNano()}
-	r.routesMu.Unlock()
-}
-
-func (r *packetRouter) lookup(ip netip.Addr) (int, bool) {
+func (r *packetRouter) lookup(ip netip.Addr) (*engineTun, bool) {
 	r.routesMu.RLock()
 	route, ok := r.routes[ip]
 	r.routesMu.RUnlock()
-	return route.engine, ok
+	return route.eng, ok
 }
 
-func (r *packetRouter) observeHandshake(raw, key string, idx int, at time.Time) {
+func (r *packetRouter) observeHandshake(raw, key string, e *engineTun, at time.Time) {
 	p, err := netip.ParsePrefix(raw)
 	if err != nil || p.Bits() != 32 || !p.Addr().Is4() || !r.policy.handshake(p.Addr(), key, at) {
 		return
@@ -148,8 +142,16 @@ func (r *packetRouter) observeHandshake(raw, key string, idx int, at time.Time) 
 	when := at.UnixNano()
 	r.routesMu.Lock()
 	if when > r.routes[p.Addr()].at {
-		r.routes[p.Addr()] = activeRoute{engine: idx, at: when}
+		r.routes[p.Addr()] = activeRoute{eng: e, at: when}
 	}
+	r.routesMu.Unlock()
+}
+
+// forget unconditionally drops the route for ip, used when a client is
+// revoked or moves to a new overlay address.
+func (r *packetRouter) forget(ip netip.Addr) {
+	r.routesMu.Lock()
+	delete(r.routes, ip)
 	r.routesMu.Unlock()
 }
 
@@ -194,16 +196,12 @@ func (r *packetRouter) dispatchLoop() {
 			if !r.policy.downlink(src, dst, 0) {
 				continue
 			}
-			idx, ok := r.lookup(dst)
+			eng, ok := r.lookup(dst)
 			if !ok {
 				continue // unknown path: drop
 			}
-			select {
-			case <-r.closed:
-			case r.device(idx).packets <- bufs[i][:tunOffset+sizes[i]]:
+			if eng.enqueue(bufs[i][:tunOffset+sizes[i]]) {
 				bufs[i] = nil // ownership transferred
-			default:
-				// queue full: drop
 			}
 		}
 		for i := range bufs {
@@ -215,7 +213,7 @@ func (r *packetRouter) dispatchLoop() {
 }
 
 // fanoutEvents copies events from the inner TUN to each engine's event
-// channel so both devices observe MTU updates and down events. Events for an
+// channel so all devices observe MTU updates and down events. Events for an
 // already-closed engine are dropped.
 func (r *packetRouter) fanoutEvents() {
 	defer r.eventWg.Done()
@@ -249,17 +247,28 @@ func (e *engineTun) sendEvent(ev tun.Event) {
 	}
 }
 
-// inject places a copy of packet into engine idx's inbound queue.
-func (r *packetRouter) inject(idx int, packet []byte) {
+// inject places a copy of packet into an engine's inbound queue.
+func (r *packetRouter) inject(e *engineTun, packet []byte) {
 	buf := r.pool.Get().([]byte)
 	n := copy(buf[tunOffset:], packet)
-	select {
-	case <-r.closed:
-		r.pool.Put(buf[:cap(buf)])
-	case r.device(idx).packets <- buf[:tunOffset+n]:
-	default:
+	if !e.enqueue(buf[:tunOffset+n]) {
 		r.pool.Put(buf[:cap(buf)])
 	}
+}
+
+func (e *engineTun) enqueue(p []byte) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closedFlag {
+		return false
+	}
+	select {
+	case <-e.router.closed:
+	case e.packets <- p:
+		return true
+	default:
+	}
+	return false
 }
 
 func (r *packetRouter) drainQueue(ch <-chan []byte) {
@@ -298,8 +307,8 @@ func (e *engineTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			}
 			src, srcOK := ipv4Src(packet)
 			dst, dstOK := ipv4Dst(packet)
-			idx, active := e.router.lookup(dst)
-			if !srcOK || !dstOK || !active || idx != e.index || !e.router.policy.downlink(src, dst, min(len(packet), len(bufs[0])-offset)) {
+			eng, active := e.router.lookup(dst)
+			if !srcOK || !dstOK || !active || eng != e || !e.router.policy.downlink(src, dst, min(len(packet), len(bufs[0])-offset)) {
 				e.router.pool.Put(p[:cap(p)])
 				continue
 			}
@@ -325,22 +334,29 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 		if !srcOK || !dstOK {
 			continue
 		}
+		if e.authSource.IsValid() {
+			if active, _ := e.router.lookup(src); src != e.authSource || active != e {
+				continue
+			}
+		}
 		direct := e.router.isKernel && !e.router.policy.isClient(dst) && !e.router.policy.isGateway(dst)
 		now := time.Now()
 		if !e.router.policy.upload(src, dst, direct, len(packet), now) {
 			continue
 		}
-		e.router.remember(src, e.index, now)
+		if !e.authSource.IsValid() {
+			e.router.remember(src, e, now.UnixNano())
+		}
 		if e.router.policy.isGateway(dst) || direct {
 			innerBufs = append(innerBufs, b)
 			continue
 		}
 		if e.router.policy.isClient(dst) {
-			idx, ok := e.router.lookup(dst)
+			eng, ok := e.router.lookup(dst)
 			if !ok {
 				continue
 			}
-			e.router.inject(idx, packet)
+			e.router.inject(eng, packet)
 			continue
 		}
 	}
@@ -354,7 +370,7 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 
 // Close shuts down this engine's virtual view. It closes the engine's event
 // stream so the owning device can finish its close sequence, but it does not
-// close the shared inner TUN; the parent does that after both engines close.
+// close the shared inner TUN; the parent owns that.
 func (e *engineTun) Close() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -364,6 +380,9 @@ func (e *engineTun) Close() error {
 	e.closedFlag = true
 	close(e.closed)
 	close(e.events)
+	if e.authSource.IsValid() {
+		e.router.drainQueue(e.packets)
+	}
 	return nil
 }
 

@@ -1,10 +1,10 @@
-# btawg — AmneziaWG inside BitTorrent
+# btawg — routed IPv4 and SOCKS5 over BitTorrent
 
 Two Linux binaries: `btawg-server` (VPS hub) and `btawg-client` (device node).
-AmneziaWG datagrams travel inside BitTorrent wire messages; the server is
-found **strictly through DHT** — no server address ships in any config. A
-3x-ui-style web panel manages the hub; each client is one `btawg://` import
-string.
+Use AmneziaWG or mutual TLS 1.3 inside BitTorrent, or native AmneziaWG
+and WireGuard over UDP. Clients use an imported hub endpoint by default;
+BitTorrent modes also support DHT discovery. The hub's web panel manages
+VPN addresses, groups and `btawg://` imports.
 
 Built on the validated transport: extended (BEP 10) over µTP no-Nagle —
 **+0.07 ms p95 vs bare AWG**, classified as `BitTorrent` by nDPI 6.1.0 with
@@ -119,7 +119,7 @@ default route.
 In **Groups**, create an IPv4 subnet and set its peer visibility and
 Internet policy. In **Clients**, choose a group when creating a user, or
 move an existing user. Users inherit both group rules unless explicitly
-overridden. The hub gives the user the same address in all six modes.
+overridden. The hub gives the user the same address in all ten modes.
 
 Permission changes apply live, including closing disallowed active SOCKS
 sessions. A move to another subnet or a changed group CIDR needs a new
@@ -147,10 +147,10 @@ infohash; the panel listens on `127.0.0.1:8080` — reach it via SSH
 port-forward (`ssh -L 8080:127.0.0.1:8080 vps`). Flags:
 `-transport` sets the preferred client mode, not which listeners are
 enabled. `-carrier-port` and `-dht-bootstrap host:port[,host:port…]` apply
-to the four carrier modes. `-external-ip` is the public IPv4 written into
+to the eight BitTorrent modes. `-external-ip` is the public IPv4 written into
 imports; set it explicitly if the outbound interface address is not public.
 
-The four carriers support both a direct endpoint and DHT discovery. Native
+All eight BitTorrent modes support a direct endpoint and DHT discovery. Native
 AWG/WG use their explicit UDP endpoints. No mode silently falls back to
 another. The panel exposes one `btawg://` import and native config
 downloads for the same registered user.
@@ -177,14 +177,14 @@ peers on the hub share its pacing budget. TCP modes ignore this setting.
 ## Run a client (any PC)
 
 ```sh
-./btawg-client -transport ext-tcp 'btawg://…'  # pick any listed mode
-./btawg-client -transport ext-tcp -dht 'btawg://…' # explicitly use DHT
+./btawg-client -transport socks5-awg-ext-tcp 'btawg://…'
+./btawg-client -transport socks5-req-tcp -dht 'btawg://…'
 ```
 
 or `./btawg-client -config file.txt`. The client then:
 
 - for a BitTorrent mode, connects to the imported endpoint or discovers it
-  through DHT when requested; for `awg` or `wg`, connects directly over UDP
+  through DHT when requested; for the two native modes, connects directly over UDP
   to the selected native endpoint;
 - serves **no-auth SOCKS5 on 127.0.0.1:1080 by default**. Traffic
   is chained through the tunnel to the hub's egress, which dials the real
@@ -193,6 +193,20 @@ or `./btawg-client -config file.txt`. The client then:
   managed IPv4 subnet routes from the import. It never installs a default
   route. To send selected public prefixes through the VPN, add explicit
   client routes; the hub still decides whether to forward them.
+
+| AWG inside BitTorrent | TLS 1.3 inside BitTorrent (no AWG) | Outer transport |
+|---|---|---|
+| `socks5-awg-ext-tcp` | `socks5-ext-tcp` | Extended messages over TCP |
+| `socks5-awg-req-tcp` | `socks5-req-tcp` | Request/piece over TCP |
+| `socks5-awg-ext-utp` | `socks5-ext-utp` | Extended messages over µTP (UDP) |
+| `socks5-awg-req-utp` | `socks5-req-utp` | Request/piece over µTP (UDP) |
+
+`socks5-awg-udp` and `socks5-wg-udp` are native AWG and WG without BitTorrent.
+SOCKS5 supports TCP and UDP in all modes; direct VPN IP traffic uses the same
+tunnel without SOCKS5. The four TLS modes use the same IPv4 addresses and
+hub ACLs as AWG/WG. Upgrade both binaries and re-export the import to get the
+TLS server pin and discovery hashes. Existing imports and short names remain
+usable in the original modes; there is no TLS-to-AWG fallback.
 
 ### Client-to-client
 
@@ -245,21 +259,20 @@ be recovered. An unclean shutdown may lose traffic since the last checkpoint.
 
 ## Import string
 
-`btawg://` + base64url(JSON): version, infohash, hub public key, client
-private/public key, overlay IP/subnet, transport, SOCKS/egress ports, AWG
-profile. It carries **no server endpoint** and it is a **secret** — it
-contains the client's private key. Anyone with the infohash can learn the
-hub's IP via DHT, but without AWG keys the channel stays opaque.
+`btawg://` + base64url(JSON) carries overlay addressing, connection chain,
+endpoints and discovery hashes, the hub's public keys, and the client's
+private key. Treat it as a secret and share it only over a trusted channel.
+The BitTorrent handshake and DHT hash do not authenticate a peer: AWG or
+the pinned mutual TLS keys authenticate each encrypted connection.
 
 ## Verification performed
 
 - Carrier framing, SOCKS5 (CONNECT + UDP ASSOCIATE), bbolt store, DHT
   announce/discover (loopback relay), panel handlers: unit tests.
 - Full suite `go test ./...` green incl. `-race` on the networking paths.
-- End-to-end in all four carrier modes: DHT discovery through a local relay,
-  AWG handshake, SOCKS5 TCP and UDP egress, and client-to-client traffic
-  through the hub (`internal/e2e/e2e_test.go`). These are functional checks,
-  not throughput benchmarks.
+- End-to-end in all eight BitTorrent modes: DHT discovery through a local
+  relay, SOCKS5 policy and client-to-client IPv4 traffic through the hub.
+  The mixed-mode test also routes between both native modes and the carriers.
 
 On a single Linux host, separate network namespaces connected by a kernel
 `netkit` link (RTT approximately 0.06 ms) transferred and verified 1 GiB per
@@ -306,11 +319,14 @@ one run below that threshold.
 
 ## Honest limits
 
-- Camouflage is **wire-format only, not hash-correct**: AWG ciphertext
-  substitutes for file blocks; piece hashes never validate; no metadata is
-  served. Verified against **nDPI 6.1.0 only** (offline pcaps with
-  synthesized L3/L4 headers around real outer bytes). Active probing is out
+- BitTorrent framing substitutes encrypted traffic for file blocks. Piece
+  hashes never validate; no metadata is served. Existing nDPI 6.1.0 results
+  cover the historical AWG carrier, not the new TLS modes. Active probing is out
   of scope. No claim of universal undetectability.
+- Native AWG adds the profile's `S4` bytes on top of the normal tunnel
+  overhead. With the default profile on a 1500-byte IPv4 path, reduce the
+  native client TUN MTU (e.g. to 1400) if large transfers fail with
+  `message too long`. This does not apply to the BitTorrent modes.
 - DHT discovery depends on bootstrap reachability; if a network blocks the
   public DHT, point both sides at a private bootstrap island with
   `-dht-bootstrap` (hub) and the import string's `dht_bootstrap` field.

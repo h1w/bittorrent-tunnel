@@ -32,6 +32,7 @@ type Registry interface {
 	Traffic() map[string]store.Traffic
 	InfoHash() string
 	PubKey() string
+	TLSServerKey() string
 }
 
 const (
@@ -225,10 +226,12 @@ func (p *Panel) serverPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	pending.Normalize()
 	p.render(w, "server", map[string]any{
 		"CSRF":      p.session(r).csrf,
 		"Cfg":       pending,
 		"ActiveCfg": p.reg.Config(),
+		"Modes":     config.ClientModes(),
 		"Saved":     r.URL.Query().Get("saved") == "1",
 		"Active":    "server",
 	})
@@ -250,7 +253,7 @@ func (p *Panel) serverSubmit(w http.ResponseWriter, r *http.Request) {
 		S1: get("s1"), S2: get("s2"), S3: get("s3"), S4: get("s4"),
 		H1: get("h1"), H2: get("h2"), H3: get("h3"), H4: get("h4"),
 	}
-	cfg.Transport = r.PostFormValue("transport")
+	cfg.Transport = config.CanonicalMode(r.PostFormValue("transport"))
 	if cfg.LegacyTransport == "" {
 		cfg.LegacyTransport = p.reg.Config().LegacyTransport
 	}
@@ -465,7 +468,10 @@ func (p *Panel) buildClientConfig(rec store.ClientRecord, cfg config.ServerConfi
 		legacy = preferred
 	}
 	hashes := make(map[string]string)
-	for _, mode := range []string{config.ModeExtUTP, config.ModeExtTCP, config.ModeReqUTP, config.ModeReqTCP} {
+	for _, mode := range config.ClientModes() {
+		if !config.IsCarrierMode(mode) {
+			continue
+		}
 		h, err := config.CarrierHash(base, legacy, mode)
 		if err != nil {
 			return config.ClientConfig{}, err
@@ -488,6 +494,7 @@ func (p *Panel) buildClientConfig(rec store.ClientRecord, cfg config.ServerConfi
 		InfoHash:      hashes[preferred],
 		ServerPubKey:  p.reg.PubKey(),
 		ClientPrivKey: rec.PrivKey,
+		TLSServerKey:  p.reg.TLSServerKey(),
 		ClientPubKey:  rec.PubKey,
 		ClientIP:      rec.IP,
 		Subnet:        group.Subnet,
@@ -540,7 +547,7 @@ func (p *Panel) clientNative(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "native config requires a public ExternalIP", http.StatusPreconditionFailed)
 		return
 	}
-	mode := r.URL.Query().Get("mode")
+	mode := config.CanonicalMode(r.URL.Query().Get("mode"))
 	if !config.IsNativeMode(mode) {
 		http.Error(w, "bad native mode", http.StatusBadRequest)
 		return

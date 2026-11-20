@@ -18,9 +18,13 @@ func TestMixedTransportStableAddress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	relay := newRelay(t)
-	specs := []clientSpec{{id: "a", ip: "10.77.0.2"}, {id: "b", ip: "10.77.0.3"}, {id: "c", ip: "10.77.0.4"}, {id: "d", ip: "10.77.0.5"}, {id: "e", ip: "10.77.0.6"}, {id: "f", ip: "10.77.0.7"}}
+	modes := []string{"socks5-awg-ext-tcp", "socks5-awg-req-tcp", "socks5-awg-ext-utp", "socks5-awg-req-utp",
+		"socks5-awg-udp", "socks5-wg-udp", "socks5-ext-tcp", "socks5-req-tcp", "socks5-ext-utp", "socks5-req-utp"}
+	specs := make([]clientSpec, len(modes))
+	for i := range specs {
+		specs[i] = clientSpec{id: strconv.Itoa(i), ip: "10.77.0." + strconv.Itoa(i+2)}
+	}
 	hub, st, recs := hubWithClients(t, ctx, relay, specs, "ext-utp")
-	modes := []string{"ext-tcp", "req-tcp", "ext-utp", "req-utp", "awg", "wg"}
 	cs := make([]*client.Client, len(modes))
 	ls := make([]net.Listener, len(modes))
 	cfg := hub.Config()
@@ -29,11 +33,15 @@ func TestMixedTransportStableAddress(t *testing.T) {
 		cc := clientConfigFor(hub, recs[i], relay, recs[i].IP)
 		cc.Transport = mode
 		h, err := config.CarrierHash(hub.InfoHash(), cfg.Transport, mode)
-		if mode != "wg" && mode != "awg" {
+		if !config.IsNativeMode(mode) {
 			if err != nil {
 				t.Fatal(err)
 			}
 			cc.InfoHash = h
+		}
+		if config.IsTLSMode(mode) {
+			cc.CarrierHashes = map[string]string{mode: h}
+			cc.TLSServerKey = hub.TLSServerKey()
 		}
 		cc.AWGEndpoint = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(cfg.AWGPort)).String()
 		cc.WGEndpoint = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(cfg.WGPort)).String()
@@ -105,7 +113,7 @@ func TestMixedTransportStableAddress(t *testing.T) {
 	// A new stack using the same identity and address can leave WG for AWG.
 	ls[5].Close()
 	cs[5].Close()
-	cs[5] = start(5, "awg")
+	cs[5] = start(5, "socks5-awg-udp")
 	probe(5, 0)
 	after := hub.Traffic()[recs[5].ID]
 	if after.Up <= before.Up || after.Down <= before.Down {

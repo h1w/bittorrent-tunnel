@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 )
 
 // protocol is the BitTorrent protocol identifier sent in every handshake.
@@ -33,50 +34,51 @@ func Handshake(c net.Conn, infoHash, peerID [20]byte) ([20]byte, error) {
 
 // Accept reads the first BitTorrent handshake once on a server connection,
 // dispatches to the carrier framing selected by the infohash in hashes
-// (values "ext" or "req"), replies with the same wire handshake, and
+// ("ext" or "req", optionally with a payload suffix), replies, and
 // negotiates the existing request/piece feature bits. The caller is
 // responsible for any deadline on c; Accept does not reset it. The returned
-// peer ID is the one presented by the remote end.
-func Accept(c net.Conn, serverID [20]byte, hashes map[[20]byte]string) (Transport, [20]byte, error) {
+// peer ID and family identify the enrollment and payload protocol.
+func Accept(c net.Conn, serverID [20]byte, hashes map[[20]byte]string) (Transport, [20]byte, string, error) {
 	var zero [20]byte
 	var got [68]byte
 	if _, err := io.ReadFull(c, got[:]); err != nil {
 		c.Close()
-		return nil, zero, fmt.Errorf("read peer handshake: %w", err)
+		return nil, zero, "", fmt.Errorf("read peer handshake: %w", err)
 	}
 	if got[0] != 19 || string(got[1:20]) != protocol {
 		c.Close()
-		return nil, zero, fmt.Errorf("invalid BT handshake magic")
+		return nil, zero, "", fmt.Errorf("invalid BT handshake magic")
 	}
 	var infoHash [20]byte
 	copy(infoHash[:], got[28:48])
 	mode, ok := hashes[infoHash]
 	if !ok {
 		c.Close()
-		return nil, zero, fmt.Errorf("unknown infohash")
+		return nil, zero, "", fmt.Errorf("unknown infohash")
 	}
 	var theirs [20]byte
 	copy(theirs[:], got[48:68])
 	peerFeatures := got[20]
 
-	switch mode {
+	framing, _, _ := strings.Cut(mode, "-")
+	switch framing {
 	case "ext":
 		if err := acceptSendHandshake(c, infoHash, serverID, 0); err != nil {
 			c.Close()
-			return nil, theirs, fmt.Errorf("write handshake: %w", err)
+			return nil, theirs, mode, fmt.Errorf("write handshake: %w", err)
 		}
 		tr, err := acceptExtended(c, theirs)
-		return tr, theirs, err
+		return tr, theirs, mode, err
 	case "req":
 		if err := acceptSendHandshake(c, infoHash, serverID, wideRequestFeature|compactRequestFeature); err != nil {
 			c.Close()
-			return nil, theirs, fmt.Errorf("write handshake: %w", err)
+			return nil, theirs, mode, fmt.Errorf("write handshake: %w", err)
 		}
 		tr, err := acceptRequestPiece(c, theirs, peerFeatures)
-		return tr, theirs, err
+		return tr, theirs, mode, err
 	default:
 		c.Close()
-		return nil, theirs, fmt.Errorf("unknown carrier mode %q", mode)
+		return nil, theirs, mode, fmt.Errorf("unknown carrier mode %q", mode)
 	}
 }
 

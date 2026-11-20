@@ -23,23 +23,66 @@ const ImportPrefix = "btawg://"
 // ParseImportString.
 const ClientVersion = 1
 
-// Supported client transport modes.
+// Supported SOCKS5 connection chains. Native modes can also be exported
+// for standalone clients that do not provide SOCKS5.
 const (
-	ModeExtUTP = "ext-utp"
-	ModeExtTCP = "ext-tcp"
-	ModeReqUTP = "req-utp"
-	ModeReqTCP = "req-tcp"
-	ModeAWG    = "awg"
-	ModeWG     = "wg"
+	ModeExtUTP = "socks5-awg-ext-utp"
+	ModeExtTCP = "socks5-awg-ext-tcp"
+	ModeReqUTP = "socks5-awg-req-utp"
+	ModeReqTCP = "socks5-awg-req-tcp"
+	ModeAWG    = "socks5-awg-udp"
+	ModeWG     = "socks5-wg-udp"
+
+	ModeTLSExtUTP = "socks5-ext-utp"
+	ModeTLSExtTCP = "socks5-ext-tcp"
+	ModeTLSReqUTP = "socks5-req-utp"
+	ModeTLSReqTCP = "socks5-req-tcp"
 )
 
-// clientModes is the ordered list used for help text and validation.
-var clientModes = []string{ModeExtUTP, ModeExtTCP, ModeReqUTP, ModeReqTCP, ModeAWG, ModeWG}
+// ClientModes returns the canonical names in display order.
+func ClientModes() []string {
+	return []string{ModeExtUTP, ModeExtTCP, ModeReqUTP, ModeReqTCP, ModeAWG, ModeWG,
+		ModeTLSExtUTP, ModeTLSExtTCP, ModeTLSReqUTP, ModeTLSReqTCP}
+}
+
+// CanonicalMode translates transport names from existing deployments.
+func CanonicalMode(mode string) string {
+	switch mode {
+	case "ext-utp":
+		return ModeExtUTP
+	case "ext-tcp":
+		return ModeExtTCP
+	case "req-utp":
+		return ModeReqUTP
+	case "req-tcp":
+		return ModeReqTCP
+	case "awg":
+		return ModeAWG
+	case "wg":
+		return ModeWG
+	default:
+		return mode
+	}
+}
+
+// CarrierFraming reports the BitTorrent wire framing, or empty for other modes.
+func CarrierFraming(mode string) string {
+	switch CanonicalMode(mode) {
+	case ModeExtUTP, ModeExtTCP, ModeTLSExtUTP, ModeTLSExtTCP:
+		return "ext"
+	case ModeReqUTP, ModeReqTCP, ModeTLSReqUTP, ModeTLSReqTCP:
+		return "req"
+	}
+	return ""
+}
 
 // IsCarrierMode reports whether mode uses the BitTorrent carrier path.
-func IsCarrierMode(mode string) bool {
+func IsCarrierMode(mode string) bool { return CarrierFraming(mode) != "" }
+
+// IsTLSMode reports whether the carrier uses TLS instead of AWG.
+func IsTLSMode(mode string) bool {
 	switch mode {
-	case ModeExtUTP, ModeExtTCP, ModeReqUTP, ModeReqTCP:
+	case ModeTLSExtUTP, ModeTLSExtTCP, ModeTLSReqUTP, ModeTLSReqTCP:
 		return true
 	}
 	return false
@@ -47,16 +90,16 @@ func IsCarrierMode(mode string) bool {
 
 // IsNativeMode reports whether mode uses a direct AWG or WireGuard UDP path.
 func IsNativeMode(mode string) bool {
-	switch mode {
-	case ModeAWG, ModeWG:
-		return true
-	}
-	return false
+	mode = CanonicalMode(mode)
+	return mode == ModeAWG || mode == ModeWG
 }
 
 // ValidClientMode reports whether mode is one of the supported modes.
-func ValidClientMode(mode string) bool {
-	return IsCarrierMode(mode) || IsNativeMode(mode)
+func ValidClientMode(mode string) bool { return IsCarrierMode(mode) || IsNativeMode(mode) }
+
+// CarrierHelloModes returns one representative per discovery hash.
+func CarrierHelloModes() [4]string {
+	return [4]string{ModeExtTCP, ModeReqTCP, ModeTLSExtTCP, ModeTLSReqTCP}
 }
 
 // AWGProfile holds the AmneziaWG obfuscation parameters shared by the server
@@ -94,16 +137,17 @@ func (p AWGProfile) String() string {
 // reachable endpoint: it exists only inside the tunnel.
 type ClientConfig struct {
 	Version         int               `json:"version"`
-	InfoHash        string            `json:"infohash"`       // legacy 20-byte hex (old framing)
-	ServerPubKey    string            `json:"server_pubkey"`  // hex
-	ClientPrivKey   string            `json:"client_privkey"` // hex (secret)
-	ClientPubKey    string            `json:"client_pubkey"`  // hex
-	ClientIP        string            `json:"client_ip"`      // overlay, e.g. 10.77.0.2
-	Subnet          string            `json:"subnet"`         // overlay, e.g. 10.77.0.0/24
-	ServerIP        string            `json:"server_ip"`      // overlay hub, e.g. 10.77.0.1
-	Transport       string            `json:"transport"`      // user-selected mode
-	SocksPort       int               `json:"socks_port"`     // client's local no-auth SOCKS5
-	EgressPort      int               `json:"egress_port"`    // hub's overlay SOCKS5 the chain targets
+	InfoHash        string            `json:"infohash"`                 // legacy 20-byte hex (old framing)
+	ServerPubKey    string            `json:"server_pubkey"`            // hex
+	TLSServerKey    string            `json:"tls_server_key,omitempty"` // pinned Ed25519 public key
+	ClientPrivKey   string            `json:"client_privkey"`           // hex (secret)
+	ClientPubKey    string            `json:"client_pubkey"`            // hex
+	ClientIP        string            `json:"client_ip"`                // overlay, e.g. 10.77.0.2
+	Subnet          string            `json:"subnet"`                   // overlay, e.g. 10.77.0.0/24
+	ServerIP        string            `json:"server_ip"`                // overlay hub, e.g. 10.77.0.1
+	Transport       string            `json:"transport"`                // user-selected mode
+	SocksPort       int               `json:"socks_port"`               // client's local no-auth SOCKS5
+	EgressPort      int               `json:"egress_port"`              // hub's overlay SOCKS5 the chain targets
 	Profile         AWGProfile        `json:"awg_profile"`
 	DHTBootstrap    []string          `json:"dht_bootstrap,omitempty"`
 	CarrierHashes   map[string]string `json:"carrier_hashes,omitempty"`   // mode -> 20-byte hex infohash
@@ -142,33 +186,22 @@ func ParseImportString(s string) (ClientConfig, error) {
 	return c, nil
 }
 
-// framing returns the carrier framing family of a mode: "ext" or "req".
-// Native modes have no carrier framing.
-func framing(mode string) string {
-	if i := strings.Index(mode, "-"); i > 0 {
-		return mode[:i]
-	}
-	return mode
-}
-
-// CarrierHash returns a deterministic 20-byte hex infohash for a carrier mode.
-// The base infohash is preserved for every mode that shares the preferred
-// mode's framing family (ext or req) so old clients and old hub imports keep
-// working; the other framing family gets a stable derivative.
+// CarrierHash returns a 20-byte hex discovery hash. Legacy AWG framing keeps
+// its existing hashes; TLS always gets a separate namespace per framing.
 func CarrierHash(base, preferred, mode string) (string, error) {
-	if mode == "" {
-		return "", fmt.Errorf("mode required")
+	framing := CarrierFraming(mode)
+	if framing == "" {
+		return "", fmt.Errorf("invalid carrier mode %q", mode)
 	}
 	if err := validateInfoHash(base); err != nil {
 		return "", fmt.Errorf("invalid base infohash: %w", err)
 	}
-	if framing(mode) == framing(preferred) {
+	if IsTLSMode(mode) {
+		framing = "tls-ip-v1:" + framing
+	} else if !IsTLSMode(preferred) && framing == CarrierFraming(preferred) {
 		return base, nil
 	}
-	h := sha256.New()
-	h.Write([]byte(base))
-	h.Write([]byte(framing(mode)))
-	sum := h.Sum(nil)
+	sum := sha256.Sum256([]byte(base + framing))
 	return hex.EncodeToString(sum[:20]), nil
 }
 
@@ -176,6 +209,7 @@ func CarrierHash(base, preferred, mode string) (string, error) {
 // native modes. Keys are exported as base64, the endpoint is the real public
 // UDP endpoint, and AllowedIPs come from Routes (no default route).
 func (c ClientConfig) NativeConfig(mode string) (string, error) {
+	mode = CanonicalMode(mode)
 	if !IsNativeMode(mode) {
 		return "", fmt.Errorf("native mode must be %q or %q, got %q", ModeAWG, ModeWG, mode)
 	}
@@ -212,6 +246,7 @@ func (c ClientConfig) NativeConfig(mode string) (string, error) {
 // the AmneziaWG device for native modes. Keys are kept as hex (the engine's
 // IPC format) and routes use allowed_ip stanzas.
 func (c ClientConfig) NativeDeviceConfig(mode string) (string, error) {
+	mode = CanonicalMode(mode)
 	if !IsNativeMode(mode) {
 		return "", fmt.Errorf("native mode must be %q or %q, got %q", ModeAWG, ModeWG, mode)
 	}
@@ -376,7 +411,7 @@ func DefaultServerConfig() ServerConfig {
 		AWGProfile:  DefaultProfile(),
 		Subnet:      "10.77.0.0/24",
 		ServerIP:    "10.77.0.1",
-		Transport:   "ext-utp",
+		Transport:   ModeExtUTP,
 		CarrierPort: 6881,
 		AWGPort:     51821,
 		WGPort:      51820,
@@ -401,6 +436,8 @@ func (c *ServerConfig) Normalize() {
 	if c.Transport == "" {
 		c.Transport = def.Transport
 	}
+	c.Transport = CanonicalMode(c.Transport)
+	c.LegacyTransport = CanonicalMode(c.LegacyTransport)
 	if c.CarrierPort == 0 {
 		c.CarrierPort = def.CarrierPort
 	}

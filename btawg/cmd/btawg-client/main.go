@@ -1,9 +1,5 @@
-// btawg-client runs a btawg node from a btawg:// import string: it discovers
-// the hub strictly through DHT, carries AmneziaWG inside a BitTorrent
-// carrier, and exposes a no-auth SOCKS5 on loopback. Real-TUN mode (default
-// with root) additionally creates the btawg0 interface with the overlay
-// address; it never installs a default route. Native AWG/WG modes connect
-// directly to the published UDP endpoint instead of using the carrier.
+// btawg-client runs a VPN node from a btawg:// import string, with local
+// SOCKS5 and an optional OS TUN interface. It never installs a default route.
 package main
 
 import (
@@ -24,7 +20,7 @@ import (
 
 func main() {
 	importFile := flag.String("config", "", "path to a file containing the btawg:// import string")
-	transport := flag.String("transport", "", "transport mode (ext-utp|ext-tcp|req-utp|req-tcp|awg|wg)")
+	transport := flag.String("transport", "", "connection chain ("+strings.Join(config.ClientModes(), "|")+")")
 	dhtOnly := flag.Bool("dht", false, "discover the carrier through DHT instead of using the import endpoint")
 	noTun := flag.Bool("no-tun", false, "userspace netstack mode: no OS interface is created")
 	socksListen := flag.String("socks-listen", "127.0.0.1", "local SOCKS5 listen IPv4 address (0.0.0.0 for all IPv4 interfaces)")
@@ -58,8 +54,9 @@ func main() {
 	if *transport != "" {
 		cfg.Transport = *transport
 	}
+	cfg.Transport = config.CanonicalMode(cfg.Transport)
 	if !config.ValidClientMode(cfg.Transport) {
-		fmt.Fprintf(os.Stderr, "btawg-client: unsupported transport %q (want ext-utp|ext-tcp|req-utp|req-tcp|awg|wg)\n", cfg.Transport)
+		fmt.Fprintf(os.Stderr, "btawg-client: unsupported transport %q (want %s)\n", cfg.Transport, strings.Join(config.ClientModes(), "|"))
 		os.Exit(1)
 	}
 	if *dhtOnly {

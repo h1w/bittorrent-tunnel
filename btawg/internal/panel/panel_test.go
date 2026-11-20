@@ -48,6 +48,7 @@ func (f *fakeRegistry) Config() config.ServerConfig {
 func (f *fakeRegistry) Traffic() map[string]store.Traffic { return nil }
 func (f *fakeRegistry) InfoHash() string                  { return "aabbccddeeff00112233445566778899aabbccdd" }
 func (f *fakeRegistry) PubKey() string                    { return "11223344556677889900aabbccddeeff00112233" }
+func (f *fakeRegistry) TLSServerKey() string              { return "" }
 
 func importParse(raw string) (config.ClientConfig, error) {
 	return config.ParseImportString(raw)
@@ -170,7 +171,7 @@ func TestServerConfigFormRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load cfg: %v", err)
 	}
-	if cfg.Transport != "ext-tcp" || cfg.CarrierPort != 17777 || cfg.ExternalIP != "203.0.113.7" {
+	if cfg.Transport != config.ModeExtTCP || cfg.CarrierPort != 17777 || cfg.ExternalIP != "203.0.113.7" {
 		t.Fatalf("cfg not saved: %+v", cfg)
 	}
 	if cfg.InfoHash != "" {

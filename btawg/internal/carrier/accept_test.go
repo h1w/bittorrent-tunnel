@@ -14,7 +14,7 @@ func TestAcceptDispatchExtended(t *testing.T) {
 
 	srvCh := make(chan result, 1)
 	go func() {
-		tr, pid, err := Accept(server, peerB, hashes)
+		tr, pid, _, err := Accept(server, peerB, hashes)
 		srvCh <- result{tr: tr, pid: pid, err: err}
 	}()
 
@@ -45,7 +45,7 @@ func TestAcceptDispatchRequestPiece(t *testing.T) {
 
 	srvCh := make(chan result, 1)
 	go func() {
-		tr, pid, err := Accept(server, peerB, hashes)
+		tr, pid, _, err := Accept(server, peerB, hashes)
 		srvCh <- result{tr: tr, pid: pid, err: err}
 	}()
 
@@ -78,7 +78,7 @@ func TestAcceptRejectsUnknownHash(t *testing.T) {
 
 	srvCh := make(chan result, 1)
 	go func() {
-		tr, pid, err := Accept(server, peerB, hashes)
+		tr, pid, _, err := Accept(server, peerB, hashes)
 		srvCh <- result{tr: tr, pid: pid, err: err}
 	}()
 
@@ -128,7 +128,7 @@ func TestAcceptDataTransfer(t *testing.T) {
 
 			srvCh := make(chan result, 1)
 			go func() {
-				tr, pid, err := Accept(server, peerB, hashes)
+				tr, pid, _, err := Accept(server, peerB, hashes)
 				srvCh <- result{tr: tr, pid: pid, err: err}
 			}()
 
@@ -178,7 +178,7 @@ func TestAcceptDoesNotSetDeadline(t *testing.T) {
 
 	srvCh := make(chan result, 1)
 	go func() {
-		tr, pid, err := Accept(server, peerB, hashes)
+		tr, pid, _, err := Accept(server, peerB, hashes)
 		srvCh <- result{tr: tr, pid: pid, err: err}
 	}()
 

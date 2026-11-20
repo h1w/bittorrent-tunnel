@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/panel"
 	"bittorrent-tunnel/btawg/internal/server"
 	"bittorrent-tunnel/btawg/internal/store"
@@ -24,7 +25,7 @@ import (
 
 func main() {
 	storePath := flag.String("store", "btawg.db", "path to the bbolt database")
-	transport := flag.String("transport", "", "preferred carrier for legacy imports (all six modes listen)")
+	transport := flag.String("transport", "", "preferred connection chain for new imports ("+strings.Join(config.ClientModes(), "|")+")")
 	carrierPort := flag.Int("carrier-port", 0, "override carrier listen port")
 	externalIP := flag.String("external-ip", "", "public IPv4 for native imports (default: outbound interface address)")
 	dhtBootstrap := flag.String("dht-bootstrap", "", "override DHT bootstrap nodes, comma-separated host:port (default: public)")
@@ -121,8 +122,8 @@ func main() {
 	go func() { errCh <- srv.Announce(ctx) }()
 
 	active := srv.Config()
-	fmt.Printf("btawg-server: modes=ext-tcp,req-tcp,ext-utp,req-utp,awg,wg carrier=:%d awg=:%d/udp wg=:%d/udp socks=%d infohash=%s\n",
-		active.CarrierPort, active.AWGPort, active.WGPort, active.SocksPort, srv.InfoHash())
+	fmt.Printf("btawg-server: modes=%s carrier=:%d awg=:%d/udp wg=:%d/udp socks=%d infohash=%s\n",
+		strings.Join(config.ClientModes(), ","), active.CarrierPort, active.AWGPort, active.WGPort, active.SocksPort, srv.InfoHash())
 	fmt.Println("btawg-server: optional DHT discovery announce loop started")
 
 	select {

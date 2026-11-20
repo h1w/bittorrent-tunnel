@@ -48,7 +48,11 @@ func (s *Server) refreshHandshakeRoutes() {
 						}
 					}
 					if sec > 0 {
-						s.router.observeHandshake(ip, key, i, time.Unix(sec, nsec))
+						eng := s.router.awg
+						if i == 1 {
+							eng = s.router.wg
+						}
+						s.router.observeHandshake(ip, key, eng, time.Unix(sec, nsec))
 					}
 				}
 			}

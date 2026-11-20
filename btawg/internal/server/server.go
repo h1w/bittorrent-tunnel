@@ -8,12 +8,14 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -30,6 +32,7 @@ import (
 	"bittorrent-tunnel/btawg/internal/carrier"
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/dht"
+	"bittorrent-tunnel/btawg/internal/iptunnel"
 	"bittorrent-tunnel/btawg/internal/socks"
 	"bittorrent-tunnel/btawg/internal/store"
 	"bittorrent-tunnel/btawg/internal/tunsetup"
@@ -41,10 +44,11 @@ var serverPeerID = [20]byte{'b', 't', 'a', 'w', 'g', '-', 's', 'e', 'r', 'v', 'e
 
 // Server is the assembled btawg hub.
 type Server struct {
-	cfg      config.ServerConfig
-	st       *store.Store
-	infoHash [20]byte
-	pubKey   string
+	cfg         config.ServerConfig
+	st          *store.Store
+	infoHash    [20]byte
+	pubKey      string
+	tlsIdentity *iptunnel.Identity
 
 	bd      *bind.Hybrid
 	dev, wg *device.Device
@@ -58,10 +62,12 @@ type Server struct {
 	closeOnce    sync.Once
 	closeErr     error
 	trafficWG    sync.WaitGroup
+	carrierWG    sync.WaitGroup
 	savedTraffic map[string]store.Traffic
 	hashes       map[[20]byte]string
 	peers        map[string]store.ClientRecord
 	sessions     map[string]map[carrier.Transport]struct{}
+	tlsSessions  map[string]carrier.Transport // current TLS carrier by enrolled peer ID
 	gateways     []netip.Prefix
 	byPeerID     map[string]store.ClientRecord
 	attached     map[string]int // client IP -> carrier count
@@ -167,6 +173,9 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 		}
 	}
 	cfg.Normalize()
+	if !config.ValidClientMode(cfg.Transport) {
+		return nil, fmt.Errorf("unsupported transport %q", cfg.Transport)
+	}
 	for _, p := range []int{cfg.CarrierPort, cfg.AWGPort, cfg.WGPort, cfg.SocksPort} {
 		if p < 1 || p > 65535 {
 			return nil, fmt.Errorf("invalid port %d", p)
@@ -219,6 +228,10 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("derive server public key: %w", err)
 	}
+	tlsIdentity, err := iptunnel.NewIdentity(cfg.ServerPrivKey, iptunnel.Hub)
+	if err != nil {
+		return nil, fmt.Errorf("hub TLS identity: %w", err)
+	}
 	serverIP := netip.MustParseAddr(cfg.ServerIP)
 	if g, err := st.GetGroup(store.DefaultGroupID); err == nil {
 		cfg.ServerIP, cfg.Subnet = g.ServerIP, g.Subnet
@@ -228,16 +241,18 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:      cfg,
-		st:       st,
-		infoHash: [20]byte(ih),
-		pubKey:   serverPub,
-		bd:       bind.NewHybrid(),
-		peers:    make(map[string]store.ClientRecord),
-		sessions: make(map[string]map[carrier.Transport]struct{}),
-		byPeerID: make(map[string]store.ClientRecord),
-		attached: make(map[string]int),
-		closed:   make(chan struct{}),
+		cfg:         cfg,
+		st:          st,
+		infoHash:    [20]byte(ih),
+		pubKey:      serverPub,
+		tlsIdentity: tlsIdentity,
+		bd:          bind.NewHybrid(),
+		peers:       make(map[string]store.ClientRecord),
+		sessions:    make(map[string]map[carrier.Transport]struct{}),
+		tlsSessions: make(map[string]carrier.Transport),
+		byPeerID:    make(map[string]store.ClientRecord),
+		attached:    make(map[string]int),
+		closed:      make(chan struct{}),
 	}
 
 	s.policy = newPolicySnapshot()
@@ -260,8 +275,8 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 }
 
 func (s *Server) finish() error {
-	s.dev = device.NewDevice(s.router.device(0), s.bd, device.NewLogger(device.LogLevelError, "btawg-awg: "))
-	s.wg = device.NewDevice(s.router.device(1), conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "btawg-wg: "))
+	s.dev = device.NewDevice(s.router.awg, s.bd, device.NewLogger(device.LogLevelError, "btawg-awg: "))
+	s.wg = device.NewDevice(s.router.wg, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "btawg-wg: "))
 	if err := s.dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n%s", s.cfg.ServerPrivKey, s.cfg.AWGPort, s.cfg.AWGProfile.String())); err != nil {
 		return err
 	}
@@ -311,12 +326,12 @@ func (s *Server) finish() error {
 		return err
 	}
 	s.egressGate = &gatedListener{inner: s.egressLn, policy: s.policy, active: make(map[*egressSession]netip.Addr)}
-	s.hashes = make(map[[20]byte]string, 2)
+	s.hashes = make(map[[20]byte]string, len(config.CarrierHelloModes()))
 	if s.ns == nil {
 		s.egressGate.requireGateway = true
 	}
-	for _, framing := range []string{"ext", "req"} {
-		hash, err := config.CarrierHash(s.InfoHash(), s.cfg.LegacyTransport, framing+"-tcp")
+	for _, mode := range config.CarrierHelloModes() {
+		hash, err := config.CarrierHash(s.InfoHash(), s.cfg.LegacyTransport, mode)
 		if err != nil {
 			return err
 		}
@@ -324,7 +339,11 @@ func (s *Server) finish() error {
 		if err != nil {
 			return err
 		}
-		s.hashes[key] = framing
+		family := config.CarrierFraming(mode)
+		if config.IsTLSMode(mode) {
+			family += "-tls"
+		}
+		s.hashes[key] = family
 		ann, err := dht.NewAnnouncer(key, netip.AddrPortFrom(netip.IPv4Unspecified(), uint16(s.cfg.CarrierPort)), nil)
 		if err != nil {
 			return err
@@ -341,13 +360,30 @@ func (s *Server) InfoHash() string { return hex.EncodeToString(s.infoHash[:]) }
 // PubKey returns the hub's AWG public key.
 func (s *Server) PubKey() string { return s.pubKey }
 
+// TLSServerKey is the TLS public key pinned by new client imports.
+func (s *Server) TLSServerKey() string { return s.tlsIdentity.Pin() }
+
 // Config returns the active server configuration.
 func (s *Server) Config() config.ServerConfig { return s.cfg }
 
 // ReloadPolicy applies stored group addresses, peer addresses and access rules.
-func (s *Server) ReloadPolicy() error {
+func (s *Server) ReloadPolicy() (err error) {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	defer func() {
+		if err == nil {
+			return
+		}
+		s.policy.disableClients()
+		if s.egressGate != nil {
+			s.egressGate.closeDenied()
+		}
+		s.mu.Lock()
+		for _, t := range s.tlsSessions {
+			t.Close()
+		}
+		s.mu.Unlock()
+	}()
 	gs, err := groupGateways(s.st)
 	if err != nil {
 		return err
@@ -369,10 +405,6 @@ func (s *Server) ReloadPolicy() error {
 		s.gateways = gs
 	}
 	if err = s.reloadPeers(); err != nil {
-		s.policy.disableClients()
-		if s.egressGate != nil {
-			s.egressGate.closeDenied()
-		}
 		return err
 	}
 	group, err := s.st.GetGroup(store.DefaultGroupID)
@@ -380,10 +412,6 @@ func (s *Server) ReloadPolicy() error {
 		return err
 	}
 	if err = s.policy.reload(s.st, netip.MustParseAddr(group.ServerIP)); err != nil {
-		s.policy.disableClients()
-		if s.egressGate != nil {
-			s.egressGate.closeDenied()
-		}
 		return err
 	}
 	if s.egressGate != nil {
@@ -450,7 +478,16 @@ func (s *Server) Run(ctx context.Context) error {
 					errs <- err
 					return
 				}
-				go s.acceptConn(runCtx, c)
+				s.mu.Lock()
+				select {
+				case <-s.closed:
+					s.mu.Unlock()
+					_ = c.Close()
+					return
+				default:
+				}
+				s.carrierWG.Go(func() { s.acceptConn(runCtx, c) })
+				s.mu.Unlock()
 			}
 		}()
 	}
@@ -467,7 +504,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// Announce publishes both framing hashes through DHT.
+// Announce publishes the AWG and TLS framing hashes through DHT.
 func (s *Server) Announce(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -486,48 +523,97 @@ func (s *Server) Announce(ctx context.Context) error {
 }
 
 func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
+	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
 	if err := c.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		_ = c.Close()
 		return
 	}
-	t, theirs, err := carrier.Accept(c, serverPeerID, s.hashes)
+	t, theirs, family, err := carrier.Accept(c, serverPeerID, s.hashes)
 	if err != nil {
-		_ = c.Close()
 		return
 	}
-	if err = c.SetDeadline(time.Time{}); err != nil {
-		t.Close()
-		return
-	}
+	defer t.Wait()
 	id := hex.EncodeToString(theirs[:])
 	s.mu.Lock()
 	rec, ok := s.byPeerID[id]
+	s.mu.Unlock()
 	if !ok {
+		return
+	}
+	var secure *tls.Conn
+	if strings.HasSuffix(family, "-tls") {
+		pin, err := iptunnel.PublicKey(rec.PrivKey, iptunnel.Client)
+		if err != nil {
+			return
+		}
+		cfg, err := s.tlsIdentity.TLS(pin)
+		if err != nil {
+			return
+		}
+		secure = tls.Server(iptunnel.Stream(c, t), cfg)
+		if err := secure.HandshakeContext(ctx); err != nil {
+			return
+		}
+	}
+	if err := c.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+	ip := netip.MustParseAddr(rec.IP)
+	s.applyMu.Lock()
+	s.mu.Lock()
+	current, ok := s.byPeerID[id]
+	if !ok || current.ID != rec.ID || current.IP != rec.IP || current.PubKey != rec.PubKey || current.PrivKey != rec.PrivKey || ctx.Err() != nil {
 		s.mu.Unlock()
-		t.Close()
+		s.applyMu.Unlock()
 		return
 	}
 	select {
 	case <-s.closed:
 		s.mu.Unlock()
-		t.Close()
+		s.applyMu.Unlock()
 		return
 	default:
+	}
+	var eng *engineTun
+	var detach func()
+	if secure != nil {
+		now := time.Now()
+		if !s.policy.handshake(ip, rec.PubKey, now) {
+			s.mu.Unlock()
+			s.applyMu.Unlock()
+			return
+		}
+		eng = s.router.newEngine(ip)
+		s.router.remember(ip, eng, now.UnixNano())
+		if old := s.tlsSessions[id]; old != nil {
+			old.Close()
+		}
+		s.tlsSessions[id] = t
+	} else {
+		detach = s.bd.AddCarrier(ip, t)
 	}
 	if s.sessions[id] == nil {
 		s.sessions[id] = make(map[carrier.Transport]struct{})
 	}
 	s.sessions[id][t] = struct{}{}
-	detach := s.bd.AddCarrier(netip.MustParseAddr(rec.IP), t)
 	s.attached[rec.IP]++
 	s.mu.Unlock()
-	select {
-	case <-t.Done():
-	case <-ctx.Done():
-	case <-s.closed:
+	s.applyMu.Unlock()
+	if secure != nil {
+		s.runTLS(eng, secure, t)
+	} else {
+		select {
+		case <-t.Done():
+		case <-ctx.Done():
+		case <-s.closed:
+		}
+		detach()
 	}
-	detach()
 	s.mu.Lock()
+	if s.tlsSessions[id] == t {
+		delete(s.tlsSessions, id)
+	}
 	delete(s.sessions[id], t)
 	if len(s.sessions[id]) == 0 {
 		delete(s.sessions, id)
@@ -538,6 +624,23 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
 		delete(s.attached, rec.IP)
 	}
 	s.mu.Unlock()
+}
+
+func (s *Server) runTLS(eng *engineTun, secure *tls.Conn, t carrier.Transport) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer t.Close()
+		_ = iptunnel.SendPackets(eng, func(p []byte) error {
+			_, err := secure.Write(p)
+			return err
+		})
+	}()
+	_ = iptunnel.ReceivePackets(eng, secure)
+	t.Close()
+	_ = eng.Close()
+	<-done
+	s.router.removeEngine(eng)
 }
 
 func (s *Server) reloadPeers() error {
@@ -570,7 +673,7 @@ func (s *Server) reloadPeers() error {
 	s.mu.Lock()
 	s.byPeerID = byPeerID
 	for id, old := range s.peers {
-		if r, ok := next[id]; ok && r.IP == old.IP && r.PubKey == old.PubKey {
+		if r, ok := next[id]; ok && r.IP == old.IP && r.PubKey == old.PubKey && r.PrivKey == old.PrivKey && r.PeerID == old.PeerID {
 			continue
 		}
 		for t := range s.sessions[old.PeerID] {
@@ -747,7 +850,14 @@ func (s *Server) ConnectedCount() map[string]int {
 // Close tears the hub down.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
+		s.mu.Lock()
 		close(s.closed)
+		for _, sessions := range s.sessions {
+			for t := range sessions {
+				t.Close()
+			}
+		}
+		s.mu.Unlock()
 		s.trafficWG.Wait()
 		for _, a := range s.anns {
 			a.Close()
@@ -761,6 +871,7 @@ func (s *Server) Close() error {
 		if s.udpPC != nil {
 			_ = s.udpPC.Close()
 		}
+		s.carrierWG.Wait()
 		if s.egressGate != nil {
 			_ = s.egressGate.Close()
 		} else if s.egressLn != nil {
@@ -782,7 +893,7 @@ func (s *Server) Close() error {
 	return s.closeErr
 }
 
-// SetDHTBootstrap updates discovery bootstrap for both framing hashes.
+// SetDHTBootstrap updates discovery bootstrap for all carrier families.
 func (s *Server) SetDHTBootstrap(hosts []string) {
 	for _, a := range s.anns {
 		a.SetBootstrap(hosts)

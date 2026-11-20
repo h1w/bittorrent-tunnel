@@ -201,6 +201,42 @@ func TestCarrierHashIsDeterministic(t *testing.T) {
 	}
 }
 
+func TestNamedConnectionChains(t *testing.T) {
+	for _, name := range []string{
+		"socks5-awg-ext-utp", "socks5-awg-ext-tcp", "socks5-awg-req-utp", "socks5-awg-req-tcp",
+		"socks5-ext-utp", "socks5-ext-tcp", "socks5-req-utp", "socks5-req-tcp",
+		"socks5-awg-udp", "socks5-wg-udp",
+	} {
+		if !ValidClientMode(name) {
+			t.Errorf("connection chain %q not accepted", name)
+		}
+	}
+	c := ServerConfig{Transport: "req-tcp"}
+	c.Normalize()
+	if c.Transport != "socks5-awg-req-tcp" {
+		t.Fatalf("legacy preferred mode became %q", c.Transport)
+	}
+}
+
+func TestTLSCarrierHashIsolation(t *testing.T) {
+	const preferred = "socks5-awg-ext-utp"
+	seen := map[string]string{}
+	for _, family := range []string{"socks5-awg-ext", "socks5-awg-req", "socks5-ext", "socks5-req"} {
+		tcp, errTCP := CarrierHash(testInfoHash, preferred, family+"-tcp")
+		utp, errUTP := CarrierHash(testInfoHash, preferred, family+"-utp")
+		if errTCP != nil || errUTP != nil || tcp != utp {
+			t.Fatalf("%s: carrier hashes differ or failed: %s, %s (%v, %v)", family, tcp, utp, errTCP, errUTP)
+		}
+		if other, duplicate := seen[tcp]; duplicate {
+			t.Fatalf("%s and %s share one discovery hash", family, other)
+		}
+		seen[tcp] = family
+	}
+	if seen[testInfoHash] != "socks5-awg-ext" {
+		t.Fatalf("legacy deployment hash was not preserved: %v", seen)
+	}
+}
+
 func TestNativeConfigRendersQuickINI(t *testing.T) {
 	cfg := testClientConfig()
 	cfg.AWGEndpoint = "203.0.113.7:51821"
