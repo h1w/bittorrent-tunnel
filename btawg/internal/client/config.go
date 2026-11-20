@@ -25,6 +25,8 @@ type ManagedConfig struct {
 	Enabled     []string    `json:"enabled"`
 	ListenIP    string      `json:"listen_ip"`
 	Credentials Credentials `json:"credentials"`
+	NoTUN       bool        `json:"no_tun,omitempty"`
+	TUNName     string      `json:"tun_name,omitempty"`
 }
 
 // LoadManagedConfig reads the client configuration from path.

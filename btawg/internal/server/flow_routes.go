@@ -91,7 +91,7 @@ func newFlowTable() *flowTable {
 }
 
 // pin records that packets matching key (the reverse of an authenticated
-// forward flow) must be delivered to eng. It returns the evicted key, if any.
+// forward flow) belong to eng unless another live engine owns the tuple.
 func (t *flowTable) pin(key flowKey, eng *engineTun, now time.Time) {
 	if !key.src.IsValid() || !key.dst.IsValid() {
 		return
@@ -99,7 +99,11 @@ func (t *flowTable) pin(key flowKey, eng *engineTun, now time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if _, ok := t.flows[key]; !ok && len(t.flows) >= t.maxEntries {
+	if entry, ok := t.flows[key]; ok {
+		if entry.eng != eng && now.Sub(entry.at) <= t.flowTTL {
+			return
+		}
+	} else if len(t.flows) >= t.maxEntries {
 		t.evictOneLocked()
 	}
 	t.flows[key] = flowEntry{eng: eng, at: now}

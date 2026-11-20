@@ -166,3 +166,21 @@ func TestRouterUnauthenticatedSourceCannotSpoof(t *testing.T) {
 		t.Fatal("unauthenticated engine pinned a spoofed flow")
 	}
 }
+
+func TestTLSModesBothReturnTrafficForOneIP(t *testing.T) {
+	r, clientIP, gatewayIP := testRouterWithClient(t)
+	first, second := r.newEngine(clientIP), r.newEngine(clientIP)
+	defer first.Close()
+	defer second.Close()
+	r.remember(clientIP, second, time.Now().UnixNano())
+	for i, e := range []*engineTun{first, second} {
+		port := uint16(32000 + i)
+		if _, err := e.Write([][]byte{makeTCPPacket(clientIP.String(), gatewayIP.String(), port, 443)}, 0); err != nil {
+			t.Fatal(err)
+		}
+		reply := makeTCPPacket(gatewayIP.String(), clientIP.String(), 443, port)
+		if r.lookupDestinationEngine(gatewayIP, clientIP, reply, time.Now()) != e {
+			t.Fatalf("reply to port %d left on the wrong TLS tunnel", port)
+		}
+	}
+}

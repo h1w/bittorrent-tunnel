@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -10,21 +12,30 @@ import (
 // mode 0o700 if needed. The final file is created with the requested mode.
 // It is used for all root-owned btawg configuration files.
 func WriteFile(path string, data []byte, mode os.FileMode) error {
+	return writeFile(path, bytes.NewReader(data), mode)
+}
+
+func writeFile(path string, r io.Reader, mode os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("mkdir %s: %w", dir, err)
+		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
-		return fmt.Errorf("write temp: %w", err)
+	f, err := os.CreateTemp(dir, ".btawg-*")
+	if err != nil {
+		return err
 	}
-	if err := os.Chmod(tmp, mode); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("chmod temp: %w", err)
+	defer os.Remove(f.Name())
+	if _, err = io.Copy(f, r); err == nil {
+		err = f.Chmod(mode)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("rename: %w", err)
+	if err == nil {
+		err = f.Sync()
 	}
-	return nil
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return os.Rename(f.Name(), path)
 }

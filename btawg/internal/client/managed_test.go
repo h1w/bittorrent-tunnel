@@ -2,44 +2,23 @@ package client
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
-	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/socks"
 )
 
-// errNoTunnel stands in for a transport tunnel the lifecycle test never dials.
-var errNoTunnel = errors.New("no tunnel in lifecycle test")
-
-// testManaged binds ten managed SOCKS listeners on a free consecutive port
-// block so the test never collides with real services.
-func testManaged(t *testing.T, cfg config.ClientConfig) *managed {
-	t.Helper()
-	for base := 21000; base < 40000; base += 10 {
-		m, err := newManaged(context.Background(), cfg, netip.MustParseAddr("127.0.0.1"), base)
-		if err == nil {
-			t.Cleanup(func() { m.Close() })
-			return m
-		}
-	}
-	t.Fatal("no free managed port block")
-	return nil
-}
-
 func TestManagedReservesDisabledPortsAndRotatesAuth(t *testing.T) {
-	cfg := config.ClientConfig{ClientIP: "10.77.0.2", ServerIP: "10.77.0.1", Subnet: "10.77.0.0/24"}
-	m := testManaged(t, cfg)
-	m.SetProxy(config.ModeWG, ModeProxy{TCP: func(context.Context, netip.AddrPort) (net.Conn, error) {
-		return nil, errNoTunnel
-	}})
-	auth := Credentials{Username: "operator", Password: "before"}
-	if err := m.Apply([]string{config.ModeWG}, auth); err != nil {
+	m, err := newManaged(context.Background(), netip.MustParseAddr("127.0.0.1"), 0)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer m.Close()
+	auth := Credentials{Username: "operator", Password: "before"}
+	m.replace(5, socks.NewServer(nil, nil).WithCredentials(auth.Username, auth.Password))
 
 	main, unused := m.slots[5].ln.Addr().String(), m.slots[0].ln.Addr().String()
 	if l, err := net.Listen("tcp4", unused); err == nil {
@@ -56,12 +35,12 @@ func TestManagedReservesDisabledPortsAndRotatesAuth(t *testing.T) {
 	}
 	defer c.Close()
 	after := Credentials{Username: "operator", Password: "after"}
-	if err := m.Apply([]string{config.ModeWG}, after); err != nil {
-		t.Fatal(err)
-	}
+	m.replace(5, socks.NewServer(nil, nil).WithCredentials(after.Username, after.Password))
 	c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := c.Read(make([]byte, 1)); err == nil {
 		t.Fatal("credential rotation kept an old session open")
+	} else if e, ok := err.(net.Error); ok && e.Timeout() {
+		t.Fatal("credential rotation did not close the session")
 	}
 	if _, err := proxyAuth(t, main, auth); err == nil {
 		t.Fatal("old credentials were still accepted after rotation")
@@ -72,9 +51,7 @@ func TestManagedReservesDisabledPortsAndRotatesAuth(t *testing.T) {
 	}
 	c2.Close()
 
-	if err := m.Apply(nil, after); err != nil {
-		t.Fatal(err)
-	}
+	m.replace(5, nil)
 	if l, err := net.Listen("tcp4", main); err == nil {
 		l.Close()
 		t.Fatal("disabling a mode released its fixed port")

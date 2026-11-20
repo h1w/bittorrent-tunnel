@@ -43,6 +43,9 @@ func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
+	if err := st.SaveGroup(store.GroupRecord{ID: "aaa", Name: "Another group", Subnet: "10.78.0.0/24", ServerIP: "10.78.0.1"}); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := config.DefaultServerConfig()
 	cfg.CarrierPort = freeTCPPort(t)

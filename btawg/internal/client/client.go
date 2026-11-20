@@ -41,8 +41,11 @@ type Client struct {
 	proxyTCP   func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
 	proxyUDP   func(ctx context.Context) (net.PacketConn, error)
 	proxyRoute *tunsetup.ProxyRoute
+	markedRoute *tunsetup.MarkedRoute
 
 	disc func(ctx context.Context) ([]netip.AddrPort, error)
+
+	cleanup func() // managed-mode route/rule cleanup
 
 	socksAddr atomic.Value // string, set once the SOCKS5 listener is up
 }
@@ -108,6 +111,56 @@ func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
 	listen := net.ListenConfig{Control: route.Control}
 	c.proxyUDP = func(ctx context.Context) (net.PacketConn, error) {
 		return listen.ListenPacket(ctx, "udp4", clientAddr.String())
+	}
+	return c, nil
+}
+
+func newManagedTUN(cfg config.ClientConfig, base string, index int) (*Client, error) {
+	clientIP, err := netip.ParseAddr(cfg.ClientIP)
+	if err != nil || !clientIP.Is4() {
+		return nil, fmt.Errorf("invalid client IPv4 address")
+	}
+	prefixes := make([]netip.Prefix, 0, 1+len(cfg.Routes))
+	seen := make(map[netip.Prefix]bool)
+	for _, raw := range append([]string{cfg.Subnet}, cfg.Routes...) {
+		p, err := netip.ParsePrefix(raw)
+		if err != nil || !p.Addr().Is4() || p.Bits() == 0 {
+			return nil, fmt.Errorf("invalid overlay route %q", raw)
+		}
+		p = p.Masked()
+		if !seen[p] {
+			seen[p] = true
+			prefixes = append(prefixes, p)
+		}
+	}
+	name := base + "-" + strconv.Itoa(index)
+	td, err := tunsetup.CreateExclusiveTUN(name, config.DefaultMTU)
+	if err != nil {
+		return nil, fmt.Errorf("create TUN %s: %w", name, err)
+	}
+	route, err := tunsetup.NewMarkedRoute(name, index, config.DefaultMTU, clientIP, prefixes)
+	if err != nil {
+		td.Close()
+		return nil, err
+	}
+	c := &Client{cfg: cfg, markedRoute: route}
+	if err := c.start(td); err != nil {
+		_ = route.Close()
+		return nil, err
+	}
+	addr := netip.AddrPortFrom(clientIP, 0)
+	dialer := net.Dialer{LocalAddr: net.TCPAddrFromAddrPort(addr), Control: func(network, address string, fd syscall.RawConn) error {
+		if err := route.Control(network, address, fd); err != nil {
+			return err
+		}
+		return tunsetup.OverlayTCP(network, address, fd)
+	}}
+	c.proxyTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", dst.String())
+	}
+	listen := net.ListenConfig{Control: route.Control}
+	c.proxyUDP = func(ctx context.Context) (net.PacketConn, error) {
+		return listen.ListenPacket(ctx, "udp4", addr.String())
 	}
 	return c, nil
 }
@@ -394,7 +447,9 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 			pc.Close()
 			return nil, nil, fmt.Errorf("carrier utp socket: %w", err)
 		}
-		conn, err = sock.DialTimeout(addr.String(), 10*time.Second)
+		dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		conn, err = sock.DialContext(dialCtx, "", addr.String())
+		cancel()
 		if err != nil {
 			sock.Close()
 			return nil, nil, fmt.Errorf("carrier dial %s: %w", addr, err)
@@ -449,6 +504,9 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 
 // Close tears the client down.
 func (c *Client) Close() {
+	if c.markedRoute != nil {
+		_ = c.markedRoute.Close()
+	}
 	if c.proxyRoute != nil {
 		_ = c.proxyRoute.Close()
 	}

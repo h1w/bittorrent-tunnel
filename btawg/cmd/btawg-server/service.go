@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,14 +28,17 @@ const (
 	managedStorePath = "/var/lib/btawg/server.db"
 )
 
-var pendingPassPath = "/etc/btawg/.admin-password"
+var managedLaunchPath = "/etc/btawg/server.json"
 
-// setPendingPassPath is used by tests to avoid writing to /etc.
-func setPendingPassPath(p string) { pendingPassPath = p }
+type serverLaunch struct {
+	Store string `json:"store"`
+	NoTUN bool   `json:"no_tun,omitempty"`
+}
 
 func installCmd(args []string) error {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	storePath := fs.String("store", managedStorePath, "path to existing bbolt database to use")
+	noTun := fs.Bool("no-tun", false, "run overlay-only without kernel TUN or NAT")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -43,7 +47,34 @@ func installCmd(args []string) error {
 		return errors.New("install must run as root")
 	}
 
-	st, generated, pw, err := openOrCreateServerStore(*storePath)
+	launch := serverLaunch{Store: managedStorePath}
+	if data, err := os.ReadFile(managedLaunchPath); err == nil {
+		if err := json.Unmarshal(data, &launch); err != nil {
+			return fmt.Errorf("read server launch settings: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "store":
+			launch.Store = *storePath
+		case "no-tun":
+			launch.NoTUN = *noTun
+		}
+	})
+	if launch.Store == "" {
+		return errors.New("server store path must not be empty")
+	}
+	path, err := filepath.Abs(launch.Store)
+	if err != nil {
+		return err
+	}
+	launch.Store = path
+	pendingPath := launch.Store + ".pending-admin"
+	if launch.Store == managedStorePath {
+		pendingPath = "/etc/btawg/.admin-password"
+	}
 	if err != nil {
 		return err
 	}
@@ -56,20 +87,27 @@ func installCmd(args []string) error {
 			return fmt.Errorf("save pending password: %w", err)
 		}
 	}
-
+	data, err := json.MarshalIndent(launch, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := service.WriteFile(managedLaunchPath, data, 0600); err != nil {
+		return err
+	}
 	if err := service.Server.Install(); err != nil {
 		return fmt.Errorf("install unit: %w", err)
 	}
-
-	if generated {
-		pending, err := os.ReadFile(pendingPassPath)
-		if err == nil && len(pending) > 0 {
-			cfg, _ := st.LoadServerConfig()
-			fmt.Printf("btawg-server: panel login admin / %s (shown once, loopback :%d)\n", string(pending), cfg.PanelPort)
-			_ = os.Remove(pendingPassPath)
-		}
+	pending, err := os.ReadFile(pendingPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	return nil
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Printf("btawg-server: panel login admin / %s (shown once)\n", pending); err != nil {
+		return err
+	}
+	return os.Remove(pendingPath)
 }
 
 func runCmd(parent context.Context, args []string) error {
@@ -87,19 +125,41 @@ func runCmd(parent context.Context, args []string) error {
 	}
 
 	if *managed {
-		if *storePath == "" {
-			*storePath = managedStorePath
+		var launch serverLaunch
+		if data, err := os.ReadFile(managedLaunchPath); err == nil {
+			if err := json.Unmarshal(data, &launch); err != nil {
+				return fmt.Errorf("read server launch settings: %w", err)
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
+		if *storePath == "" {
+			*storePath = launch.Store
+			if *storePath == "" {
+				*storePath = managedStorePath
+			}
+		}
+		*noTun = *noTun || launch.NoTUN
 	}
 	if *storePath == "" {
 		*storePath = "btawg.db"
 	}
 
-	st, _, _, err := openOrCreateServerStore(*storePath)
+	pendingPath := ""
+	if *managed {
+		pendingPath = *storePath + ".pending-admin"
+		if *storePath == managedStorePath {
+			pendingPath = "/etc/btawg/.admin-password"
+		}
+	}
+	st, _, pw, err := openOrCreateServerStore(*storePath, pendingPath)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
+	if pw != "" && !*managed {
+		fmt.Printf("btawg-server: panel login admin / %s (shown once)\n", pw)
+	}
 
 	cfg, err := st.LoadServerConfig()
 	if err != nil {
@@ -166,10 +226,12 @@ func runCmd(parent context.Context, args []string) error {
 	}
 	p := panel.New(st, srv, "admin", cfg.AdminPassHash)
 	handler := p.Handler()
+	web := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
+	defer web.Close()
+	webErrors := make(chan error, len(listeners))
 	for _, ln := range listeners {
-		go func(l net.Listener) {
-			_ = http.Serve(l, handler)
-		}(ln)
+		defer ln.Close()
+		go func(l net.Listener) { webErrors <- web.Serve(l) }(ln)
 	}
 	for _, addr := range listenerAddrs(listeners) {
 		fmt.Printf("btawg-server: panel on http://%s\n", addr)
@@ -177,7 +239,7 @@ func runCmd(parent context.Context, args []string) error {
 
 	if *managed {
 		if err := service.NotifyReady(); err != nil {
-			fmt.Fprintf(os.Stderr, "btawg-server: sdnotify: %v\n", err)
+			return fmt.Errorf("systemd readiness: %w", err)
 		}
 	}
 
@@ -192,13 +254,14 @@ func runCmd(parent context.Context, args []string) error {
 
 	select {
 	case <-ctx.Done():
-		fmt.Println("btawg-server: shutting down")
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return web.Shutdown(shutdown)
 	case err := <-errCh:
-		if err != nil {
-			return err
-		}
+		return err
+	case err := <-webErrors:
+		return err
 	}
-	return nil
 }
 
 func tui() error {
@@ -208,7 +271,7 @@ func tui() error {
 // openOrCreateServerStore opens the database, generating server identity and
 // an admin password when the store is new. It returns the store, whether a
 // password was generated, and the generated plaintext password.
-func openOrCreateServerStore(path string) (*store.Store, bool, string, error) {
+func openOrCreateServerStore(path string, pendingPath ...string) (*store.Store, bool, string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, false, "", fmt.Errorf("create db dir: %w", err)
 	}
@@ -225,6 +288,12 @@ func openOrCreateServerStore(path string) (*store.Store, bool, string, error) {
 		return st, false, "", nil
 	}
 	pw := randomPassword()
+	if len(pendingPath) > 0 && pendingPath[0] != "" {
+		if err := service.WriteFile(pendingPath[0], []byte(pw), 0600); err != nil {
+			st.Close()
+			return nil, false, "", err
+		}
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
 	if err != nil {
 		st.Close()

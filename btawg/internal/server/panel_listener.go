@@ -21,10 +21,7 @@ func (s *Server) ListenPanel(ctx context.Context, port int) ([]net.Listener, err
 	}
 	listeners := []net.Listener{loopback}
 
-	if len(s.gateways) == 0 {
-		return listeners, nil
-	}
-	gateway := s.gateways[0].Addr()
+	gateway := netip.MustParseAddr(s.cfg.ServerIP)
 	addrPort := netip.AddrPortFrom(gateway, uint16(port))
 
 	if s.ns != nil {

@@ -36,7 +36,7 @@ func daemonReload() error {
 }
 
 func unitAction(unit, action string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Second)
 	defer cancel()
 	out, err := systemctlRunner(ctx, action, unit)
 	if err != nil {
@@ -53,7 +53,7 @@ func unitIsEnabled(unit string) (bool, error) {
 	switch state {
 	case "enabled":
 		return true, nil
-	case "disabled", "masked":
+	case "disabled", "masked", "not-found":
 		return false, nil
 	default:
 		if err != nil {

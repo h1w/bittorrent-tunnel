@@ -86,10 +86,14 @@ func runTUI(in io.Reader, out io.Writer, unit Unit, client func() ([]string, err
 				fmt.Fprintf(&b, "  %s\n", line)
 			}
 		}
+		if extra != nil {
+			fmt.Fprintln(&b, "Space:toggle  v:show SOCKS5 login  g:regenerate")
+		}
 		fmt.Fprintln(&b, "s:start t:stop r:restart b:autostart q:quit")
 		out.Write([]byte(b.String()))
 	}
 
+	draw()
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	// Stop the refresh goroutine before returning so it cannot read the UI
@@ -115,7 +119,6 @@ func runTUI(in io.Reader, out io.Writer, unit Unit, client func() ([]string, err
 		}
 	}()
 
-	draw()
 	r := bufio.NewReader(in)
 	for {
 		c, err := r.ReadByte()
@@ -131,21 +134,22 @@ func runTUI(in io.Reader, out io.Writer, unit Unit, client func() ([]string, err
 			mu.Unlock()
 			return nil
 		case 's':
-			message = "starting..."
+			message = ""
 			if err := tuiControl(unit, "start"); err != nil {
 				message = fmt.Sprintf("error: %v", err)
 			}
 		case 't':
-			message = "stopping..."
+			message = ""
 			if err := tuiControl(unit, "stop"); err != nil {
 				message = fmt.Sprintf("error: %v", err)
 			}
 		case 'r':
-			message = "restarting..."
+			message = ""
 			if err := tuiControl(unit, "restart"); err != nil {
 				message = fmt.Sprintf("error: %v", err)
 			}
 		case 'b':
+			message = ""
 			_, enabled, _ := tuiState(unit)
 			if enabled {
 				message = "disabling autostart..."

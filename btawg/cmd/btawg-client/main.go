@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net/netip"
@@ -61,46 +62,47 @@ func installMain(args []string) error {
 		return err
 	}
 
-	raw, err := readImport(*importFile)
-	if err != nil {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("install must run as root")
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("use -import-file or the hidden terminal prompt")
+	}
+	mc, err := client.LoadManagedConfig(client.ManagedConfigPath)
+	if errors.Is(err, os.ErrNotExist) {
+		raw, err := readImport(*importFile)
+		if err != nil {
+			return err
+		}
+		cfg, err := config.ParseImportString(raw)
+		if err != nil {
+			return err
+		}
+		mode := config.CanonicalMode(cfg.Transport)
+		if !config.ValidClientMode(mode) {
+			return fmt.Errorf("unsupported import mode %q", mode)
+		}
+		ip, err := netip.ParseAddr(*socksListen)
+		if err != nil || !ip.Is4() {
+			return fmt.Errorf("-socks-listen requires an IPv4 address")
+		}
+		creds, err := client.GenerateCredentials()
+		if err != nil {
+			return err
+		}
+		mc = client.ManagedConfig{Import: raw, Enabled: []string{mode}, ListenIP: ip.String(), Credentials: creds, NoTUN: *noTun, TUNName: *tunName}
+		if err := mc.Save(client.ManagedConfigPath); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else if fs.NFlag() != 0 {
+		return fmt.Errorf("client already configured; run install without flags to upgrade")
+	}
+	if err := service.Client.Install(); err != nil {
 		return err
 	}
-	cfg, err := config.ParseImportString(raw)
-	if err != nil {
-		return err
-	}
-	listenIP, err := netip.ParseAddr(*socksListen)
-	if err != nil || !listenIP.Is4() {
-		return fmt.Errorf("-socks-listen requires an IPv4 address")
-	}
-	creds, err := client.GenerateCredentials()
-	if err != nil {
-		return err
-	}
-	mc := client.ManagedConfig{
-		Import:      raw,
-		Enabled:     []string{cfg.Transport},
-		ListenIP:    listenIP.String(),
-		Credentials: creds,
-	}
-	if err := mc.Save(client.ManagedConfigPath); err != nil {
-		return err
-	}
-	// Pass the TUN/no-tun choice through the unit's environment-free argv only
-	// as non-secret flags.
-	var extra []string
-	if *noTun {
-		extra = append(extra, "-no-tun")
-	}
-	if *tunName != "btawg0" {
-		extra = append(extra, "-tun", *tunName)
-	}
-	if err := service.Client.Install(extra...); err != nil {
-		return err
-	}
-	fmt.Println("btawg-client: installed and started")
-	fmt.Printf("btawg-client: SOCKS5 login %s / %s (all inbounds; view or rotate in the TUI)\n", creds.Username, creds.Password)
-	fmt.Printf("btawg-client: SOCKS5 inbounds 127.0.0.1:%d-%d\n", client.ManagedPortBase, client.ManagedPortBase+len(config.ClientModes())-1)
+	fmt.Println("btawg-client: installed and started; use sudo btawg-client to view SOCKS5 credentials")
 	return nil
 }
 
@@ -153,7 +155,10 @@ func runManaged(noTun bool, tunName string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return client.RunManaged(ctx, mc, !noTun, tunName)
+	if mc.TUNName != "" {
+		tunName = mc.TUNName
+	}
+	return client.RunManaged(ctx, mc, !noTun && !mc.NoTUN, tunName)
 }
 
 // legacyOrTUI runs a bare import string (single foreground connection) or the

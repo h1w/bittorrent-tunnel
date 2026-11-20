@@ -5,227 +5,182 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
+	"syscall"
+	"time"
 
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/service"
 )
 
-// ControlRequest is one live TUI command sent to the daemon's control socket.
 type ControlRequest struct {
-	Op      string   `json:"op"` // status | show | apply | rotate
+	Op      string   `json:"op"`
+	Mode    string   `json:"mode,omitempty"`
 	Enabled []string `json:"enabled,omitempty"`
 }
 
-// ModeState reports one connection mode's fixed port and whether it is live.
-type ModeState struct {
-	Mode    string `json:"mode"`
-	Port    int    `json:"port"`
-	Enabled bool   `json:"enabled"`
-}
-
-// ControlResponse is the daemon's answer to a ControlRequest.
 type ControlResponse struct {
-	OK          bool          `json:"ok"`
-	Enabled     []string      `json:"enabled"`
-	Modes       []ModeState   `json:"modes,omitempty"`
-	Credentials *Credentials  `json:"credentials,omitempty"`
-	Error       string        `json:"error,omitempty"`
+	OK          bool         `json:"ok"`
+	Enabled     []string     `json:"enabled"`
+	Credentials *Credentials `json:"credentials,omitempty"`
+	Error       string       `json:"error,omitempty"`
 }
 
-// Daemon owns a running Managed client and serves live control requests over
-// a root-only Unix socket. Enabled modes and credentials change in place and
-// are persisted so they survive a restart.
-type Daemon struct {
-	m       *Managed
-	path    string
-	cfgPath string
-
-	mu sync.Mutex
-	cfg ManagedConfig
+type clientControl struct {
+	m    *Managed
+	path string
+	mu   sync.Mutex
+	cfg  ManagedConfig
 }
 
-// RunManaged builds the managed client from cfg, serves live control on the
-// socket, and reports readiness to systemd. It returns when ctx is done or the
-// client fails irrecoverably.
 func RunManaged(ctx context.Context, cfg ManagedConfig, realTUN bool, tunName string) error {
-	return runManagedAt(ctx, cfg, ManagedConfigPath, ControlSocketPath, realTUN, tunName)
+	return runManagedAt(ctx, cfg, ManagedConfigPath, ControlSocketPath, realTUN, tunName, ManagedPortBase)
 }
 
-func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath string, realTUN bool, tunName string) error {
+func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath string, realTUN bool, tunName string, portBase int) error {
 	importCfg, err := config.ParseImportString(cfg.Import)
 	if err != nil {
-		return fmt.Errorf("parse import: %w", err)
+		return err
 	}
-	listenIP := netip.MustParseAddr(cfg.ListenIP)
-	if !listenIP.IsValid() {
-		listenIP = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	listenIP, err := netip.ParseAddr(cfg.ListenIP)
+	if err != nil || !listenIP.Is4() {
+		return fmt.Errorf("invalid SOCKS5 listen IPv4 address")
 	}
-	m, err := NewManaged(ctx, importCfg, cfg.Enabled, listenIP, cfg.Credentials, realTUN, tunName)
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0700); err != nil {
+		return err
+	}
+	if err := os.Chmod(filepath.Dir(socketPath), 0700); err != nil {
+		return err
+	}
+	ln, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	if err := os.Chmod(socketPath, 0600); err != nil {
+		return err
+	}
+	m, err := newManagedAt(ctx, importCfg, cfg.Enabled, listenIP, cfg.Credentials, realTUN, tunName, portBase)
 	if err != nil {
 		return err
 	}
 	defer m.Close()
-
-	d := &Daemon{m: m, path: socketPath, cfgPath: cfgPath, cfg: cfg}
-	ln, err := d.listen()
-	if err != nil {
+	d := &clientControl{m: m, path: cfgPath, cfg: cfg}
+	if err := service.NotifyReady(); err != nil {
 		return err
 	}
-	defer func() {
-		ln.Close()
-		os.Remove(d.path)
-	}()
-
-	if err := service.NotifyReady(); err != nil {
-		return fmt.Errorf("systemd ready: %w", err)
-	}
-
-	sctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go func() {
-		<-sctx.Done()
-		ln.Close()
-	}()
+	stop := context.AfterFunc(ctx, func() { ln.Close() })
+	defer stop()
+	var workers sync.WaitGroup
+	defer workers.Wait()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			if sctx.Err() != nil {
+			if ctx.Err() != nil {
 				return nil
 			}
 			return err
 		}
-		go d.serveConn(c)
+		workers.Go(func() { d.serve(ctx, c) })
 	}
 }
 
-func (d *Daemon) listen() (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(d.path), 0o700); err != nil {
-		return nil, err
-	}
-	os.Remove(d.path)
-	ln, err := net.Listen("unix", d.path)
-	if err != nil {
-		return nil, err
-	}
-	if err := os.Chmod(d.path, 0o600); err != nil {
-		ln.Close()
-		return nil, err
-	}
-	return ln, nil
-}
-
-func (d *Daemon) serveConn(c net.Conn) {
+func (d *clientControl) serve(ctx context.Context, c net.Conn) {
 	defer c.Close()
-	dec := json.NewDecoder(c)
-	enc := json.NewEncoder(c)
-	for {
-		var req ControlRequest
-		if err := dec.Decode(&req); err != nil {
-			return
-		}
-		enc.Encode(d.handle(req))
+	stop := context.AfterFunc(ctx, func() { c.Close() })
+	defer stop()
+	c.SetDeadline(time.Now().Add(15 * time.Second))
+	var req ControlRequest
+	if json.NewDecoder(io.LimitReader(c, 4096)).Decode(&req) != nil {
+		return
 	}
+	_ = json.NewEncoder(c).Encode(d.handle(req))
 }
 
-func (d *Daemon) handle(req ControlRequest) ControlResponse {
+func (d *clientControl) handle(req ControlRequest) ControlResponse {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	next := d.cfg
+	if err := next.update(req); err != nil {
+		return ControlResponse{Error: err.Error()}
+	}
+	if req.Op == "apply" || req.Op == "toggle" || req.Op == "rotate" {
+		if err := d.m.apply(next.Enabled, next.Credentials, func() error { return next.Save(d.path) }); err != nil {
+			return ControlResponse{Error: err.Error()}
+		}
+		d.cfg = next
+	}
+	return next.response(req.Op)
+}
+
+func (c *ManagedConfig) update(req ControlRequest) error {
 	switch req.Op {
 	case "status", "show":
-		resp := d.snapshotLocked()
-		if req.Op == "show" {
-			creds := d.cfg.Credentials
-			resp.Credentials = &creds
-		}
-		return resp
 	case "apply":
-		if err := d.m.Apply(req.Enabled, d.cfg.Credentials); err != nil {
-			return ControlResponse{OK: false, Error: err.Error()}
+		for _, m := range req.Enabled {
+			if !slices.Contains(config.ClientModes(), m) {
+				return fmt.Errorf("unsupported transport %q", m)
+			}
 		}
-		d.cfg.Enabled = canonicalModes(req.Enabled)
-		if err := d.cfg.Save(d.cfgPath); err != nil {
-			return ControlResponse{OK: false, Error: err.Error()}
+		c.Enabled = req.Enabled
+	case "toggle":
+		if !slices.Contains(config.ClientModes(), req.Mode) {
+			return fmt.Errorf("unsupported transport %q", req.Mode)
 		}
-		return d.snapshotLocked()
+		modes := slices.Clone(c.Enabled)
+		if i := slices.Index(modes, req.Mode); i >= 0 {
+			modes = slices.Delete(modes, i, i+1)
+		} else {
+			modes = append(modes, req.Mode)
+		}
+		c.Enabled = modes
 	case "rotate":
 		creds, err := GenerateCredentials()
 		if err != nil {
-			return ControlResponse{OK: false, Error: err.Error()}
+			return err
 		}
-		if err := d.m.Apply(d.cfg.Enabled, creds); err != nil {
-			return ControlResponse{OK: false, Error: err.Error()}
-		}
-		d.cfg.Credentials = creds
-		if err := d.cfg.Save(d.cfgPath); err != nil {
-			return ControlResponse{OK: false, Error: err.Error()}
-		}
-		resp := d.snapshotLocked()
-		resp.Credentials = &creds
-		return resp
+		c.Credentials = creds
 	default:
-		return ControlResponse{OK: false, Error: fmt.Sprintf("unknown op %q", req.Op)}
+		return fmt.Errorf("unknown operation %q", req.Op)
 	}
+	return nil
 }
 
-func (d *Daemon) snapshotLocked() ControlResponse {
-	ports := ManagedPorts()
-	modes := config.ClientModes()
-	enabled := map[string]bool{}
-	for _, m := range d.cfg.Enabled {
-		enabled[m] = true
+func (c ManagedConfig) response(op string) ControlResponse {
+	r := ControlResponse{OK: true, Enabled: c.Enabled}
+	if op == "show" || op == "rotate" {
+		r.Credentials = &c.Credentials
 	}
-	resp := ControlResponse{OK: true, Enabled: append([]string(nil), d.cfg.Enabled...)}
-	for i, mode := range modes {
-		resp.Modes = append(resp.Modes, ModeState{Mode: mode, Port: ports[i], Enabled: enabled[mode]})
-	}
-	return resp
+	return r
 }
 
-func canonicalModes(list []string) []string {
-	out := make([]string, 0, len(list))
-	for _, m := range list {
-		if cm := config.CanonicalMode(m); config.ValidClientMode(cm) {
-			out = append(out, cm)
-		}
-	}
-	return out
-}
+var ErrNotRunning = errors.New("btawg-client control socket is not listening")
 
-// Control is the TUI's client for the daemon socket. When the daemon is not
-// running, commands return ErrNotRunning and the TUI falls back to editing the
-// saved configuration.
-var ErrNotRunning = errors.New("btawg-client service is not running")
-
-// DialControl connects to the daemon's control socket.
-func DialControl(path string) (*Control, error) {
-	c, err := net.Dial("unix", path)
+func request(path string, req ControlRequest) (ControlResponse, error) {
+	var r ControlResponse
+	c, err := net.DialTimeout("unix", path, time.Second)
 	if err != nil {
-		return nil, ErrNotRunning
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+			return r, ErrNotRunning
+		}
+		return r, err
 	}
-	return &Control{conn: c}, nil
-}
-
-// Control is a live control connection to the daemon.
-type Control struct {
-	conn net.Conn
-}
-
-// Do sends one request and returns the daemon's response.
-func (c *Control) Do(req ControlRequest) (ControlResponse, error) {
-	var resp ControlResponse
-	if err := json.NewEncoder(c.conn).Encode(req); err != nil {
-		return resp, err
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(15 * time.Second))
+	if err := json.NewEncoder(c).Encode(req); err != nil {
+		return r, err
 	}
-	if err := json.NewDecoder(c.conn).Decode(&resp); err != nil {
-		return resp, err
+	if err := json.NewDecoder(c).Decode(&r); err != nil {
+		return r, err
 	}
-	return resp, nil
+	if !r.OK {
+		return r, errors.New(r.Error)
+	}
+	return r, nil
 }
-
-// Close releases the control connection.
-func (c *Control) Close() error { return c.conn.Close() }

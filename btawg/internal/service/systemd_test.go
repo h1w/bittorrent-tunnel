@@ -30,7 +30,7 @@ func TestUnitRender(t *testing.T) {
 	}
 
 	got = Server.renderUnit([]string{"-foo", "bar"})
-	if !strings.Contains(got, "ExecStart=/usr/local/bin/btawg-server run -managed -foo bar") {
+	if !strings.Contains(got, `ExecStart=/usr/local/bin/btawg-server run -managed "-foo" "bar"`) {
 		t.Fatalf("server unit missing extra args: %s", got)
 	}
 }
@@ -69,7 +69,7 @@ func TestInstallCopiesBinaryAndWritesUnit(t *testing.T) {
 		t.Fatalf("unit not written: %v", err)
 	}
 
-	want := []string{"daemon-reload", "enable btawg-server.service", "start btawg-server.service"}
+	want := []string{"daemon-reload", "enable btawg-server.service", "restart btawg-server.service"}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %v, want %v", calls, want)
 	}

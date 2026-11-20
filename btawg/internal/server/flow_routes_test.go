@@ -161,6 +161,22 @@ func TestFlowFragmentPin(t *testing.T) {
 	}
 }
 
+func TestActiveFlowCannotBeMovedToAnotherEngine(t *testing.T) {
+	ft := newFlowTable()
+	first, second := &engineTun{}, &engineTun{}
+	key, _ := flowKeyFromPacket(makeTCPPacket("1.1.1.1", "10.77.0.2", 443, 12345))
+	now := time.Now()
+	ft.pin(key, first, now)
+	ft.pin(key, second, now.Add(time.Second))
+	if got, _ := ft.lookup(key, now.Add(time.Second)); got != first {
+		t.Fatal("active reply path was stolen")
+	}
+	ft.pin(key, second, now.Add(2*ft.flowTTL))
+	if got, _ := ft.lookup(key, now.Add(2*ft.flowTTL)); got != second {
+		t.Fatal("expired reply path could not be replaced")
+	}
+}
+
 func TestFlowCapacityEviction(t *testing.T) {
 	ft := newFlowTable()
 	ft.flowTTL = time.Hour

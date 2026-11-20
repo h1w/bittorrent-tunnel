@@ -22,31 +22,6 @@ func freePort(t *testing.T) int {
 	return c.LocalAddr().(*net.UDPAddr).Port
 }
 
-// freeBase finds ten free consecutive TCP ports and returns the first.
-func freeBase(t *testing.T) int {
-	t.Helper()
-	for base := 23000; base < 40000; base += 10 {
-		var ls []net.Listener
-		ok := true
-		for i := 0; i < 10; i++ {
-			l, err := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(base+i)))
-			if err != nil {
-				ok = false
-				break
-			}
-			ls = append(ls, l)
-		}
-		for _, l := range ls {
-			l.Close()
-		}
-		if ok {
-			return base
-		}
-	}
-	t.Fatal("no free managed port block")
-	return 0
-}
-
 // managedCfg returns a config with real keys and loopback native endpoints so
 // a netstack tunnel can be built without a hub.
 func managedCfg(t *testing.T) config.ClientConfig {
@@ -77,34 +52,36 @@ func managedCfg(t *testing.T) config.ClientConfig {
 
 func TestManagedTunnelsFollowEnabledSet(t *testing.T) {
 	cfg := managedCfg(t)
-	base := freeBase(t)
 	m, err := newManagedAt(context.Background(), cfg,
 		[]string{config.ModeWG, config.ModeAWG}, netip.MustParseAddr("127.0.0.1"),
-		Credentials{Username: "op", Password: "pw"}, false, "btawg", base)
+		Credentials{Username: "op", Password: "pw"}, false, "btawg", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer m.Close()
 
-	if got := len(m.tunnels); got != 2 {
-		t.Fatalf("built %d tunnels, want 2", got)
-	}
-	if l, err := net.Listen("tcp4", m.slot(5).ln.Addr().String()); err == nil {
-		l.Close()
-		t.Fatal("WG slot listener was not reserved")
+	addr := m.inbound.slots[4].ln.Addr().String()
+	creds := Credentials{Username: "op", Password: "pw"}
+	if c, err := proxyAuth(t, addr, creds); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
 	}
 
 	// Disable AWG: its tunnel goes away but its fixed port stays reserved.
 	if err := m.Apply([]string{config.ModeWG}, Credentials{Username: "op", Password: "pw"}); err != nil {
 		t.Fatal(err)
 	}
-	if m.hasTunnel(config.ModeAWG) {
-		t.Fatal("AWG tunnel still live after disable")
+	if c, err := proxyAuth(t, addr, creds); err == nil {
+		c.Close()
+		t.Fatal("disabled AWG still accepting SOCKS authentication")
 	}
-	if !m.hasTunnel(config.ModeWG) {
-		t.Fatal("WG tunnel missing after sibling disabled")
+	if c, err := proxyAuth(t, m.inbound.slots[5].ln.Addr().String(), creds); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
 	}
-	if l, err := net.Listen("tcp4", m.slot(4).ln.Addr().String()); err == nil {
+	if l, err := net.Listen("tcp4", addr); err == nil {
 		l.Close()
 		t.Fatal("disabled AWG port was released")
 	}
@@ -113,7 +90,9 @@ func TestManagedTunnelsFollowEnabledSet(t *testing.T) {
 	if err := m.Apply([]string{config.ModeWG, config.ModeAWG}, Credentials{Username: "op", Password: "pw"}); err != nil {
 		t.Fatal(err)
 	}
-	if !m.hasTunnel(config.ModeAWG) {
-		t.Fatal("AWG tunnel did not return after re-enable")
+	if c, err := proxyAuth(t, addr, creds); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
 	}
 }

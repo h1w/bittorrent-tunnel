@@ -2,7 +2,6 @@ package service
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,10 +40,7 @@ func (u Unit) unitPath() string   { return filepath.Join(unitDir, u.unitName()) 
 // secret is never placed in unit arguments; callers must persist it to
 // /etc/btawg/client.json before installing the client unit.
 func (u Unit) Install(extraArgs ...string) error {
-	src, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("locate executable: %w", err)
-	}
+	const src = "/proc/self/exe"
 	if err := copyFile(src, u.binaryPath(), 0o755); err != nil {
 		return fmt.Errorf("copy binary: %w", err)
 	}
@@ -58,10 +54,7 @@ func (u Unit) Install(extraArgs ...string) error {
 	if err := unitAction(u.unitName(), "enable"); err != nil {
 		return err
 	}
-	if err := unitAction(u.unitName(), "start"); err != nil {
-		return err
-	}
-	return nil
+	return unitAction(u.unitName(), "restart")
 }
 
 // Control executes a systemd action for the unit. Supported actions are the
@@ -93,6 +86,9 @@ func (u Unit) State() (string, bool, error) {
 
 func (u Unit) renderUnit(extraArgs []string) string {
 	exec := fmt.Sprintf("%s run -managed", u.binaryPath())
+	for i, arg := range extraArgs {
+		extraArgs[i] = strconv.Quote(strings.NewReplacer("%", "%%", "$", "$$").Replace(arg))
+	}
 	if len(extraArgs) > 0 {
 		exec += " " + strings.Join(extraArgs, " ")
 	}
@@ -110,6 +106,8 @@ After=network.target
 [Service]
 Type=notify
 ExecStart=%s
+TimeoutStartSec=45
+TimeoutStopSec=20
 Restart=on-failure
 RestartSec=5
 %s
@@ -127,17 +125,5 @@ func copyFile(src, dst string, mode os.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(out, in)
-	if closeErr := out.Close(); closeErr != nil && err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		_ = os.Remove(dst)
-		return err
-	}
-	return nil
+	return writeFile(dst, in, mode)
 }

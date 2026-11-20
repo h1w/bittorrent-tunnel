@@ -424,10 +424,8 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 		if !srcOK || !dstOK {
 			continue
 		}
-		if e.authSource.IsValid() {
-			if active, _ := e.router.lookup(src); src != e.authSource || active != e {
-				continue
-			}
+		if e.authSource.IsValid() && src != e.authSource {
+			continue
 		}
 		direct := e.router.isKernel && !e.router.policy.isClient(dst) && !e.router.policy.isGateway(dst)
 		if !e.router.policy.upload(src, dst, direct, len(packet), now) {
@@ -437,9 +435,7 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 		// only moment a flow's ownership is established; route changes and
 		// later handshakes cannot steal an active flow.
 		e.pinReverseFlow(packet, now)
-		if !e.authSource.IsValid() {
-			e.router.remember(src, e, now.UnixNano())
-		}
+		e.router.remember(src, e, now.UnixNano())
 		if e.router.policy.isGateway(dst) || direct {
 			innerBufs = append(innerBufs, b)
 			continue

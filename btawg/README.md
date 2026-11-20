@@ -42,20 +42,20 @@ The first install prints, once:
 btawg-server: panel login admin / <password> (shown once)
 ```
 
-**Save that password now** — it is never shown again. If lost, delete the db
-and re-import clients (or look into the store with the panel still logged in).
+**Save that password now** — it is shown only once. Do not delete the
+database to recover it; the database also contains the hub and client identities.
 
 Manage the service and see its status from the TUI:
 
 ```sh
-btawg-server            # TUI: status, start/stop/restart, autostart
+sudo btawg-server       # TUI: status, start/stop/restart, autostart
 ```
 
 Open **6881/TCP**, **6881/UDP**, **51821/UDP** (AWG), and **51820/UDP**
-(WG) on the hub, or the configured equivalents. DHT also needs outbound
-UDP. Real-TUN mode requires `ip`, `sysctl`, and `nft` (with kernel IPv4 NAT
-support). If the host firewall drops traffic, allow **1053/TCP only on the hub
-TUN** for DNS and allow forwarding from the TUN to the WAN plus established
+(WG) on the hub. DHT also needs outbound UDP. Real-TUN mode requires `ip`,
+`sysctl`, and `nft` with kernel conntrack and NAT support. If the host
+firewall drops traffic, allow the panel and **1053/TCP** (DNS) on the hub
+TUN only, and allow forwarding from the TUN to the WAN plus established
 return traffic. btawg configures routing, overlay addresses, and scoped NAT
 automatically, but it **does not open host firewall ports** — add those
 yourself.
@@ -87,11 +87,11 @@ installs, enables, and starts the `btawg-client` systemd service. The mode from
 the import is enabled at first; the rest start reserved-but-off. Re-running
 `install` upgrades the binary without losing config or credentials.
 
-Run `btawg-client` with no arguments for the TUI:
+Run `sudo btawg-client` with no arguments for the TUI:
 
 ```text
 btawg-client  active / enabled
-[x] 1080  socks5-awg-ext-utp   active
+[x] 1080  socks5-awg-ext-utp   enabled
 [ ] 1081  socks5-awg-ext-tcp   reserved
 ...
 Space: toggle   v: show SOCKS5 login   g: regenerate
@@ -126,14 +126,16 @@ sudo ./btawg-client 'btawg://…'      # one mode, btawg0 interface
 ### 4. Verify
 
 ```sh
-curl -4 -s --socks5-hostname 127.0.0.1:1080 https://example.com   # 200
-ip a show btawg0                                                  # 10.77.0.x present
+curl --socks5-hostname 127.0.0.1:1080 --proxy-user "$SOCKS_LOGIN" https://example.com
+curl http://10.77.0.1:8080/login
+ip route get 10.77.0.1
 ```
 
-Point any app's SOCKS5 at `127.0.0.1:1080` (DNS resolves at the hub — no
-client-side leak). To route specific traffic via the interface instead,
-add your own routes into `10.77.0.0/24` — btawg never touches your
-default route.
+Use a port enabled in the TUI and set `SOCKS_LOGIN` to the username shown by
+`v`; curl prompts for the password. SOCKS domain resolution runs at the hub.
+The client automatically installs the VPN prefixes from the import and uses
+the lowest-index enabled path for ordinary VPN-IP traffic. SOCKS sockets use
+the tunnel assigned to their port. The host default route is not changed.
 
 ### 5. Policy (panel, live)
 
@@ -306,6 +308,11 @@ the pinned mutual TLS keys authenticate each encrypted connection.
 - End-to-end in all eight BitTorrent modes: DHT discovery through a local
   relay, local SOCKS5 destination filtering and client-to-client IPv4 traffic.
   The mixed-mode test also routes between both native modes and the carriers.
+- Managed services: a Linux VM with real systemd, kernel TUN, nftables NAT,
+  and separate hub, client, and egress networks exercised both installers,
+  login on loopback and access to the panel over the VPN, ten authenticated
+  SOCKS5 paths (hostname TCP and UDP), live TUI switching and password
+  rotation, and persistence after restart and reinstall.
 
 On a single Linux host, separate network namespaces connected by a kernel
 `netkit` link (RTT approximately 0.06 ms) transferred and verified 1 GiB per
