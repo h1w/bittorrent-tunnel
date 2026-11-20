@@ -63,8 +63,9 @@ Open **6881/TCP**, **6881/UDP**, **51821/UDP** (AWG), and **51820/UDP**
 (WG) on the hub, or the configured equivalents. DHT also needs outbound
 UDP. The admin panel stays on loopback. Real-TUN mode requires `ip`,
 `sysctl`, and `nft` (with kernel IPv4 NAT support). If the host firewall
-drops overlay traffic, allow the overlay SOCKS port on `btawg0`, and allow
-the intended forwarding paths; btawg does not override the host firewall.
+drops traffic, allow **1053/TCP only on the hub TUN** for DNS and allow
+forwarding from the TUN to the WAN plus established return traffic.
+btawg does not override the host firewall. There is no SOCKS5 port on the hub.
 
 ### 2. Panel → first client
 
@@ -187,12 +188,13 @@ or `./btawg-client -config file.txt`. The client then:
   through DHT when requested; for the two native modes, connects directly over UDP
   to the selected native endpoint;
 - serves **no-auth SOCKS5 on 127.0.0.1:1080 by default**. Traffic
-  is chained through the tunnel to the hub's egress, which dials the real
-  internet (DNS resolves at the hub — no client-side leak);
+  goes directly into the tunnel as IPv4 packets; the hub routes and NATs
+  them. The client resolves SOCKS domain targets via the hub's overlay-only
+  DNS service, without asking the client's system DNS resolver;
 - with real TUN, creates `btawg0` with the assigned VPN address and the
-  managed IPv4 subnet routes from the import. It never installs a default
-  route. To send selected public prefixes through the VPN, add explicit
-  client routes; the hub still decides whether to forward them.
+  managed IPv4 subnet routes from the import. Only sockets bound to that
+  interface use its private egress routing table; the host default route
+  stays unchanged. The hub still decides which traffic to forward.
 
 The hub and client use a default tunnel MTU of 1280 bytes, including in
 `-no-tun` mode and in exported standalone VPN configurations.
@@ -217,8 +219,8 @@ Clients form a local network on the overlay: dial another client's
 `10.77.0.x` address directly (the hub re-encrypts packets between carriers,
 like kernel WireGuard's ip_forward). In netstack mode use
 `Client.OverlayDialTCP`; on a real TUN the kernel routes overlay addresses
-through `btawg0`. **Do not** route LAN traffic through SOCKS5 — the egress
-dials destinations on the hub's host, which is for the internet only.
+through `btawg0`. Use direct VPN IP traffic for LAN services; the client
+SOCKS5 proxy is for public IPv4 destinations only.
 
 ## Routing policy and groups
 
@@ -230,16 +232,21 @@ routed IPv4 networks, not shared Ethernet segments.
 
 The hub enforces the policy after VPN authentication, on both overlay
 routing and internet egress. Internet can only use the central server.
-Real-TUN mode supports explicitly routed IPv4 packets via scoped NAT;
-SOCKS5 is available in real-TUN and `-no-tun` modes. The client never
-installs a system-wide default route. To use internet egress with standalone
-WG/AWG, add the selected public prefixes to `AllowedIPs` and the OS routes.
+A real-TUN hub routes IPv4 through scoped NAT. Clients can use SOCKS5 with
+either a kernel TUN or `-no-tun`; a hub started with `-no-tun` is overlay-only
+and does not provide Internet egress or DNS. The client never installs a
+system-wide default route. Standalone WG/AWG users must add the desired
+public prefixes to `AllowedIPs` and the OS routes for Internet access.
 
 Back up the database before upgrading. Existing IPs and settings move to
 the default group; existing per-user permissions become explicit. Policy
 edits are live. Changing the hub listener ports or AWG profile requires a
 restart and a fresh import. In `-no-tun` mode the group gateway addresses
 are fixed at startup; use real TUN to change group networks live.
+
+Upgrade both binaries together for client SOCKS5 Internet access. Existing
+imports still work with the updated client; the old hub SOCKS port is ignored.
+An old client cannot proxy Internet traffic through an updated hub.
 
 ## Live activity and traffic
 
@@ -274,7 +281,7 @@ the pinned mutual TLS keys authenticate each encrypted connection.
   announce/discover (loopback relay), panel handlers: unit tests.
 - Full suite `go test ./...` green incl. `-race` on the networking paths.
 - End-to-end in all eight BitTorrent modes: DHT discovery through a local
-  relay, SOCKS5 policy and client-to-client IPv4 traffic through the hub.
+  relay, local SOCKS5 destination filtering and client-to-client IPv4 traffic.
   The mixed-mode test also routes between both native modes and the carriers.
 
 On a single Linux host, separate network namespaces connected by a kernel

@@ -26,6 +26,28 @@ const ClientVersion = 1
 // DefaultMTU is the default IP MTU of the hub and client tunnels.
 const DefaultMTU = 1280
 
+var nonInternetIPv4 = [...]netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
+// PublicIPv4 reports whether ip is eligible for routed Internet egress.
+func PublicIPv4(ip netip.Addr) bool {
+	ip = ip.Unmap()
+	if !ip.Is4() || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	for _, p := range nonInternetIPv4 {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
 // Supported SOCKS5 connection chains. Native modes can also be exported
 // for standalone clients that do not provide SOCKS5.
 const (
@@ -150,7 +172,6 @@ type ClientConfig struct {
 	ServerIP        string            `json:"server_ip"`                // overlay hub, e.g. 10.77.0.1
 	Transport       string            `json:"transport"`                // user-selected mode
 	SocksPort       int               `json:"socks_port"`               // client's local no-auth SOCKS5
-	EgressPort      int               `json:"egress_port"`              // hub's overlay SOCKS5 the chain targets
 	Profile         AWGProfile        `json:"awg_profile"`
 	DHTBootstrap    []string          `json:"dht_bootstrap,omitempty"`
 	CarrierHashes   map[string]string `json:"carrier_hashes,omitempty"`   // mode -> 20-byte hex infohash
@@ -399,7 +420,6 @@ type ServerConfig struct {
 	CarrierPort     int        `json:"carrier_port"`
 	AWGPort         int        `json:"awg_port"`
 	WGPort          int        `json:"wg_port"`
-	SocksPort       int        `json:"socks_port"`
 	PanelPort       int        `json:"panel_port"`
 	ExternalIP      string     `json:"external_ip"`
 	InfoHash        string     `json:"infohash"`        // 20-byte hex, generated at first boot
@@ -418,7 +438,6 @@ func DefaultServerConfig() ServerConfig {
 		CarrierPort: 6881,
 		AWGPort:     51821,
 		WGPort:      51820,
-		SocksPort:   1080,
 		PanelPort:   8080,
 	}
 }
@@ -449,9 +468,6 @@ func (c *ServerConfig) Normalize() {
 	}
 	if c.WGPort == 0 {
 		c.WGPort = def.WGPort
-	}
-	if c.SocksPort == 0 {
-		c.SocksPort = def.SocksPort
 	}
 	if c.PanelPort == 0 {
 		c.PanelPort = def.PanelPort

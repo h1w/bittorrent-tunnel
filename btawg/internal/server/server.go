@@ -1,8 +1,6 @@
-// Package server assembles the btawg hub: the AmneziaWG device over a
-// netstack overlay with peer-to-peer forwarding, the BitTorrent carrier
-// listener (µTP or TCP per transport), the egress SOCKS5 reachable only inside
-// the tunnel, and the DHT announcer. The web panel (separate package) drives
-// the same store this server loads.
+// Package server assembles the btawg hub: encrypted tunnels, IPv4 routing,
+// overlay DNS, and optional BitTorrent discovery. The web panel drives the
+// same store this server loads.
 package server
 
 import (
@@ -17,7 +15,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
@@ -25,7 +22,6 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	utp "github.com/anacrolix/go-utp"
-	"golang.org/x/sys/unix"
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/bind"
@@ -33,8 +29,8 @@ import (
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/dht"
 	"bittorrent-tunnel/btawg/internal/iptunnel"
-	"bittorrent-tunnel/btawg/internal/socks"
 	"bittorrent-tunnel/btawg/internal/store"
+	"bittorrent-tunnel/btawg/internal/tunneldns"
 	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
 
@@ -74,19 +70,15 @@ type Server struct {
 
 	policy *policySnapshot
 
-	udpPC      net.PacketConn
-	sock       utp.Socket
-	tcpLn      net.Listener
-	anns       []*dht.Announcer
-	egressLn   net.Listener
-	egressGate *gatedListener
-	closed     chan struct{}
+	udpPC  net.PacketConn
+	sock   utp.Socket
+	tcpLn  net.Listener
+	anns   []*dht.Announcer
+	dnsLn  net.Listener
+	closed chan struct{}
 }
 
-// New loads (or generates at first boot) the server identity, builds the AWG
-// hub with one peer per stored client, the carrier listener and the egress
-// SOCKS5 in userspace netstack mode. Call Run to serve; call Announce to
-// publish via DHT.
+// New builds an overlay-only userspace hub, without Internet forwarding.
 func New(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 	return newServer(cfg, st, "")
 }
@@ -176,7 +168,7 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 	if !config.ValidClientMode(cfg.Transport) {
 		return nil, fmt.Errorf("unsupported transport %q", cfg.Transport)
 	}
-	for _, p := range []int{cfg.CarrierPort, cfg.AWGPort, cfg.WGPort, cfg.SocksPort} {
+	for _, p := range []int{cfg.CarrierPort, cfg.AWGPort, cfg.WGPort} {
 		if p < 1 || p > 65535 {
 			return nil, fmt.Errorf("invalid port %d", p)
 		}
@@ -307,29 +299,14 @@ func (s *Server) finish() error {
 	if err != nil {
 		return err
 	}
-	if s.ns != nil {
-		s.egressLn, err = s.netstackEgress()
-	} else {
-		lc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {
-			if err := tunsetup.OverlayTCP(network, address, c); err != nil {
-				return err
-			}
-			var optErr error
-			if err := c.Control(func(fd uintptr) { optErr = unix.BindToDevice(int(fd), s.tunName) }); err != nil {
-				return err
-			}
-			return optErr
-		}}
-		s.egressLn, err = lc.Listen(context.Background(), "tcp4", fmt.Sprintf(":%d", s.cfg.SocksPort))
+	if s.kernel != nil {
+		lc := net.ListenConfig{Control: tunsetup.BindDevice(s.tunName)}
+		s.dnsLn, err = lc.Listen(context.Background(), "tcp4", fmt.Sprintf(":%d", tunneldns.Port))
+		if err != nil {
+			return fmt.Errorf("overlay DNS: %w", err)
+		}
 	}
-	if err != nil {
-		return err
-	}
-	s.egressGate = &gatedListener{inner: s.egressLn, policy: s.policy, active: make(map[*egressSession]netip.Addr)}
 	s.hashes = make(map[[20]byte]string, len(config.CarrierHelloModes()))
-	if s.ns == nil {
-		s.egressGate.requireGateway = true
-	}
 	for _, mode := range config.CarrierHelloModes() {
 		hash, err := config.CarrierHash(s.InfoHash(), s.cfg.LegacyTransport, mode)
 		if err != nil {
@@ -375,9 +352,6 @@ func (s *Server) ReloadPolicy() (err error) {
 			return
 		}
 		s.policy.disableClients()
-		if s.egressGate != nil {
-			s.egressGate.closeDenied()
-		}
 		s.mu.Lock()
 		for _, t := range s.tlsSessions {
 			t.Close()
@@ -414,9 +388,6 @@ func (s *Server) ReloadPolicy() (err error) {
 	if err = s.policy.reload(s.st, netip.MustParseAddr(group.ServerIP)); err != nil {
 		return err
 	}
-	if s.egressGate != nil {
-		s.egressGate.closeDenied()
-	}
 	s.gateways = gs
 	return nil
 }
@@ -424,7 +395,7 @@ func (s *Server) ReloadPolicy() (err error) {
 // OverlayNet exposes the hub's userspace network stack for the panel and diagnostics.
 func (s *Server) OverlayNet() *netstack.Net { return s.ns }
 
-// Run serves the carrier listener and the egress SOCKS5 until ctx is done.
+// Run serves carrier connections and overlay DNS until ctx is done.
 func (s *Server) Run(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -436,41 +407,12 @@ func (s *Server) Run(ctx context.Context) error {
 		cancel()
 	}()
 
-	prefix := egressDenied{policy: s.policy}
-	egress := socks.NewServer(
-		newEgressDialer(prefix, net.DefaultResolver),
-		func(ctx context.Context) (net.PacketConn, error) {
-			return newEgressUDP(prefix)
-		},
-	).WithRelayUDP(func(local, remote net.Addr) (net.PacketConn, error) {
-		// The relay must live inside the overlay. In netstack mode that is a
-		// netstack address; in real-TUN mode the kernel interface owns the
-		// overlay prefix, so bind the relay to it on the host network.
-		serverIP, ok := addrIP(local)
-		if !ok {
-			return nil, fmt.Errorf("invalid relay local address")
-		}
-		var relay net.PacketConn
-		var err error
-		if s.ns != nil {
-			relay, err = s.ns.ListenUDPAddrPort(netip.AddrPortFrom(serverIP, 0))
-		} else {
-			relay, err = net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(serverIP.String())})
-		}
-		if err != nil {
-			return nil, err
-		}
-		remoteIP, ok := addrIP(remote)
-		if !ok {
-			relay.Close()
-			return nil, fmt.Errorf("relay: cannot parse control remote address %v", remote)
-		}
-		return &sourceLockedRelay{PacketConn: relay, allow: remoteIP}, nil
-	})
-	go egress.Serve(runCtx, s.egressGate)
-
-	errs := make(chan error, 2)
-	for _, accept := range []func() (net.Conn, error){s.tcpLn.Accept, s.sock.Accept} {
+	listeners := []func() (net.Conn, error){s.tcpLn.Accept, s.sock.Accept}
+	errs := make(chan error, len(listeners)+1)
+	if s.dnsLn != nil {
+		go func() { errs <- tunneldns.Serve(runCtx, s.dnsLn, s.policy.allowDNS) }()
+	}
+	for _, accept := range listeners {
 		go func() {
 			for {
 				c, err := accept()
@@ -499,7 +441,7 @@ func (s *Server) Run(ctx context.Context) error {
 		case <-s.closed:
 			return nil
 		default:
-			return fmt.Errorf("carrier accept: %w", err)
+			return fmt.Errorf("hub listener: %w", err)
 		}
 	}
 }
@@ -721,121 +663,6 @@ func (s *Server) RegisterClient(rec store.ClientRecord) error { return s.ReloadP
 // RevokeClient applies a revocation already persisted by the panel.
 func (s *Server) RevokeClient(rec store.ClientRecord) error { return s.ReloadPolicy() }
 
-// hostResolver is the minimal resolver surface the egress dialer needs.
-type hostResolver interface {
-	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
-}
-
-// overlayFilteredPacketConn wraps an upstream UDP socket and refuses writes
-// to destinations inside the overlay subnet. SOCKS/egress is internet-only;
-// client-to-client traffic must use the filtered OverlayDialTCP path.
-type overlayFilteredPacketConn struct {
-	net.PacketConn
-	prefix interface{ Contains(netip.Addr) bool }
-}
-
-func (c *overlayFilteredPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if ip, ok := addrIP(addr); !ok || c.prefix.Contains(ip.Unmap()) {
-		return 0, fmt.Errorf("egress refused: UDP destination %v is not allowed", addr)
-	}
-	return c.PacketConn.WriteTo(p, addr)
-}
-
-// sourceLockedRelay wraps the app-facing UDP relay socket of a single SOCKS5
-// UDP ASSOCIATE. It only accepts datagrams from the overlay IP that opened
-// the TCP control connection; datagrams from any other source are dropped
-// before pumpUDP can forward them upstream. This prevents a malicious or
-// NoInternet client from hijacking another client's UDP relay association.
-type sourceLockedRelay struct {
-	net.PacketConn
-	allow netip.Addr
-}
-
-func (r *sourceLockedRelay) ReadFrom(p []byte) (int, net.Addr, error) {
-	for {
-		n, src, err := r.PacketConn.ReadFrom(p)
-		if err != nil {
-			return n, src, err
-		}
-		ip, ok := addrIP(src)
-		if ok && ip == r.allow {
-			return n, src, nil
-		}
-		// Datagram from an unauthorized source: drop and keep reading.
-	}
-}
-
-// newEgressDialer returns a TCP dialer that refuses overlay destinations.
-// For literal IPs the check is direct; for hostnames it resolves the name and
-// refuses if any returned IP lies inside the overlay subnet. After the check
-// succeeds, the dial uses the resolved address so the guard cannot be bypassed
-// by a name that resolves differently at dial time.
-func newEgressDialer(prefix interface{ Contains(netip.Addr) bool }, resolver hostResolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("egress: malformed destination %q: %w", addr, err)
-		}
-		dialHost := host
-
-		if ip, err := netip.ParseAddr(host); err == nil {
-			if prefix.Contains(ip.Unmap()) {
-				return nil, fmt.Errorf("egress refused: destination %s is not allowed", addr)
-			}
-		} else {
-			ips, err := resolver.LookupIP(ctx, "ip", host)
-			if err != nil {
-				return nil, fmt.Errorf("egress: resolve %s: %w", host, err)
-			}
-			var addrs []string
-			for _, ip := range ips {
-				a, ok := netip.AddrFromSlice(ip)
-				if !ok {
-					continue
-				}
-				a = a.Unmap()
-				if prefix.Contains(a) {
-					return nil, fmt.Errorf("egress refused: hostname %s resolved to a prohibited IP %s", host, a)
-				}
-				addrs = append(addrs, net.JoinHostPort(a.String(), port))
-			}
-			if len(addrs) == 0 {
-				return nil, fmt.Errorf("egress: no usable IP for %s", host)
-			}
-
-			var d net.Dialer
-			var firstErr error
-			for _, addr := range addrs {
-				conn, err := d.DialContext(ctx, network, addr)
-				if err == nil {
-					return conn, nil
-				}
-				if firstErr == nil {
-					firstErr = err
-				}
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				default:
-				}
-			}
-			return nil, firstErr
-		}
-
-		var d net.Dialer
-		return d.DialContext(ctx, network, net.JoinHostPort(dialHost, port))
-	}
-}
-
-// newEgressUDP returns an upstream UDP socket that refuses overlay destinations.
-func newEgressUDP(prefix interface{ Contains(netip.Addr) bool }) (net.PacketConn, error) {
-	pc, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		return nil, err
-	}
-	return &overlayFilteredPacketConn{PacketConn: pc, prefix: prefix}, nil
-}
-
 // ConnectedCount reports how many carriers are attached per overlay IP.
 func (s *Server) ConnectedCount() map[string]int {
 	s.mu.Lock()
@@ -872,10 +699,8 @@ func (s *Server) Close() error {
 			_ = s.udpPC.Close()
 		}
 		s.carrierWG.Wait()
-		if s.egressGate != nil {
-			_ = s.egressGate.Close()
-		} else if s.egressLn != nil {
-			_ = s.egressLn.Close()
+		if s.dnsLn != nil {
+			_ = s.dnsLn.Close()
 		}
 		if s.dev != nil {
 			s.dev.Close()

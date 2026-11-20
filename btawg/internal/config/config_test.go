@@ -120,7 +120,7 @@ func TestServerConfigNormalize(t *testing.T) {
 		t.Fatalf("Normalize() = %+v, want %+v", c, want)
 	}
 
-	legacy := ServerConfig{CarrierPort: 7777, SocksPort: 9999}
+	legacy := ServerConfig{CarrierPort: 7777}
 	legacy.Normalize()
 	if legacy.CarrierPort != 7777 {
 		t.Fatalf("Normalize overwrote explicit CarrierPort")

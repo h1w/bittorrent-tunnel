@@ -55,19 +55,8 @@ func TestMixedTransportStableAddress(t *testing.T) {
 		t.Cleanup(c.Close)
 		t.Cleanup(stop)
 		go c.Run(clientCtx)
-		// Give the client an authenticated path to the hub before other peers initiate traffic.
-		until := time.Now().Add(18 * time.Second)
-		for time.Now().Before(until) {
-			dialctx, done := context.WithTimeout(ctx, 450*time.Millisecond)
-			conn, e := c.OverlayDialTCP(dialctx, netip.MustParseAddrPort("10.77.0.1:1080"))
-			done()
-			if e == nil {
-				conn.Close()
-				return c
-			}
-		}
-		t.Fatalf("%s could not reach hub", mode)
-		return nil
+		primeGatewayPath(t, hub, c)
+		return c
 	}
 	for i, mode := range modes {
 		cs[i] = start(i, mode)

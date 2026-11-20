@@ -1,10 +1,12 @@
 package server
 
 import (
+	"net"
 	"net/netip"
 	"sync"
 	"time"
 
+	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/store"
 )
 
@@ -194,7 +196,7 @@ func (p *policySnapshot) packetAllowed(src, dst netip.Addr, directInternet bool)
 		return p.peerSees(a, b) && p.peerSees(b, a)
 	}
 	_, local := p.localIPs[dst]
-	return directInternet && !local && publicDestination(dst) && !p.overlay(dst) && p.internet(a)
+	return directInternet && !local && config.PublicIPv4(dst) && !p.overlay(dst) && p.internet(a)
 }
 
 func (p *policySnapshot) clientCanReach(src, dst netip.Addr) bool {
@@ -211,14 +213,18 @@ func (p *policySnapshot) clientCanReach(src, dst netip.Addr) bool {
 	return srcOK && dstOK && p.peerSees(a, b) && p.peerSees(b, a)
 }
 
-func (p *policySnapshot) internetFor(src netip.Addr) bool {
+// allowDNS only accepts enrolled clients at a tunnel gateway. Resolver work
+// and replies are subject to the same live Internet policy as forwarded IP.
+func (p *policySnapshot) allowDNS(remote, local net.Addr) bool {
+	src, srcOK := remote.(*net.TCPAddr)
+	dst, dstOK := local.(*net.TCPAddr)
+	if !srcOK || !dstOK {
+		return false
+	}
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	if p.gateway(src) {
-		return true
-	}
-	rec, ok := p.byIP[src]
-	return ok && p.internet(rec)
+	rec, known := p.byIP[src.AddrPort().Addr().Unmap()]
+	return known && p.gateway(dst.AddrPort().Addr().Unmap()) && p.internet(rec)
 }
 
 func (p *policySnapshot) internet(rec store.ClientRecord) bool {

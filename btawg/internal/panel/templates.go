@@ -127,10 +127,9 @@ const serverTmpl = `{{define "content"}}
 <div class="row">
 <div><label>Native AWG UDP<input name="awg_port" value="{{.Cfg.AWGPort}}"></label></div>
 <div><label>Native WG UDP<input name="wg_port" value="{{.Cfg.WGPort}}"></label></div>
-<div><label>Egress SOCKS5 (overlay)<input name="socks_port" value="{{.Cfg.SocksPort}}"></label></div>
 <div><label>Panel (loopback)<input name="panel_port" value="{{.Cfg.PanelPort}}"></label></div>
 </div>
-{{if or (ne .Cfg.CarrierPort .ActiveCfg.CarrierPort) (ne .Cfg.AWGPort .ActiveCfg.AWGPort) (ne .Cfg.WGPort .ActiveCfg.WGPort) (ne .Cfg.SocksPort .ActiveCfg.SocksPort) (ne .Cfg.PanelPort .ActiveCfg.PanelPort)}}<div class="note">Port changes differ from active config — restart required.</div>{{end}}
+{{if or (ne .Cfg.CarrierPort .ActiveCfg.CarrierPort) (ne .Cfg.AWGPort .ActiveCfg.AWGPort) (ne .Cfg.WGPort .ActiveCfg.WGPort) (ne .Cfg.PanelPort .ActiveCfg.PanelPort)}}<div class="note">Port changes differ from active config — restart required.</div>{{end}}
 </div>
 <button>Save settings</button>
 </form>

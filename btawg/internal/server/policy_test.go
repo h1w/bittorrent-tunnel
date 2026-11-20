@@ -161,18 +161,19 @@ func TestPolicySnapshotMatrix(t *testing.T) {
 		t.Errorf("serverIP -> C: want true, got false")
 	}
 
-	// Internet access rules.
-	if !p.internetFor(aIP) {
-		t.Errorf("internetFor(A): want true, got false")
+	// The kernel path must gate outgoing IP packets and their replies.
+	public := netip.MustParseAddr("1.1.1.1")
+	checkInternet := func(ip netip.Addr, want bool) {
+		t.Helper()
+		if up, down := p.upload(ip, public, true, 40, time.Now()), p.downlink(public, ip, 40); up != want || down != want {
+			t.Errorf("routed access for %s: up=%v down=%v, want %v", ip, up, down, want)
+		}
 	}
-	if p.internetFor(cIP) {
-		t.Errorf("internetFor(C): want false, got true")
-	}
-	if !p.internetFor(serverIP) {
-		t.Errorf("internetFor(serverIP): want true, got false")
-	}
-	if p.internetFor(unknownIP) {
-		t.Errorf("internetFor(unknown): want false, got true")
+	checkInternet(aIP, true)
+	checkInternet(cIP, false)
+	checkInternet(unknownIP, false)
+	if p.upload(aIP, public, false, 40, time.Now()) {
+		t.Error("userspace-only hub accepted routed Internet packet")
 	}
 
 	// Live reload: flip B and C so they mutually see each other, reload, C->B true.
@@ -187,12 +188,14 @@ func TestPolicySnapshotMatrix(t *testing.T) {
 		t.Fatalf("delete C: %v", err)
 	}
 	c.VisiblePeers = []string{"B"}
+	c.Internet = new(true)
 	if err := st.CreateClient(c); err != nil {
 		t.Fatalf("recreate C: %v", err)
 	}
 	if err := p.reload(st, serverIP); err != nil {
 		t.Fatalf("reload after update: %v", err)
 	}
+	checkInternet(cIP, true)
 	if !p.clientCanReach(cIP, bIP) {
 		t.Errorf("after reload C -> B: want true, got false")
 	}

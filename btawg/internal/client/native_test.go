@@ -22,7 +22,6 @@ func TestNativeAWGNetstack(t *testing.T) {
 		ServerIP:      "10.77.0.1",
 		Transport:     config.ModeAWG,
 		SocksPort:     0,
-		EgressPort:    1080,
 		AWGEndpoint:   "127.0.0.1:51821",
 		Profile:       config.DefaultProfile(),
 	}
@@ -79,7 +78,6 @@ func TestNativeWGNetstack(t *testing.T) {
 		ServerIP:      "10.77.0.1",
 		Transport:     config.ModeWG,
 		SocksPort:     0,
-		EgressPort:    1080,
 		WGEndpoint:    "127.0.0.1:51820",
 	}
 

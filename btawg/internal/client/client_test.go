@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"net/netip"
 	"testing"
 	"time"
 
@@ -62,10 +61,7 @@ func tcpEcho(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// TestClientFullFlow runs the product path end to end: the hub announces in
-// a DHT relay, the client discovers it strictly via DHT, builds the
-// BitTorrent carrier with AWG inside, and an app's SOCKS5 CONNECT reaches an
-// echo through the chained egress.
+// TestClientFullFlow covers DHT discovery and rejection of local destinations.
 func TestClientFullFlow(t *testing.T) {
 	relay := newRelay(t)
 
@@ -121,7 +117,6 @@ func TestClientFullFlow(t *testing.T) {
 		ServerIP:      "10.77.0.1",
 		Transport:     "ext-utp",
 		SocksPort:     0,
-		EgressPort:    1080,
 		Profile:       config.DefaultProfile(),
 		DHTBootstrap:  []string{relay},
 	}
@@ -151,24 +146,16 @@ func TestClientFullFlow(t *testing.T) {
 		t.Fatal("client SOCKS5 never came up")
 	}
 
-	// The request reaches the connected hub, which must refuse its own loopback.
-	echo := tcpEcho(t)
-	app := socks.NewClient(socksAddr)
 	deadline = time.Now().Add(12 * time.Second)
-	for time.Now().Before(deadline) {
-		probe, stop := context.WithTimeout(ctx, time.Second)
-		c0, e := c.OverlayDialTCP(probe, netip.MustParseAddrPort("10.77.0.1:1080"))
-		stop()
-		if e != nil {
-			continue
-		}
-		c0.Close()
-		conn, e := app.Dial(ctx, "tcp", echo)
-		if e == nil {
-			conn.Close()
-			t.Fatal("proxy reached hub loopback")
-		}
-		return
+	for len(srv.ConnectedCount()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(30 * time.Millisecond)
 	}
-	t.Fatal("client never reached the hub")
+	if len(srv.ConnectedCount()) == 0 {
+		t.Fatal("client never reached the hub")
+	}
+	conn, err := socks.NewClient(socksAddr).Dial(ctx, "tcp", tcpEcho(t))
+	if err == nil {
+		conn.Close()
+		t.Fatal("proxy reached local loopback")
+	}
 }

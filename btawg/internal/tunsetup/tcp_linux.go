@@ -26,3 +26,16 @@ func OverlayTCP(_, _ string, conn syscall.RawConn) error {
 	}
 	return nil
 }
+
+// BindDevice restricts a socket to the named tunnel interface.
+func BindDevice(name string) func(string, string, syscall.RawConn) error {
+	return func(_, _ string, conn syscall.RawConn) error {
+		var bindErr error
+		if err := conn.Control(func(fd uintptr) {
+			bindErr = unix.BindToDevice(int(fd), name)
+		}); err != nil {
+			return err
+		}
+		return bindErr
+	}
+}

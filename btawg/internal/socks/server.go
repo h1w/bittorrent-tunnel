@@ -1,8 +1,5 @@
-// Package socks implements the two SOCKS5 roles btawg needs: a no-auth
-// server (RFC 1928, CONNECT + UDP ASSOCIATE) and a chaining client that
-// forwards both commands to a remote SOCKS5 server. The client's local server
-// chains to the server's egress over the overlay; the egress server dials the
-// real internet. UDP datagrams are never coalesced and FRAG != 0 is rejected.
+// Package socks implements the client-side SOCKS5 proxy (CONNECT and UDP
+// ASSOCIATE) and helpers for applications speaking to it.
 package socks
 
 import (
@@ -11,8 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strconv"
-	"sync"
 	"sync/atomic"
 )
 
@@ -25,49 +22,27 @@ type DialUDPFunc func(ctx context.Context) (net.PacketConn, error)
 
 // Server is a no-auth SOCKS5 server.
 type Server struct {
-	dial     DialFunc
-	dialUDP  DialUDPFunc
-	relayUDP func(local, remote net.Addr) (net.PacketConn, error)
+	dial       DialFunc
+	dialUDP    DialUDPFunc
+	resolveUDP func(context.Context, netip.Addr, string) (netip.Addr, error)
 }
 
-// NewServer builds a server whose egress is the given dialers. The
-// app-facing UDP relay defaults to a kernel socket on the listener's host;
-// WithRelayUDP replaces it (btawg's netstack egress binds the relay inside
-// the overlay stack).
+// NewServer builds a local SOCKS5 server with the given upstream dialers.
 func NewServer(dial DialFunc, dialUDP DialUDPFunc) *Server {
-	return &Server{
-		dial:     dial,
-		dialUDP:  dialUDP,
-		relayUDP: func(local, remote net.Addr) (net.PacketConn, error) { return listenUDPFor(local) },
-	}
+	return &Server{dial: dial, dialUDP: dialUDP}
 }
 
-// WithRelayUDP replaces the app-facing UDP relay socket factory. The factory
-// receives both the TCP listener's local address and the control connection's
-// remote address so per-association source filtering can be applied.
-func (s *Server) WithRelayUDP(fn func(local, remote net.Addr) (net.PacketConn, error)) *Server {
-	if fn != nil {
-		s.relayUDP = fn
-	}
+// WithUDPResolver handles both IP literals and domain targets for UDP.
+func (s *Server) WithUDPResolver(resolve func(context.Context, netip.Addr, string) (netip.Addr, error)) *Server {
+	s.resolveUDP = resolve
 	return s
-}
-
-// ListenAndServe accepts SOCKS5 connections on addr until ctx is done.
-func (s *Server) ListenAndServe(ctx context.Context, addr string) error {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("socks listen: %w", err)
-	}
-	return s.Serve(ctx, ln)
 }
 
 // Serve accepts SOCKS5 connections on ln until ctx is done.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	defer ln.Close()
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stop()
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -82,6 +57,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 
 func (s *Server) handle(ctx context.Context, c net.Conn) {
 	defer c.Close()
+	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
+	defer stop()
 	if !serveGreeting(c) {
 		return
 	}
@@ -138,7 +115,16 @@ func boundLoopbackBuffers(c net.Conn) {
 }
 
 func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ target) {
-	relay, err := s.relayUDP(c.LocalAddr(), c.RemoteAddr())
+	if s.dialUDP == nil {
+		writeReply(c, replyCommandUnsupported)
+		return
+	}
+	peer, ok := c.RemoteAddr().(*net.TCPAddr)
+	if !ok {
+		writeReply(c, replyGeneralFailure)
+		return
+	}
+	relay, err := listenUDPFor(c.LocalAddr())
 	if err != nil {
 		writeReply(c, replyGeneralFailure)
 		return
@@ -153,29 +139,30 @@ func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ target) {
 	if err := writeUDPReply(c, relay.LocalAddr()); err != nil {
 		return
 	}
-	s.pumpUDP(relay, upstream, c)
+	s.pumpUDP(ctx, relay, upstream, c, peer.AddrPort().Addr().Unmap())
 }
 
-// pumpUDP bridges the app-facing relay (SOCKS5-UDP framed) and the upstream
-// (raw datagrams) until the TCP control connection closes. Both sides use
-// the net.PacketConn interface so kernel and netstack sockets work alike.
-func (s *Server) pumpUDP(relay net.PacketConn, upstream net.PacketConn, ctrl net.Conn) {
-	var appAddr atomic.Value // net.Addr of the app's relay socket
-	closed := make(chan struct{})
-	var once sync.Once
-	shutdown := func() { once.Do(func() { close(closed) }) }
+func (s *Server) pumpUDP(ctx context.Context, relay *net.UDPConn, upstream net.PacketConn, ctrl net.Conn, peer netip.Addr) {
+	type association struct{ addr netip.AddrPort }
+	var appAddr atomic.Pointer[association]
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(ctx, func() {
+		_ = ctrl.Close()
+		_ = relay.Close()
+		_ = upstream.Close()
+	})
+	defer stop()
+	defer cancel()
 	go func() {
-		io.Copy(io.Discard, ctrl) // control conn closed by the client
-		shutdown()
-		relay.Close()
-		upstream.Close()
+		_, _ = io.Copy(io.Discard, ctrl)
+		cancel()
 	}()
 	go func() {
+		defer cancel()
 		buf := make([]byte, 65536)
 		for {
 			n, src, err := upstream.ReadFrom(buf)
 			if err != nil {
-				shutdown()
 				return
 			}
 			app := appAddr.Load()
@@ -183,30 +170,40 @@ func (s *Server) pumpUDP(relay net.PacketConn, upstream net.PacketConn, ctrl net
 				continue
 			}
 			m := append(buildUDPHeader(src), buf[:n]...)
-			if _, err := relay.WriteTo(m, app.(net.Addr)); err != nil {
-				shutdown()
+			if _, err := relay.WriteToUDPAddrPort(m, app.addr); err != nil {
 				return
 			}
 		}
 	}()
 	buf := make([]byte, 65536)
 	for {
-		n, app, err := relay.ReadFrom(buf)
+		n, app, err := relay.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			shutdown()
 			return
+		}
+		app = netip.AddrPortFrom(app.Addr().Unmap(), app.Port())
+		if app.Addr() != peer {
+			continue
+		}
+		if last := appAddr.Load(); last != nil && last.addr != app {
+			continue
+		}
+		dst, data, err := parseUDPTarget(buf[:n])
+		if err != nil || dst.port == 0 {
+			continue
+		}
+		ip := dst.ip
+		if s.resolveUDP != nil {
+			ip, err = s.resolveUDP(ctx, ip, dst.host)
+		}
+		if err != nil || !ip.IsValid() {
+			continue
 		}
 		if appAddr.Load() == nil {
-			appAddr.Store(app)
+			appAddr.Store(&association{app})
 		}
-		dst, data, err := parseUDPHeader(buf[:n])
-		if err != nil {
-			continue // malformed header: drop the datagram
-		}
-		if _, err := upstream.WriteTo(data, dst); err != nil {
-			shutdown()
-			return
-		}
+		// A failed DNS lookup or unreachable destination is per datagram.
+		_, _ = upstream.WriteTo(data, net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, dst.port)))
 	}
 }
 
@@ -374,35 +371,44 @@ func buildUDPHeader(addr net.Addr) []byte {
 	return append(b, p[:]...)
 }
 
-// parseUDPHeader splits a SOCKS5-UDP datagram into destination and payload.
-// Fragmented datagrams (FRAG != 0) are rejected: btawg never fragments.
-func parseUDPHeader(b []byte) (net.Addr, []byte, error) {
-	if len(b) < 4 {
-		return nil, nil, fmt.Errorf("short UDP header")
+type udpTarget struct {
+	ip   netip.Addr
+	host string
+	port uint16
+}
+
+// parseUDPTarget splits the header from the payload. SOCKS fragmentation is
+// not supported; domain targets remain names until the caller resolves them.
+func parseUDPTarget(b []byte) (udpTarget, []byte, error) {
+	if len(b) < 4 || b[0] != 0 || b[1] != 0 || b[2] != 0 {
+		return udpTarget{}, nil, fmt.Errorf("invalid SOCKS UDP header")
 	}
-	if b[2] != 0 {
-		return nil, nil, fmt.Errorf("fragmented UDP datagram rejected")
-	}
-	var ip net.IP
-	switch b[3] {
+	atyp := b[3]
+	b = b[4:]
+	var dst udpTarget
+	switch atyp {
 	case atypIPv4:
-		if len(b) < 10 {
-			return nil, nil, fmt.Errorf("short IPv4 UDP header")
+		if len(b) < 4 {
+			return udpTarget{}, nil, io.ErrUnexpectedEOF
 		}
-		ip = net.IP(append([]byte(nil), b[4:8]...))
-		b = b[8:]
+		dst.ip, b = netip.AddrFrom4([4]byte(b[:4])), b[4:]
 	case atypIPv6:
-		if len(b) < 22 {
-			return nil, nil, fmt.Errorf("short IPv6 UDP header")
+		if len(b) < 16 {
+			return udpTarget{}, nil, io.ErrUnexpectedEOF
 		}
-		ip = net.IP(append([]byte(nil), b[4:20]...))
-		b = b[20:]
+		dst.ip, b = netip.AddrFrom16([16]byte(b[:16])).Unmap(), b[16:]
+	case atypDomain:
+		if len(b) == 0 || b[0] == 0 || len(b) < 1+int(b[0]) {
+			return udpTarget{}, nil, io.ErrUnexpectedEOF
+		}
+		end := 1 + int(b[0])
+		dst.host, b = string(b[1:end]), b[end:]
 	default:
-		return nil, nil, fmt.Errorf("unsupported ATYP %d in UDP header", b[3])
+		return udpTarget{}, nil, fmt.Errorf("unsupported UDP address type %d", atyp)
 	}
 	if len(b) < 2 {
-		return nil, nil, fmt.Errorf("missing UDP port")
+		return udpTarget{}, nil, io.ErrUnexpectedEOF
 	}
-	port := int(binary.BigEndian.Uint16(b[:2]))
-	return &net.UDPAddr{IP: ip, Port: port}, b[2:], nil
+	dst.port = binary.BigEndian.Uint16(b[:2])
+	return dst, b[2:], nil
 }

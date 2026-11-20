@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
@@ -23,7 +24,6 @@ import (
 	"bittorrent-tunnel/btawg/internal/carrier"
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/dht"
-	"bittorrent-tunnel/btawg/internal/socks"
 	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
 
@@ -38,16 +38,16 @@ type Client struct {
 	ns   *netstack.Net // non-nil in netstack mode
 	ip   *tlsTunnel    // non-nil for TLS carrier modes
 
-	chainTCP func(ctx context.Context, addr string) (net.Conn, error)
-	chainUDP func(ctx context.Context) (net.PacketConn, error)
+	proxyTCP   func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
+	proxyUDP   func(ctx context.Context) (net.PacketConn, error)
+	proxyRoute *tunsetup.ProxyRoute
 
 	disc func(ctx context.Context) ([]netip.AddrPort, error)
 
 	socksAddr atomic.Value // string, set once the SOCKS5 listener is up
 }
 
-// New builds the client in userspace netstack mode: the overlay lives inside
-// the process and the SOCKS5 chain dials through it.
+// New builds an unprivileged client whose SOCKS sockets use the overlay netstack.
 func New(cfg config.ClientConfig) (*Client, error) {
 	cfg.Transport = config.CanonicalMode(cfg.Transport)
 	c := &Client{cfg: cfg}
@@ -60,14 +60,10 @@ func New(cfg config.ClientConfig) (*Client, error) {
 	if err := c.start(tunDev); err != nil {
 		return nil, err
 	}
-	c.chainTCP = func(ctx context.Context, addr string) (net.Conn, error) {
-		ap, err := netip.ParseAddrPort(addr)
-		if err != nil {
-			return nil, fmt.Errorf("chain addr: %w", err)
-		}
-		return ns.DialContextTCPAddrPort(ctx, ap)
+	c.proxyTCP = func(ctx context.Context, addr netip.AddrPort) (net.Conn, error) {
+		return ns.DialContextTCPAddrPort(ctx, addr)
 	}
-	c.chainUDP = func(ctx context.Context) (net.PacketConn, error) {
+	c.proxyUDP = func(ctx context.Context) (net.PacketConn, error) {
 		// Bind the client's overlay address: an unspecified-source socket
 		// gets "no route to host" in the netstack on WriteTo.
 		return ns.ListenUDPAddrPort(netip.AddrPortFrom(clientIP, 0))
@@ -85,18 +81,33 @@ func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create tun: %w", err)
 	}
+	route, err := tunsetup.NewProxyRoute(tunName)
+	if err != nil {
+		tunDev.Close()
+		return nil, fmt.Errorf("create SOCKS TUN route: %w", err)
+	}
+	c.proxyRoute = route
 	if err := c.start(tunDev); err != nil {
+		_ = route.Close()
 		return nil, err
 	}
 	clientIP := netip.MustParseAddr(cfg.ClientIP)
-	dialer := net.Dialer{Control: tunsetup.OverlayTCP}
-	c.chainTCP = func(ctx context.Context, addr string) (net.Conn, error) {
-		return dialer.DialContext(ctx, "tcp4", addr)
+	clientAddr := netip.AddrPortFrom(clientIP, 0)
+	dialer := net.Dialer{
+		LocalAddr: net.TCPAddrFromAddrPort(clientAddr),
+		Control: func(network, address string, socket syscall.RawConn) error {
+			if err := route.Control(network, address, socket); err != nil {
+				return err
+			}
+			return tunsetup.OverlayTCP(network, address, socket)
+		},
 	}
-	c.chainUDP = func(ctx context.Context) (net.PacketConn, error) {
-		// Bind the overlay source address so the kernel selects the TUN
-		// interface for traffic to the hub's SOCKS5 UDP relay.
-		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP(clientIP.AsSlice())})
+	c.proxyTCP = func(ctx context.Context, addr netip.AddrPort) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", addr.String())
+	}
+	listen := net.ListenConfig{Control: route.Control}
+	c.proxyUDP = func(ctx context.Context) (net.PacketConn, error) {
+		return listen.ListenPacket(ctx, "udp4", clientAddr.String())
 	}
 	return c, nil
 }
@@ -258,12 +269,7 @@ func (c *Client) Run(ctx context.Context) error {
 		return fmt.Errorf("socks listen: %w", err)
 	}
 	c.socksAddr.Store(ln.Addr().String())
-	serverIP := netip.MustParseAddr(c.cfg.ServerIP)
-	chain := socks.NewClient(netip.AddrPortFrom(serverIP, uint16(c.cfg.EgressPort)).String())
-	chain.WithTransport(c.chainTCP, c.chainUDP)
-	local := socks.NewServer(chain.Dial, func(ctx context.Context) (net.PacketConn, error) {
-		return chain.DialUDP(ctx)
-	})
+	local := c.localProxy()
 	go local.Serve(ctx, ln)
 
 	if config.IsNativeMode(c.cfg.Transport) {
@@ -271,7 +277,7 @@ func (c *Client) Run(ctx context.Context) error {
 		return nil
 	}
 
-	serverEp := carrierbind.Endpoint(serverIP)
+	serverEp := carrierbind.Endpoint(netip.MustParseAddr(c.cfg.ServerIP))
 	hash, _ := c.carrierInfoHash()
 	for {
 		// DHT announces may not have landed yet when we look: retry the
@@ -430,6 +436,9 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 
 // Close tears the client down.
 func (c *Client) Close() {
+	if c.proxyRoute != nil {
+		_ = c.proxyRoute.Close()
+	}
 	if c.ip != nil {
 		c.ip.close()
 		return

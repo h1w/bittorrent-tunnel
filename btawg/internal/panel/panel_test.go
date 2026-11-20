@@ -156,7 +156,7 @@ func TestServerConfigFormRoundTrip(t *testing.T) {
 		"h1": {"101"}, "h2": {"102"}, "h3": {"103"}, "h4": {"104"},
 		"transport":    {"ext-tcp"},
 		"carrier_port": {"17777"}, "awg_port": {"51821"}, "wg_port": {"51820"},
-		"socks_port": {"1080"}, "panel_port": {"8080"},
+		"panel_port":  {"8080"},
 		"external_ip": {"203.0.113.7"},
 	}
 	resp, err := c.PostForm(srv.URL+"/server", form)
@@ -255,15 +255,8 @@ func parseImportForTest(t *testing.T, st *store.Store, raw string) (any, error) 
 	if len(clients) != 1 {
 		t.Fatalf("store has %d clients, want 1", len(clients))
 	}
-	hub, err := st.LoadServerConfig()
-	if err != nil {
-		return nil, err
-	}
 	if cfg.ClientIP != clients[0].IP {
 		t.Fatalf("import IP %q != store IP %q", cfg.ClientIP, clients[0].IP)
-	}
-	if cfg.EgressPort != hub.SocksPort {
-		t.Fatalf("import EgressPort = %d, want hub socks port %d", cfg.EgressPort, hub.SocksPort)
 	}
 	if cfg.InfoHash != fakeInfoHash || cfg.ServerPubKey != fakePubKey {
 		t.Fatal("import does not carry the hub identity")

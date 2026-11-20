@@ -116,7 +116,6 @@ func clientConfigFor(srv *server.Server, rec *store.ClientRecord, relay, ip stri
 		ServerIP:      "10.77.0.1",
 		Transport:     srv.Config().Transport,
 		SocksPort:     0,
-		EgressPort:    1080,
 		Profile:       config.DefaultProfile(),
 		DHTBootstrap:  []string{relay},
 	}
@@ -203,6 +202,13 @@ func testEndToEndSocksAndLan(t *testing.T, mode string) {
 	for _, ip := range []string{"10.77.0.2", "10.77.0.3"} {
 		waitConnected(t, srv, ip)
 	}
+	// The hub must route IP traffic, not expose a second SOCKS proxy.
+	probeCtx, stopProbe := context.WithTimeout(ctx, 10*time.Second)
+	_, err = ca.OverlayDialTCP(probeCtx, netip.MustParseAddrPort("10.77.0.1:1080"))
+	stopProbe()
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("legacy hub SOCKS endpoint must refuse connections, got %v", err)
+	}
 	for _, addr := range []string{tcpEcho(t), "localhost:1"} {
 		dialCtx, stop := context.WithTimeout(ctx, 10*time.Second)
 		conn, e := socks.NewClient(socksA).Dial(dialCtx, "tcp", addr)
@@ -284,10 +290,31 @@ func testEndToEndSocksAndLan(t *testing.T, mode string) {
 	}
 }
 
-// TestRuntimeRegistration proves that a client registered after server.New
-// (the panel create path) is immediately usable: its chained internet egress
-// works and it can reach permitted overlay peers without any restart or
-// explicit policy reload.
+// primeGatewayPath gives the hub an authenticated packet to learn the return
+// path, even for engines that have not yet exchanged application traffic.
+func primeGatewayPath(t *testing.T, hub *server.Server, c *client.Client) {
+	t.Helper()
+	listen, err := hub.OverlayNet().ListenTCPAddrPort(netip.MustParseAddrPort("10.77.0.1:0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listen.Close()
+	addr := listen.Addr().(*net.TCPAddr).AddrPort()
+	until := time.Now().Add(18 * time.Second)
+	for time.Now().Before(until) {
+		ctx, cancel := context.WithTimeout(context.Background(), 450*time.Millisecond)
+		conn, err := c.OverlayDialTCP(ctx, addr)
+		cancel()
+		if err == nil {
+			conn.Close()
+			return
+		}
+	}
+	t.Fatalf("client could not reach gateway %s", addr)
+}
+
+// TestRuntimeRegistration proves a newly enrolled client can reach overlay
+// peers immediately, without restarting the hub.
 func TestRuntimeRegistration(t *testing.T) {
 	relay := newRelay(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -339,11 +366,7 @@ func TestRuntimeRegistration(t *testing.T) {
 
 	// B can reach A over the overlay (mutual visibility by default).
 	// A needs one authenticated data packet to activate its return path.
-	ready, err := ca.OverlayDialTCP(ctx, netip.MustParseAddrPort("10.77.0.1:1080"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ready.Close()
+	primeGatewayPath(t, srv, ca)
 	lanALn, err := ca.OverlayListenTCP(9004)
 	if err != nil {
 		t.Fatalf("A lan listen: %v", err)
@@ -413,10 +436,7 @@ func TestPolicyIsolationLive(t *testing.T) {
 	t.Cleanup(cc.Close)
 	go cc.Run(ctx)
 
-	socksB := waitSocksAddr(t, cb)
 	_ = waitSocksAddr(t, cc)
-
-	echoAddr := tcpEcho(t)
 
 	// --- A can reach B over the overlay (mutual visibility by default).
 	lanBLn, err := cb.OverlayListenTCP(9002)
@@ -470,38 +490,6 @@ func TestPolicyIsolationLive(t *testing.T) {
 	}
 	if elapsed > 6*time.Second {
 		t.Fatalf("A dial C took %v, expected bounded ~5s timeout", elapsed)
-	}
-
-	// --- B's chained internet egress is closed by the egress gate.
-	appB := socks.NewClient(socksB)
-	failStart := time.Now()
-	dialCtx, dialCancel = context.WithTimeout(ctx, 5*time.Second)
-	_, err = appB.Dial(dialCtx, "tcp", echoAddr)
-	dialCancel()
-	failElapsed := time.Since(failStart)
-	if err == nil {
-		t.Fatal("B chained egress succeeded, want failure")
-	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("B chained egress timed out, want fast close: %v", err)
-	}
-	if failElapsed > 4*time.Second {
-		t.Fatalf("B chained egress took %v, want fast close", failElapsed)
-	}
-
-	// --- B can still send packets to the hub itself (dst == serverIP passes
-	// the filter). The TCP connect succeeds, but the egress gate closes it.
-	serverEgress := netip.AddrPortFrom(netip.MustParseAddr(srv.Config().ServerIP), uint16(srv.Config().SocksPort))
-	dialCtx, dialCancel = context.WithTimeout(ctx, 20*time.Second)
-	hubConn, err := cb.OverlayDialTCP(dialCtx, serverEgress)
-	dialCancel()
-	if err != nil {
-		t.Fatalf("B dial hub egress: %v", err)
-	}
-	defer hubConn.Close()
-	hubConn.SetReadDeadline(time.Now().Add(20 * time.Second))
-	if _, err := hubConn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
-		t.Fatalf("B hub read = %v, want io.EOF", err)
 	}
 
 	// --- Live flip: make C visible to everyone, reload policy, and verify

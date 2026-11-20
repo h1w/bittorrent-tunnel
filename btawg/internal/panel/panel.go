@@ -264,13 +264,11 @@ func (p *Panel) serverSubmit(w http.ResponseWriter, r *http.Request) {
 	cfg.CarrierPort = get("carrier_port")
 	cfg.AWGPort = get("awg_port")
 	cfg.WGPort = get("wg_port")
-	cfg.SocksPort = get("socks_port")
 	cfg.PanelPort = get("panel_port")
 	cfg.ExternalIP = strings.TrimSpace(r.PostFormValue("external_ip"))
 	if cfg.CarrierPort <= 0 || cfg.CarrierPort > 65535 ||
 		cfg.AWGPort <= 0 || cfg.AWGPort > 65535 ||
 		cfg.WGPort <= 0 || cfg.WGPort > 65535 ||
-		cfg.SocksPort <= 0 || cfg.SocksPort > 65535 ||
 		cfg.PanelPort <= 0 || cfg.PanelPort > 65535 {
 		http.Error(w, "bad port", http.StatusBadRequest)
 		return
@@ -501,7 +499,6 @@ func (p *Panel) buildClientConfig(rec store.ClientRecord, cfg config.ServerConfi
 		ServerIP:      group.ServerIP,
 		Transport:     preferred,
 		SocksPort:     1080,
-		EgressPort:    cfg.SocksPort,
 		Profile:       cfg.AWGProfile,
 		CarrierHashes: hashes,
 		Routes:        routes,

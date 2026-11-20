@@ -1,7 +1,5 @@
-// btawg-server runs the btawg hub: AmneziaWG inside a BitTorrent carrier,
-// an egress SOCKS5 reachable only inside the overlay, and a DHT announcer
-// publishing the carrier address. The web panel (3x-ui style) is served on
-// loopback by the panel package.
+// btawg-server runs the routed VPN hub, BitTorrent discovery, and the
+// loopback-only management panel.
 package main
 
 import (
@@ -29,7 +27,7 @@ func main() {
 	carrierPort := flag.Int("carrier-port", 0, "override carrier listen port")
 	externalIP := flag.String("external-ip", "", "public IPv4 for native imports (default: outbound interface address)")
 	dhtBootstrap := flag.String("dht-bootstrap", "", "override DHT bootstrap nodes, comma-separated host:port (default: public)")
-	noTun := flag.Bool("no-tun", false, "userspace netstack mode: no OS interface is created")
+	noTun := flag.Bool("no-tun", false, "userspace overlay only: no OS interface or Internet forwarding")
 	tunName := flag.String("tun", "btawg0", "TUN interface name in real-TUN mode")
 	flag.Parse()
 	st, err := store.Open(*storePath)
@@ -122,8 +120,8 @@ func main() {
 	go func() { errCh <- srv.Announce(ctx) }()
 
 	active := srv.Config()
-	fmt.Printf("btawg-server: modes=%s carrier=:%d awg=:%d/udp wg=:%d/udp socks=%d infohash=%s\n",
-		strings.Join(config.ClientModes(), ","), active.CarrierPort, active.AWGPort, active.WGPort, active.SocksPort, srv.InfoHash())
+	fmt.Printf("btawg-server: modes=%s carrier=:%d awg=:%d/udp wg=:%d/udp infohash=%s\n",
+		strings.Join(config.ClientModes(), ","), active.CarrierPort, active.AWGPort, active.WGPort, srv.InfoHash())
 	fmt.Println("btawg-server: optional DHT discovery announce loop started")
 
 	select {

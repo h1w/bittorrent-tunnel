@@ -2,15 +2,12 @@ package server
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -22,7 +19,6 @@ import (
 	"bittorrent-tunnel/btawg/internal/bind"
 	"bittorrent-tunnel/btawg/internal/carrier"
 	"bittorrent-tunnel/btawg/internal/config"
-	"bittorrent-tunnel/btawg/internal/socks"
 	"bittorrent-tunnel/btawg/internal/store"
 )
 
@@ -113,7 +109,6 @@ func TestServerClientEcho(t *testing.T) {
 		ServerIP:      "10.77.0.1",
 		Transport:     "ext-utp",
 		SocksPort:     1080,
-		EgressPort:    1080,
 		Profile:       config.DefaultProfile(),
 	}
 	if err := cd.IpcSet(awg.ClientConf(ccfg)); err != nil {
@@ -278,8 +273,9 @@ func TestRegisterClientUpdatesSnapshot(t *testing.T) {
 	if !srv.policy.clientCanReach(bIP, aIP) {
 		t.Errorf("B -> A after register: want true, got false")
 	}
-	if !srv.policy.internetFor(bIP) {
-		t.Errorf("internetFor(B): want true, got false")
+	public := netip.MustParseAddr("1.1.1.1")
+	if !srv.policy.upload(bIP, public, true, 40, time.Now()) {
+		t.Errorf("new client B cannot send routed Internet traffic")
 	}
 
 	if err := st.RevokeClient(b.ID); err != nil {
@@ -291,87 +287,8 @@ func TestRegisterClientUpdatesSnapshot(t *testing.T) {
 	if srv.policy.clientCanReach(aIP, bIP) {
 		t.Errorf("A -> B after revoke: want false, got true")
 	}
-	if srv.policy.internetFor(bIP) {
-		t.Errorf("internetFor(B) after revoke: want false, got true")
-	}
-}
-
-// stubResolver is a hostResolver that returns a fixed set of IPs.
-type stubResolver struct {
-	ips []net.IP
-	err error
-}
-
-func (s stubResolver) LookupIP(ctx context.Context, network, host string) ([]net.IP, error) {
-	return s.ips, s.err
-}
-
-// TestEgressDialRejectsOverlay proves the real-TUN-shaped egress TCP dialer
-// refuses to proxy connections back into the overlay subnet for both literal
-// IPs and hostnames that resolve to overlay IPs.
-func TestEgressDialRejectsOverlay(t *testing.T) {
-	prefix := netip.MustParsePrefix("10.77.0.0/24")
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer ln.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Literal overlay IP.
-	dial := newEgressDialer(prefix, stubResolver{})
-	if _, err := dial(ctx, "tcp", "10.77.0.2:1234"); err == nil {
-		t.Fatal("dial to overlay IP succeeded, want refusal")
-	}
-
-	// Hostname that resolves to an overlay IP.
-	dial = newEgressDialer(prefix, stubResolver{ips: []net.IP{net.ParseIP("10.77.0.2")}})
-	if _, err := dial(ctx, "tcp", "host.example:1234"); err == nil {
-		t.Fatal("dial to hostname resolving to overlay IP succeeded, want refusal")
-	}
-
-	// Non-overlay destination still works (stub resolves to the listener IP).
-	_, port, _ := net.SplitHostPort(ln.Addr().String())
-	dial = newEgressDialer(prefix, stubResolver{ips: []net.IP{net.ParseIP("127.0.0.1")}})
-	conn, err := dial(ctx, "tcp", net.JoinHostPort("ok.example", port))
-	if err != nil {
-		t.Fatalf("dial to non-overlay host: %v", err)
-	}
-	conn.Close()
-}
-
-// TestEgressUDPRejectsOverlay proves the egress UDP upstream refuses to send
-// datagrams back into the overlay subnet.
-func TestEgressUDPRejectsOverlay(t *testing.T) {
-	prefix := netip.MustParsePrefix("10.77.0.0/24")
-	pc, err := newEgressUDP(prefix)
-	if err != nil {
-		t.Fatalf("newEgressUDP: %v", err)
-	}
-	defer pc.Close()
-
-	overlayDst, err := net.ResolveUDPAddr("udp", "10.77.0.3:53")
-	if err != nil {
-		t.Fatalf("resolve overlay: %v", err)
-	}
-	n, err := pc.WriteTo([]byte("x"), overlayDst)
-	if err == nil {
-		t.Fatalf("WriteTo overlay IP succeeded, want refusal")
-	}
-	if n != 0 {
-		t.Fatalf("WriteTo overlay IP wrote %d bytes, want 0", n)
-	}
-
-	// Non-overlay destinations are still accepted by the wrapper.
-	localDst, err := net.ResolveUDPAddr("udp", "127.0.0.1:53")
-	if err != nil {
-		t.Fatalf("resolve local: %v", err)
-	}
-	if _, err := pc.WriteTo([]byte("x"), localDst); err != nil {
-		t.Fatalf("WriteTo localhost: %v", err)
+	if srv.policy.upload(bIP, public, true, 40, time.Now()) {
+		t.Errorf("revoked client B can still send routed Internet traffic")
 	}
 }
 
@@ -432,178 +349,4 @@ func TestNewRealTUNLive(t *testing.T) {
 	if !strings.Contains(string(out), cfg.ServerIP+"/24") {
 		t.Fatalf("tun %s missing %q, has:\n%s", tunName, cfg.ServerIP+"/24", out)
 	}
-}
-
-// recordedWrite is one upstream UDP write captured by recordingPacketConn.
-type recordedWrite struct {
-	data []byte
-	to   net.Addr
-}
-
-// recordingPacketConn is a fake net.PacketConn that records WriteTo calls and
-// blocks on ReadFrom until closed.
-type recordingPacketConn struct {
-	mu     sync.Mutex
-	writes chan recordedWrite
-	closed chan struct{}
-	local  net.Addr
-}
-
-func newRecordingPacketConn() *recordingPacketConn {
-	return &recordingPacketConn{
-		writes: make(chan recordedWrite, 16),
-		closed: make(chan struct{}),
-		local:  &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9999},
-	}
-}
-
-func (r *recordingPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	<-r.closed
-	return 0, nil, net.ErrClosed
-}
-
-func (r *recordingPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	select {
-	case <-r.closed:
-		return 0, net.ErrClosed
-	default:
-	}
-	buf := make([]byte, len(p))
-	copy(buf, p)
-	r.writes <- recordedWrite{data: buf, to: addr}
-	return len(p), nil
-}
-
-func (r *recordingPacketConn) Close() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	select {
-	case <-r.closed:
-	default:
-		close(r.closed)
-	}
-	return nil
-}
-
-func (r *recordingPacketConn) LocalAddr() net.Addr                { return r.local }
-func (r *recordingPacketConn) SetDeadline(t time.Time) error      { return nil }
-func (r *recordingPacketConn) SetReadDeadline(t time.Time) error  { return nil }
-func (r *recordingPacketConn) SetWriteDeadline(t time.Time) error { return nil }
-
-// buildSOCKSUDPHeader builds a minimal SOCKS5 UDP header for an IPv4 destination.
-func buildSOCKSUDPHeader(dst *net.UDPAddr) []byte {
-	b := []byte{0, 0, 0, 1}
-	b = append(b, dst.IP.To4()...)
-	var p [2]byte
-	binary.BigEndian.PutUint16(p[:], uint16(dst.Port))
-	return append(b, p[:]...)
-}
-
-// TestUDPRelaySourceLock proves that a SOCKS5 UDP ASSOCIATE relay created by
-// the hub only forwards datagrams from the overlay IP that owns the control
-// connection. A second source (simulating a NoInternet client spraying the
-// relay port) is dropped with no upstream write and no reply.
-func TestUDPRelaySourceLock(t *testing.T) {
-	allowed := netip.MustParseAddr("127.0.0.1")
-
-	upstream := newRecordingPacketConn()
-	srv := socks.NewServer(
-		func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return nil, fmt.Errorf("no TCP egress in this test")
-		},
-		func(ctx context.Context) (net.PacketConn, error) { return upstream, nil },
-	).WithRelayUDP(func(local, remote net.Addr) (net.PacketConn, error) {
-		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-		if err != nil {
-			return nil, err
-		}
-		return &sourceLockedRelay{PacketConn: pc, allow: allowed}, nil
-	})
-
-	c1, c2 := net.Pipe()
-	ln := newFakeListener(1)
-	ln.conns <- &connWithAddr{
-		Conn:   c2,
-		remote: net.TCPAddrFromAddrPort(netip.AddrPortFrom(allowed, 12345)),
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go srv.Serve(ctx, ln)
-
-	// SOCKS5 greeting (no-auth).
-	if _, err := c1.Write([]byte{0x05, 0x01, 0x00}); err != nil {
-		t.Fatalf("greeting write: %v", err)
-	}
-	var gr [2]byte
-	if _, err := io.ReadFull(c1, gr[:]); err != nil {
-		t.Fatalf("greeting read: %v", err)
-	}
-	if gr[0] != 0x05 || gr[1] != 0x00 {
-		t.Fatalf("greeting rejected: %v", gr)
-	}
-
-	// UDP ASSOCIATE request.
-	if _, err := c1.Write([]byte{0x05, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); err != nil {
-		t.Fatalf("associate write: %v", err)
-	}
-	var head [4]byte
-	if _, err := io.ReadFull(c1, head[:]); err != nil {
-		t.Fatalf("associate reply head: %v", err)
-	}
-	if head[0] != 0x05 || head[1] != 0x00 || head[3] != 0x01 {
-		t.Fatalf("associate rejected: %v", head)
-	}
-	body := make([]byte, 6)
-	if _, err := io.ReadFull(c1, body[:]); err != nil {
-		t.Fatalf("associate reply body: %v", err)
-	}
-	relayAddr := &net.UDPAddr{
-		IP:   net.IPv4(body[0], body[1], body[2], body[3]),
-		Port: int(binary.BigEndian.Uint16(body[4:6])),
-	}
-
-	dst := &net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 53}
-
-	// Allowed source: same IP as the control connection.
-	allowedSock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
-	if err != nil {
-		t.Fatalf("allowed socket: %v", err)
-	}
-	defer allowedSock.Close()
-	frame := append(buildSOCKSUDPHeader(dst), []byte("allowed")...)
-	if _, err := allowedSock.WriteTo(frame, relayAddr); err != nil {
-		t.Fatalf("allowed write: %v", err)
-	}
-	select {
-	case w := <-upstream.writes:
-		if string(w.data) != "allowed" {
-			t.Fatalf("upstream data = %q, want allowed", string(w.data))
-		}
-		if w.to.String() != dst.String() {
-			t.Fatalf("upstream destination = %v, want %v", w.to, dst)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("allowed packet was not forwarded upstream")
-	}
-
-	// Disallowed source: another overlay IP spraying the relay port.
-	disallowedSock, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.2")})
-	if err != nil {
-		t.Fatalf("disallowed socket: %v", err)
-	}
-	defer disallowedSock.Close()
-	frame2 := append(buildSOCKSUDPHeader(dst), []byte("disallowed")...)
-	if _, err := disallowedSock.WriteTo(frame2, relayAddr); err != nil {
-		t.Fatalf("disallowed write: %v", err)
-	}
-	select {
-	case w := <-upstream.writes:
-		t.Fatalf("disallowed packet was forwarded upstream: %q", string(w.data))
-	case <-time.After(300 * time.Millisecond):
-	}
-
-	// Closing the control connection tears the relay down.
-	c1.Close()
 }
