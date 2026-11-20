@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strings"
@@ -20,7 +21,7 @@ func main() {
 	cmd := os.Args[1]
 	// Legacy foreground invocation with flags (e.g. -store, -no-tun) still works.
 	if strings.HasPrefix(cmd, "-") {
-		if err := runCmd(os.Args[1:]); err != nil {
+		if err := runCmd(context.Background(), os.Args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "btawg-server: %v\n", err)
 			os.Exit(1)
 		}
@@ -34,7 +35,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "run":
-		if err := runCmd(os.Args[2:]); err != nil {
+		if err := runCmd(context.Background(), os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "btawg-server: %v\n", err)
 			os.Exit(1)
 		}

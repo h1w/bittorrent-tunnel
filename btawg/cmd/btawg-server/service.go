@@ -72,7 +72,7 @@ func installCmd(args []string) error {
 	return nil
 }
 
-func runCmd(args []string) error {
+func runCmd(parent context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	managed := fs.Bool("managed", false, "run as a managed systemd service with fixed ports and durable paths")
 	storePath := fs.String("store", "", "path to the bbolt database (managed default: /var/lib/btawg/server.db)")
@@ -139,7 +139,7 @@ func runCmd(args []string) error {
 		srv.SetDHTBootstrap(strings.Split(*dhtBootstrap, ","))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	cfg, err = st.LoadServerConfig()

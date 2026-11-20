@@ -109,17 +109,26 @@ func TestRunCmdStartsManagedNoTun(t *testing.T) {
 	}
 	st.Close()
 
-	// Run with -managed -no-tun. We can't easily cancel it from the test, so
-	// just verify it starts without panicking and attempts the managed path.
+	// Run with -managed -no-tun. Start it, give it a moment to serve, then
+	// cancel and wait so no daemon goroutine outlives the test (a leaked
+	// daemon races with cleanup under -race).
+	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- runCmd([]string{"-managed", "-no-tun", "-store", db})
+		done <- runCmd(ctx, []string{"-managed", "-no-tun", "-store", db})
 	}()
 
 	select {
 	case err := <-done:
-		t.Logf("runCmd returned: %v", err)
-	case <-time.After(3 * time.Second):
-		t.Log("runCmd still running after 3s; test passes if no panic")
+		t.Logf("runCmd returned during startup: %v", err)
+		return
+	case <-time.After(500 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-done:
+		t.Logf("runCmd stopped on cancel: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("runCmd did not stop on cancel; daemon leaked past the test")
 	}
 }
