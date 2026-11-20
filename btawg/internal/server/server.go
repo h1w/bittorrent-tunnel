@@ -113,9 +113,9 @@ func newServer(cfg config.ServerConfig, st *store.Store, tunName string) (*Serve
 		for i, p := range gateways {
 			addresses[i] = p.Addr()
 		}
-		td, s.ns, err = netstack.CreateNetTUN(addresses, nil, 1420)
+		td, s.ns, err = netstack.CreateNetTUN(addresses, nil, config.DefaultMTU)
 	} else {
-		td, err = tun.CreateTUN(tunName, 1420)
+		td, err = tun.CreateTUN(tunName, config.DefaultMTU)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create tun %q: %w", tunName, err)
@@ -123,7 +123,7 @@ func newServer(cfg config.ServerConfig, st *store.Store, tunName string) (*Serve
 	s.router = newPacketRouter(td, tunName != "", s.policy)
 	if tunName != "" {
 		// Set link state before installing scoped routes and NAT.
-		if err = tunsetup.Setup(tunName, gateways[0], nil, 1420, false); err == nil {
+		if err = tunsetup.Setup(tunName, gateways[0], nil, config.DefaultMTU, false); err == nil {
 			s.kernel, err = tunsetup.NewHub(tunName)
 		}
 		if err == nil {

@@ -77,7 +77,7 @@ func main() {
 			os.Exit(1)
 		}
 		addr := netip.PrefixFrom(netip.MustParseAddr(cfg.ClientIP), subnet.Bits())
-		if serr := tunsetup.Setup(*tunName, addr, &subnet, 1420, false); serr != nil {
+		if serr := tunsetup.Setup(*tunName, addr, &subnet, config.DefaultMTU, false); serr != nil {
 			fmt.Fprintf(os.Stderr, "btawg-client: tun setup (root required): %v\n", serr)
 			os.Exit(1)
 		}

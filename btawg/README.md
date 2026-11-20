@@ -194,6 +194,9 @@ or `./btawg-client -config file.txt`. The client then:
   route. To send selected public prefixes through the VPN, add explicit
   client routes; the hub still decides whether to forward them.
 
+The hub and client use a default tunnel MTU of 1280 bytes, including in
+`-no-tun` mode and in exported standalone VPN configurations.
+
 | AWG inside BitTorrent | TLS 1.3 inside BitTorrent (no AWG) | Outer transport |
 |---|---|---|
 | `socks5-awg-ext-tcp` | `socks5-ext-tcp` | Extended messages over TCP |
@@ -324,9 +327,8 @@ one run below that threshold.
   cover the historical AWG carrier, not the new TLS modes. Active probing is out
   of scope. No claim of universal undetectability.
 - Native AWG adds the profile's `S4` bytes on top of the normal tunnel
-  overhead. With the default profile on a 1500-byte IPv4 path, reduce the
-  native client TUN MTU (e.g. to 1400) if large transfers fail with
-  `message too long`. This does not apply to the BitTorrent modes.
+  overhead. If large transfers fail with `message too long`, check the
+  outer path MTU. This overhead does not apply to the BitTorrent modes.
 - DHT discovery depends on bootstrap reachability; if a network blocks the
   public DHT, point both sides at a private bootstrap island with
   `-dht-bootstrap` (hub) and the import string's `dht_bootstrap` field.

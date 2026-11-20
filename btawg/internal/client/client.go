@@ -52,7 +52,7 @@ func New(cfg config.ClientConfig) (*Client, error) {
 	cfg.Transport = config.CanonicalMode(cfg.Transport)
 	c := &Client{cfg: cfg}
 	clientIP := netip.MustParseAddr(cfg.ClientIP)
-	tunDev, ns, err := netstack.CreateNetTUN([]netip.Addr{clientIP}, nil, 1420)
+	tunDev, ns, err := netstack.CreateNetTUN([]netip.Addr{clientIP}, nil, config.DefaultMTU)
 	if err != nil {
 		return nil, fmt.Errorf("client netstack: %w", err)
 	}
@@ -81,7 +81,7 @@ func New(cfg config.ClientConfig) (*Client, error) {
 func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
 	cfg.Transport = config.CanonicalMode(cfg.Transport)
 	c := &Client{cfg: cfg}
-	tunDev, err := tun.CreateTUN(tunName, 1420)
+	tunDev, err := tun.CreateTUN(tunName, config.DefaultMTU)
 	if err != nil {
 		return nil, fmt.Errorf("create tun: %w", err)
 	}

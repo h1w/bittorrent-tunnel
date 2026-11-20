@@ -20,6 +20,8 @@ import (
 	"bittorrent-tunnel/btawg/internal/carrier"
 )
 
+// MTU is the TLS packet size limit, not the default interface MTU. Keep
+// accepting 1420-byte packets from peers with the previous default.
 const MTU = 1420
 
 const (

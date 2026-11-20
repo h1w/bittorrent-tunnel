@@ -23,6 +23,9 @@ const ImportPrefix = "btawg://"
 // ParseImportString.
 const ClientVersion = 1
 
+// DefaultMTU is the default IP MTU of the hub and client tunnels.
+const DefaultMTU = 1280
+
 // Supported SOCKS5 connection chains. Native modes can also be exported
 // for standalone clients that do not provide SOCKS5.
 const (
@@ -227,7 +230,7 @@ func (c ClientConfig) NativeConfig(mode string) (string, error) {
 	b.WriteString("[Interface]\n")
 	fmt.Fprintf(&b, "PrivateKey = %s\n", privB64)
 	fmt.Fprintf(&b, "Address = %s/%d\n", c.ClientIP, subnet.Bits())
-	fmt.Fprintf(&b, "MTU = 1420\n")
+	fmt.Fprintf(&b, "MTU = %d\n", DefaultMTU)
 	if mode == ModeAWG {
 		p := c.Profile
 		fmt.Fprintf(&b, "Jc = %d\nJmin = %d\nJmax = %d\n", p.JC, p.JMin, p.JMax)
