@@ -107,6 +107,8 @@ func (s *Server) handleConnect(ctx context.Context, c net.Conn, dst target) {
 		return
 	}
 	defer upstream.Close()
+	boundLoopbackBuffers(c)
+	boundLoopbackBuffers(upstream)
 	if err := writeReply(c, replySucceeded); err != nil {
 		return
 	}
@@ -120,6 +122,19 @@ func (s *Server) handleConnect(ctx context.Context, c net.Conn, dst target) {
 		done <- struct{}{}
 	}()
 	<-done
+}
+
+// Loopback has negligible bandwidth-delay product. Large autotuned buffers
+// there compete for the same TCP memory as the actual WAN carrier.
+func boundLoopbackBuffers(c net.Conn) {
+	tcp, ok := c.(*net.TCPConn)
+	if !ok || !tcp.LocalAddr().(*net.TCPAddr).IP.IsLoopback() || !tcp.RemoteAddr().(*net.TCPAddr).IP.IsLoopback() {
+		return
+	}
+	const loopbackBuffer = 192 << 10
+	// These are performance hints; a socket stays usable without them.
+	_ = tcp.SetReadBuffer(loopbackBuffer)
+	_ = tcp.SetWriteBuffer(loopbackBuffer)
 }
 
 func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ target) {

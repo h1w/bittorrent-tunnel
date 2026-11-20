@@ -41,7 +41,7 @@ func (s *stubTransport) sentBufs() [][]byte {
 
 func ep(ip string) endpointID {
 	a := netip.MustParseAddr(ip)
-	return endpointID{netip.AddrPortFrom(a, EndpointPort)}
+	return endpointID{addr: netip.AddrPortFrom(a, EndpointPort)}
 }
 
 func TestAttachSendRoute(t *testing.T) {
@@ -130,5 +130,28 @@ func TestOpenReceiveDelivers(t *testing.T) {
 	}
 	if eps[0].DstToString() != "10.77.0.2:51820" {
 		t.Fatalf("endpoint = %q, want 10.77.0.2:51820", eps[0].DstToString())
+	}
+}
+
+func TestReceiveDrainsQueuedDatagrams(t *testing.T) {
+	b := New()
+	fns, _, err := b.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	e1, e2 := ep("10.77.0.2"), ep("10.77.0.3")
+	b.inbox <- tagged{ep: e1, data: []byte("first")}
+	b.inbox <- tagged{ep: e2, data: []byte("second")}
+	bufs := [][]byte{make([]byte, 16), make([]byte, 16), make([]byte, 16)}
+	sizes := make([]int, 3)
+	endpoints := make([]conn.Endpoint, 3)
+	n, err := fns[0](bufs, sizes, endpoints)
+	if err != nil || n != 2 {
+		t.Fatalf("receive queued datagrams: n=%d, err=%v; want 2", n, err)
+	}
+	if string(bufs[0][:sizes[0]]) != "first" || endpoints[0] != e1 ||
+		string(bufs[1][:sizes[1]]) != "second" || endpoints[1] != e2 {
+		t.Fatal("receive batch reordered or misrouted queued datagrams")
 	}
 }

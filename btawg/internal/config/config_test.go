@@ -15,9 +15,9 @@ func testClientConfig() ClientConfig {
 	return ClientConfig{
 		Version:       1,
 		InfoHash:      testInfoHash,
-		ServerPubKey:  "aabbccddeeff00112233445566778899aabbccdd",
-		ClientPrivKey: "11223344556677889900aabbccddeeff00112233",
-		ClientPubKey:  "44556677889900aabbccddeeff00112233445566",
+		ServerPubKey:  "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+		ClientPrivKey: "11223344556677889900aabbccddeeff0011223344556677889900aabbccdd00",
+		ClientPubKey:  "44556677889900aabbccddeeff0011223344556677889900aabbccddeeff00",
 		ClientIP:      "10.77.0.2",
 		Subnet:        "10.77.0.0/24",
 		ServerIP:      "10.77.0.1",
@@ -99,5 +99,268 @@ func TestParseRejectsBareBase64(t *testing.T) {
 func TestDefaultCarrierPortIsStandardTorrentPort(t *testing.T) {
 	if got := DefaultServerConfig().CarrierPort; got != 6881 {
 		t.Fatalf("default CarrierPort = %d, want canonical torrent port 6881", got)
+	}
+}
+
+func TestDefaultNativePorts(t *testing.T) {
+	def := DefaultServerConfig()
+	if def.AWGPort != 51821 {
+		t.Fatalf("default AWGPort = %d, want 51821", def.AWGPort)
+	}
+	if def.WGPort != 51820 {
+		t.Fatalf("default WGPort = %d, want 51820", def.WGPort)
+	}
+}
+
+func TestServerConfigNormalize(t *testing.T) {
+	c := ServerConfig{}
+	c.Normalize()
+	want := DefaultServerConfig()
+	if c != want {
+		t.Fatalf("Normalize() = %+v, want %+v", c, want)
+	}
+
+	legacy := ServerConfig{CarrierPort: 7777, SocksPort: 9999}
+	legacy.Normalize()
+	if legacy.CarrierPort != 7777 {
+		t.Fatalf("Normalize overwrote explicit CarrierPort")
+	}
+	if legacy.AWGPort != want.AWGPort {
+		t.Fatalf("Normalize did not fill zero AWGPort, got %d", legacy.AWGPort)
+	}
+}
+
+func TestCarrierHashPreservesPreferredMode(t *testing.T) {
+	got, err := CarrierHash(testInfoHash, "ext-utp", "ext-utp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	if got != testInfoHash {
+		t.Fatalf("CarrierHash preferred = %q, want base %q", got, testInfoHash)
+	}
+}
+
+func TestCarrierHashSharesFramingFamily(t *testing.T) {
+	extUTP, err := CarrierHash(testInfoHash, "ext-utp", "ext-utp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	extTCP, err := CarrierHash(testInfoHash, "ext-utp", "ext-tcp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	if extUTP != extTCP || extUTP != testInfoHash {
+		t.Fatalf("ext modes should share base: utp=%q tcp=%q", extUTP, extTCP)
+	}
+
+	reqUTP, err := CarrierHash(testInfoHash, "ext-utp", "req-utp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	reqTCP, err := CarrierHash(testInfoHash, "ext-utp", "req-tcp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	if reqUTP != reqTCP {
+		t.Fatalf("req modes should share hash: utp=%q tcp=%q", reqUTP, reqTCP)
+	}
+	if reqUTP == testInfoHash {
+		t.Fatal("req framing should differ from ext base")
+	}
+
+	// The preferred mode's framing is the one that keeps the base.
+	fromReq, err := CarrierHash(testInfoHash, "req-tcp", "req-utp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	if fromReq != testInfoHash {
+		t.Fatalf("req preferred should keep base, got %q", fromReq)
+	}
+}
+
+func TestCarrierHashRejectsBadBase(t *testing.T) {
+	if _, err := CarrierHash("notahash", "ext-utp", "ext-tcp"); err == nil {
+		t.Fatal("CarrierHash accepted invalid base")
+	}
+	if _, err := CarrierHash(testInfoHash, "ext-utp", ""); err == nil {
+		t.Fatal("CarrierHash accepted empty mode")
+	}
+}
+
+func TestCarrierHashIsDeterministic(t *testing.T) {
+	a, err := CarrierHash(testInfoHash, "ext-utp", "req-tcp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	b, err := CarrierHash(testInfoHash, "ext-utp", "req-tcp")
+	if err != nil {
+		t.Fatalf("CarrierHash: %v", err)
+	}
+	if a != b {
+		t.Fatalf("CarrierHash not deterministic: %q vs %q", a, b)
+	}
+}
+
+func TestNativeConfigRendersQuickINI(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.AWGEndpoint = "203.0.113.7:51821"
+	cfg.WGEndpoint = "203.0.113.7:51820"
+	cfg.Routes = []string{"10.77.0.0/24"}
+
+	awgConf, err := cfg.NativeConfig(ModeAWG)
+	if err != nil {
+		t.Fatalf("NativeConfig(awg): %v", err)
+	}
+	if !strings.Contains(awgConf, "[Interface]") || !strings.Contains(awgConf, "[Peer]") {
+		t.Fatalf("AWG native config missing INI sections: %s", awgConf)
+	}
+	if !strings.Contains(awgConf, "Jc = 4") || !strings.Contains(awgConf, "H1 = 101") {
+		t.Fatalf("AWG native config missing obfuscation profile: %s", awgConf)
+	}
+	if !strings.Contains(awgConf, "Endpoint = 203.0.113.7:51821") {
+		t.Fatalf("AWG native config endpoint wrong: %s", awgConf)
+	}
+	if !strings.Contains(awgConf, "AllowedIPs = 10.77.0.0/24") {
+		t.Fatalf("AWG native config missing AllowedIPs: %s", awgConf)
+	}
+	if strings.Contains(awgConf, "Table = off") {
+		t.Fatal("native export must let wg-quick install its explicit non-default routes")
+	}
+	if strings.Contains(awgConf, "AllowedIPs = 0.0.0.0/0") {
+		t.Fatal("AWG native export must not contain default AllowedIPs")
+	}
+	if !strings.Contains(awgConf, "Address = 10.77.0.2/24") {
+		t.Fatalf("AWG native config missing address: %s", awgConf)
+	}
+
+	wgConf, err := cfg.NativeConfig(ModeWG)
+	if err != nil {
+		t.Fatalf("NativeConfig(wg): %v", err)
+	}
+	if strings.Contains(wgConf, "Jc =") {
+		t.Fatal("WG native config must not contain AWG options")
+	}
+	if !strings.Contains(wgConf, "Endpoint = 203.0.113.7:51820") {
+		t.Fatalf("WG native config endpoint wrong: %s", wgConf)
+	}
+	if !strings.Contains(wgConf, "PrivateKey =") || !strings.Contains(wgConf, "PublicKey =") {
+		t.Fatal("native config missing keys")
+	}
+
+	// Keys are base64 in exports.
+	for _, conf := range []string{awgConf, wgConf} {
+		if strings.Contains(conf, cfg.ClientPrivKey) || strings.Contains(conf, cfg.ServerPubKey) {
+			t.Fatal("native export contained hex keys instead of base64")
+		}
+	}
+}
+
+func TestNativeDeviceConfigRendersIPC(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.AWGEndpoint = "203.0.113.7:51821"
+	cfg.WGEndpoint = "203.0.113.7:51820"
+	cfg.Routes = []string{"10.77.0.0/24"}
+
+	ipc, err := cfg.NativeDeviceConfig(ModeAWG)
+	if err != nil {
+		t.Fatalf("NativeDeviceConfig(awg): %v", err)
+	}
+	if !strings.Contains(ipc, "private_key="+cfg.ClientPrivKey) {
+		t.Fatal("AWG IPC missing hex private key")
+	}
+	if !strings.Contains(ipc, "public_key="+cfg.ServerPubKey) {
+		t.Fatal("AWG IPC missing hex public key")
+	}
+	if !strings.Contains(ipc, "endpoint=203.0.113.7:51821") {
+		t.Fatalf("AWG IPC endpoint wrong: %s", ipc)
+	}
+	if !strings.Contains(ipc, "allowed_ip=0.0.0.0/0") {
+		t.Fatalf("AWG IPC should accept any inner source: %s", ipc)
+	}
+	if !strings.Contains(ipc, "persistent_keepalive_interval=25") {
+		t.Fatalf("AWG IPC missing persistent keepalive: %s", ipc)
+	}
+	if !strings.Contains(ipc, "jc=") {
+		t.Fatal("AWG IPC missing lowercase profile")
+	}
+
+	wgIPC, err := cfg.NativeDeviceConfig(ModeWG)
+	if err != nil {
+		t.Fatalf("NativeDeviceConfig(wg): %v", err)
+	}
+	if strings.Contains(wgIPC, "jc=") {
+		t.Fatal("WG IPC must not contain AWG options")
+	}
+	if !strings.Contains(wgIPC, "allowed_ip=0.0.0.0/0") {
+		t.Fatalf("WG IPC should accept any inner source: %s", wgIPC)
+	}
+}
+
+func TestNativeConfigRejectsDefaultRoute(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.AWGEndpoint = "203.0.113.7:51821"
+	cfg.Routes = []string{"10.77.0.1/0"}
+	if _, err := cfg.NativeConfig(ModeAWG); err == nil {
+		t.Fatal("NativeConfig accepted default route")
+	}
+}
+
+func TestNativeConfigRejectsIPv6Route(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.AWGEndpoint = "203.0.113.7:51821"
+	cfg.Routes = []string{"2001:db8::/32"}
+	if _, err := cfg.NativeConfig(ModeAWG); err == nil {
+		t.Fatal("NativeConfig accepted IPv6 route")
+	}
+}
+
+func TestNativeConfigRejectsBadMode(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.AWGEndpoint = "203.0.113.7:51821"
+	if _, err := cfg.NativeConfig("ext-utp"); err == nil {
+		t.Fatal("NativeConfig accepted carrier mode")
+	}
+}
+
+func TestNativeConfigRejectsMissingEndpoint(t *testing.T) {
+	cfg := testClientConfig()
+	if _, err := cfg.NativeConfig(ModeAWG); err == nil {
+		t.Fatal("NativeConfig(awg) accepted missing AWGEndpoint")
+	}
+	cfg.AWGEndpoint = "not-an-endpoint"
+	if _, err := cfg.NativeConfig(ModeAWG); err == nil {
+		t.Fatal("NativeConfig(awg) accepted invalid endpoint")
+	}
+}
+
+func TestNativeConfigRejectsInvalidRoute(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.AWGEndpoint = "203.0.113.7:51821"
+	cfg.Routes = []string{"not-a-prefix"}
+	if _, err := cfg.NativeConfig(ModeAWG); err == nil {
+		t.Fatal("NativeConfig accepted invalid route")
+	}
+}
+
+func TestImportRoundTripWithNativeFields(t *testing.T) {
+	cfg := testClientConfig()
+	cfg.CarrierHashes = map[string]string{
+		"ext-utp": testInfoHash,
+		"ext-tcp": "fedcba9876543210fedcba9876543210fedcba98",
+	}
+	cfg.AWGEndpoint = "203.0.113.7:51821"
+	cfg.WGEndpoint = "203.0.113.7:51820"
+	cfg.Routes = []string{"10.77.0.0/24", "10.88.0.0/24"}
+
+	s, err := cfg.ImportString()
+	if err != nil {
+		t.Fatalf("ImportString: %v", err)
+	}
+	got, err := ParseImportString(s)
+	if err != nil {
+		t.Fatalf("ParseImportString: %v", err)
+	}
+	if !reflect.DeepEqual(got, cfg) {
+		t.Fatalf("round trip mismatch:\n got %+v\nwant %+v", got, cfg)
 	}
 }

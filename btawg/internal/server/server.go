@@ -9,16 +9,21 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
+	"syscall"
+	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	utp "github.com/anacrolix/go-utp"
-	"github.com/anacrolix/go-utp/purego"
+	"golang.org/x/sys/unix"
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/bind"
@@ -29,10 +34,6 @@ import (
 	"bittorrent-tunnel/btawg/internal/store"
 	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
-
-// The hub sends real-time tunnel traffic too: same µTP send policy as the
-// client, set once before any goroutine exists.
-func init() { purego.MatrixDisableNagle = true }
 
 // serverPeerID is the fixed BitTorrent peer ID this hub presents in every
 // carrier handshake; clients identify the deployment by infohash, not peer ID.
@@ -45,22 +46,32 @@ type Server struct {
 	infoHash [20]byte
 	pubKey   string
 
-	bd  *bind.Bind
-	dev *device.Device
-	ns  *netstack.Net
+	bd      *bind.Hybrid
+	dev, wg *device.Device
+	ns      *netstack.Net
+	router  *packetRouter
+	kernel  *tunsetup.Hub
+	tunName string
 
-	mu       sync.Mutex
-	byPeerID map[string]store.ClientRecord
-	attached map[string]int // client IP -> carrier count
+	mu        sync.Mutex
+	applyMu   sync.Mutex
+	closeOnce sync.Once
+	hashes    map[[20]byte]string
+	peers     map[string]store.ClientRecord
+	sessions  map[string]map[carrier.Transport]struct{}
+	gateways  []netip.Prefix
+	byPeerID  map[string]store.ClientRecord
+	attached  map[string]int // client IP -> carrier count
 
 	policy *policySnapshot
 
-	udpPC    net.PacketConn
-	sock     utp.Socket
-	tcpLn    net.Listener
-	ann      *dht.Announcer
-	egressLn net.Listener
-	closed   chan struct{}
+	udpPC      net.PacketConn
+	sock       utp.Socket
+	tcpLn      net.Listener
+	anns       []*dht.Announcer
+	egressLn   net.Listener
+	egressGate *gatedListener
+	closed     chan struct{}
 }
 
 // New loads (or generates at first boot) the server identity, builds the AWG
@@ -68,109 +79,158 @@ type Server struct {
 // SOCKS5 in userspace netstack mode. Call Run to serve; call Announce to
 // publish via DHT.
 func New(cfg config.ServerConfig, st *store.Store) (*Server, error) {
-	s, serverIP, peerConf, err := prepareServer(cfg, st)
+	return newServer(cfg, st, "")
+}
+
+// NewRealTUN shares one kernel interface across all transports.
+func NewRealTUN(cfg config.ServerConfig, st *store.Store, tunName string) (*Server, error) {
+	return newServer(cfg, st, tunName)
+}
+
+func newServer(cfg config.ServerConfig, st *store.Store, tunName string) (*Server, error) {
+	s, err := prepareServer(cfg, st)
 	if err != nil {
 		return nil, err
 	}
-
-	tunDev, ns, err := netstack.CreateNetTUN([]netip.Addr{serverIP}, nil, 1420)
+	gateways, err := groupGateways(st)
+	s.tunName = tunName
 	if err != nil {
-		return nil, fmt.Errorf("create netstack: %w", err)
+		return nil, err
 	}
-	s.ns = ns
-	fwd := newForwardingTun(tunDev, serverIP)
-	filtered := &filterTun{inner: fwd, policy: s.policy}
-
-	egressLn, err := ns.ListenTCPAddrPort(netip.AddrPortFrom(serverIP, uint16(cfg.SocksPort)))
+	s.gateways = gateways
+	var td tun.Device
+	if tunName == "" {
+		addresses := make([]netip.Addr, len(gateways))
+		for i, p := range gateways {
+			addresses[i] = p.Addr()
+		}
+		td, s.ns, err = netstack.CreateNetTUN(addresses, nil, 1420)
+	} else {
+		td, err = tun.CreateTUN(tunName, 1420)
+	}
 	if err != nil {
-		tunDev.Close()
-		return nil, fmt.Errorf("egress listen: %w", err)
+		return nil, fmt.Errorf("create tun %q: %w", tunName, err)
 	}
-
-	if err := s.finish(filtered, egressLn, peerConf); err != nil {
-		s.closeAll()
+	s.router = newPacketRouter(td, tunName != "", s.policy)
+	if tunName != "" {
+		// Set link state before installing scoped routes and NAT.
+		if err = tunsetup.Setup(tunName, gateways[0], nil, 1420, false); err == nil {
+			s.kernel, err = tunsetup.NewHub(tunName)
+		}
+		if err == nil {
+			err = s.kernel.Apply(gateways)
+		}
+	}
+	if err == nil {
+		err = s.finish()
+	}
+	if err != nil {
+		s.Close()
 		return nil, err
 	}
 	return s, nil
 }
 
-// NewRealTUN loads the server identity and builds the hub on a real kernel
-// TUN interface, like the client in real-TUN mode. The kernel owns the
-// overlay prefix and forwards allowed peer-to-peer traffic via ip_forward;
-// no userspace forwardingTun is used.
-func NewRealTUN(cfg config.ServerConfig, st *store.Store, tunName string) (*Server, error) {
-	s, serverIP, peerConf, err := prepareServer(cfg, st)
+func groupGateways(st *store.Store) ([]netip.Prefix, error) {
+	groups, err := st.ListGroups()
 	if err != nil {
 		return nil, err
 	}
-
-	tunDev, err := tun.CreateTUN(tunName, 1420)
-	if err != nil {
-		return nil, fmt.Errorf("create tun %q: %w", tunName, err)
+	if len(groups) == 0 {
+		return nil, fmt.Errorf("no VPN groups")
 	}
-	filtered := &filterTun{inner: tunDev, policy: s.policy}
-
-	// PrefixFrom keeps the host bits: Addr.Prefix masks the address down to
-	// the network number (10.77.0.0/24), and iproute2 silently assigns that,
-	// leaving the hub address absent — the egress bind then fails with
-	// EADDRNOTAVAIL.
-	addr := netip.PrefixFrom(serverIP, 24)
-	if err := tunsetup.Setup(tunName, addr, nil, 1420, true); err != nil {
-		tunDev.Close()
-		return nil, fmt.Errorf("setup tun: %w", err)
+	out := make([]netip.Prefix, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, netip.PrefixFrom(netip.MustParseAddr(g.ServerIP), netip.MustParsePrefix(g.Subnet).Bits()))
 	}
-
-	egressLn, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP(serverIP.String()), Port: cfg.SocksPort})
-	if err != nil {
-		tunDev.Close()
-		return nil, fmt.Errorf("egress listen: %w", err)
-	}
-
-	if err := s.finish(filtered, egressLn, peerConf); err != nil {
-		s.closeAll()
-		return nil, err
-	}
-	return s, nil
+	return out, nil
 }
 
 // prepareServer loads (or generates) the hub identity, policy snapshot, and
 // peer configuration shared by New and NewRealTUN.
-func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, netip.Addr, string, error) {
+func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
+	stored, err := st.LoadServerConfig()
+	if err != nil {
+		return nil, err
+	}
+	if cfg.LegacyTransport == "" {
+		cfg.LegacyTransport = stored.LegacyTransport
+		if cfg.LegacyTransport == "" {
+			cfg.LegacyTransport = cfg.Transport
+			if stored.InfoHash != "" {
+				cfg.LegacyTransport = stored.Transport
+			}
+		}
+	}
+	cfg.Normalize()
+	for _, p := range []int{cfg.CarrierPort, cfg.AWGPort, cfg.WGPort, cfg.SocksPort} {
+		if p < 1 || p > 65535 {
+			return nil, fmt.Errorf("invalid port %d", p)
+		}
+	}
+	if cfg.WGPort == cfg.AWGPort || cfg.WGPort == cfg.CarrierPort || cfg.AWGPort == cfg.CarrierPort {
+		return nil, fmt.Errorf("carrier, AWG and WG UDP ports must differ")
+	}
+	if cfg.ExternalIP == "" {
+		if c, err := net.Dial("udp4", "1.1.1.1:53"); err == nil {
+			cfg.ExternalIP = c.LocalAddr().(*net.UDPAddr).IP.String()
+			_ = c.Close()
+		}
+	}
+	if cfg.ExternalIP != "" {
+		ip, err := netip.ParseAddr(cfg.ExternalIP)
+		if err != nil || !ip.Is4() || ip.IsUnspecified() {
+			return nil, fmt.Errorf("invalid external IPv4 address %q", cfg.ExternalIP)
+		}
+	}
 	// The argument is the working configuration (main loads it from the
 	// store, applying any CLI overrides). At first boot the deployment
 	// identity is generated, persisted, and reused from then on.
 	if cfg.InfoHash == "" || cfg.ServerPrivKey == "" {
 		var ih [20]byte
 		if _, err := rand.Read(ih[:]); err != nil {
-			return nil, netip.Addr{}, "", fmt.Errorf("generate infohash: %w", err)
+			return nil, fmt.Errorf("generate infohash: %w", err)
 		}
 		cfg.InfoHash = hex.EncodeToString(ih[:])
 		priv, _, err := awg.GenerateKeyPair()
 		if err != nil {
-			return nil, netip.Addr{}, "", fmt.Errorf("generate server key: %w", err)
+			return nil, fmt.Errorf("generate server key: %w", err)
 		}
 		cfg.ServerPrivKey = priv
 		if err := st.SaveServerConfig(cfg); err != nil {
-			return nil, netip.Addr{}, "", fmt.Errorf("save first-boot identity: %w", err)
+			return nil, fmt.Errorf("save first-boot identity: %w", err)
+		}
+	} else if stored.LegacyTransport == "" {
+		stored.LegacyTransport = cfg.LegacyTransport
+		if err := st.SaveServerConfig(stored); err != nil {
+			return nil, err
 		}
 	}
 
 	ih, err := hex.DecodeString(cfg.InfoHash)
 	if err != nil || len(ih) != 20 {
-		return nil, netip.Addr{}, "", fmt.Errorf("bad infohash in store")
+		return nil, fmt.Errorf("bad infohash in store")
 	}
 	serverPub, err := awg.DerivePubKey(cfg.ServerPrivKey)
 	if err != nil {
-		return nil, netip.Addr{}, "", fmt.Errorf("derive server public key: %w", err)
+		return nil, fmt.Errorf("derive server public key: %w", err)
 	}
 	serverIP := netip.MustParseAddr(cfg.ServerIP)
+	if g, err := st.GetGroup(store.DefaultGroupID); err == nil {
+		cfg.ServerIP, cfg.Subnet = g.ServerIP, g.Subnet
+		serverIP = netip.MustParseAddr(g.ServerIP)
+	} else {
+		return nil, err
+	}
 
 	s := &Server{
 		cfg:      cfg,
 		st:       st,
 		infoHash: [20]byte(ih),
 		pubKey:   serverPub,
-		bd:       bind.New(),
+		bd:       bind.NewHybrid(),
+		peers:    make(map[string]store.ClientRecord),
+		sessions: make(map[string]map[carrier.Transport]struct{}),
 		byPeerID: make(map[string]store.ClientRecord),
 		attached: make(map[string]int),
 		closed:   make(chan struct{}),
@@ -178,79 +238,84 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, netip.Add
 
 	s.policy = newPolicySnapshot()
 	if err := s.policy.reload(st, serverIP); err != nil {
-		return nil, netip.Addr{}, "", fmt.Errorf("load policy: %w", err)
+		return nil, fmt.Errorf("load policy: %w", err)
 	}
 
-	clients, err := st.ListClients()
-	if err != nil {
-		return nil, netip.Addr{}, "", fmt.Errorf("list clients: %w", err)
-	}
-	var peerConf string
-	for _, rec := range clients {
-		if rec.PeerID == "" {
-			rec.PeerID = awg.PeerID(rec.PubKey)
-		}
-		if rec.Revoked {
-			continue
-		}
-		s.byPeerID[rec.PeerID] = rec
-		peerConf += awg.ServerPeerLine(rec.PubKey, rec.IP)
-	}
-	return s, serverIP, peerConf, nil
+	return s, nil
 }
 
-// finish assembles the AWG device, carrier listener, and DHT announcer once
-// the TUN device and egress listener have been chosen by the caller.
-func (s *Server) finish(tunDev tun.Device, egressLn net.Listener, peerConf string) error {
-	s.dev = device.NewDevice(tunDev, s.bd, device.NewLogger(device.LogLevelError, "btawg-server: "))
-	ipc := fmt.Sprintf("private_key=%s\n%s%s", s.cfg.ServerPrivKey, s.cfg.AWGProfile.String(), peerConf)
-	if err := s.dev.IpcSet(ipc); err != nil {
-		s.dev.Close()
-		return fmt.Errorf("server IpcSet: %w", err)
+func (s *Server) finish() error {
+	s.dev = device.NewDevice(s.router.device(0), s.bd, device.NewLogger(device.LogLevelError, "btawg-awg: "))
+	s.wg = device.NewDevice(s.router.device(1), conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, "btawg-wg: "))
+	if err := s.dev.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n%s", s.cfg.ServerPrivKey, s.cfg.AWGPort, s.cfg.AWGProfile.String())); err != nil {
+		return err
+	}
+	if err := s.wg.IpcSet(fmt.Sprintf("private_key=%s\nlisten_port=%d\n", s.cfg.ServerPrivKey, s.cfg.WGPort)); err != nil {
+		return err
+	}
+	if err := s.reloadPeers(); err != nil {
+		return err
 	}
 	if err := s.dev.Up(); err != nil {
-		s.dev.Close()
-		return fmt.Errorf("server up: %w", err)
+		return fmt.Errorf("AWG: %w", err)
 	}
-
-	s.egressLn = egressLn
-
-	switch s.cfg.Transport {
-	case "ext-utp", "req-utp":
-		pc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: s.cfg.CarrierPort})
-		if err != nil {
-			return fmt.Errorf("carrier listen: %w", err)
-		}
-		s.udpPC = pc
-		// 100 ms target delay is the library default (what the rest of the
-		// µTP network uses); buffers are 4 MiB so the window can cover the
-		// bandwidth-delay product of fast WAN paths. The 64 KiB / 5 ms
-		// tuning formerly here strangled throughput to ~400 KiB/s.
-		sock, err := utp.NewSocketFromPacketConn(pc,
-			utp.WithBufferSizes(4<<20, 4<<20))
-		if err != nil {
-			return fmt.Errorf("utp socket: %w", err)
-		}
-		s.sock = sock
-	case "ext-tcp", "req-tcp":
-		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", s.cfg.CarrierPort))
-		if err != nil {
-			return fmt.Errorf("carrier listen: %w", err)
-		}
-		s.tcpLn = ln
-	default:
-		return fmt.Errorf("unknown transport %q", s.cfg.Transport)
+	if err := s.wg.Up(); err != nil {
+		return fmt.Errorf("WG: %w", err)
 	}
-
-	announceIP, err := netip.ParseAddr(s.cfg.ExternalIP)
+	listen := net.ListenConfig{Control: carrier.TCPControl}
+	var err error
+	s.tcpLn, err = listen.Listen(context.Background(), "tcp4", fmt.Sprintf(":%d", s.cfg.CarrierPort))
 	if err != nil {
-		announceIP = netip.IPv4Unspecified()
+		return err
 	}
-	ann, err := dht.NewAnnouncer(s.infoHash, netip.AddrPortFrom(announceIP, uint16(s.cfg.CarrierPort)), nil)
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: s.cfg.CarrierPort})
 	if err != nil {
-		return fmt.Errorf("dht announcer: %w", err)
+		return err
 	}
-	s.ann = ann
+	s.udpPC = pc
+	s.sock, err = carrier.NewUTPSocket(pc)
+	if err != nil {
+		return err
+	}
+	if s.ns != nil {
+		s.egressLn, err = s.netstackEgress()
+	} else {
+		lc := net.ListenConfig{Control: func(network, address string, c syscall.RawConn) error {
+			if err := tunsetup.OverlayTCP(network, address, c); err != nil {
+				return err
+			}
+			var optErr error
+			if err := c.Control(func(fd uintptr) { optErr = unix.BindToDevice(int(fd), s.tunName) }); err != nil {
+				return err
+			}
+			return optErr
+		}}
+		s.egressLn, err = lc.Listen(context.Background(), "tcp4", fmt.Sprintf(":%d", s.cfg.SocksPort))
+	}
+	if err != nil {
+		return err
+	}
+	s.egressGate = &gatedListener{inner: s.egressLn, policy: s.policy, active: make(map[*egressSession]netip.Addr)}
+	s.hashes = make(map[[20]byte]string, 2)
+	if s.ns == nil {
+		s.egressGate.requireGateway = true
+	}
+	for _, framing := range []string{"ext", "req"} {
+		hash, err := config.CarrierHash(s.InfoHash(), s.cfg.LegacyTransport, framing+"-tcp")
+		if err != nil {
+			return err
+		}
+		key, err := awg.InfoHashBytes(hash)
+		if err != nil {
+			return err
+		}
+		s.hashes[key] = framing
+		ann, err := dht.NewAnnouncer(key, netip.AddrPortFrom(netip.IPv4Unspecified(), uint16(s.cfg.CarrierPort)), nil)
+		if err != nil {
+			return err
+		}
+		s.anns = append(s.anns, ann)
+	}
 	return nil
 }
 
@@ -264,10 +329,53 @@ func (s *Server) PubKey() string { return s.pubKey }
 // Config returns the active server configuration.
 func (s *Server) Config() config.ServerConfig { return s.cfg }
 
-// ReloadPolicy re-reads the current client records from the store into the
-// in-memory policy snapshot.
+// ReloadPolicy applies stored group addresses, peer addresses and access rules.
 func (s *Server) ReloadPolicy() error {
-	return s.policy.reload(s.st, netip.MustParseAddr(s.cfg.ServerIP))
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	gs, err := groupGateways(s.st)
+	if err != nil {
+		return err
+	}
+	if s.ns != nil {
+		if len(gs) != len(s.gateways) {
+			return fmt.Errorf("changing group networks in -no-tun mode requires a restart or a real TUN")
+		}
+		for i, g := range gs {
+			if g != s.gateways[i] {
+				return fmt.Errorf("changing group networks in -no-tun mode requires a restart or a real TUN")
+			}
+		}
+	}
+	if s.kernel != nil && !slices.Equal(gs, s.gateways) {
+		if err = s.kernel.Apply(gs); err != nil {
+			return err
+		}
+		s.gateways = gs
+	}
+	if err = s.reloadPeers(); err != nil {
+		s.policy.disableClients()
+		if s.egressGate != nil {
+			s.egressGate.closeDenied()
+		}
+		return err
+	}
+	group, err := s.st.GetGroup(store.DefaultGroupID)
+	if err != nil {
+		return err
+	}
+	if err = s.policy.reload(s.st, netip.MustParseAddr(group.ServerIP)); err != nil {
+		s.policy.disableClients()
+		if s.egressGate != nil {
+			s.egressGate.closeDenied()
+		}
+		return err
+	}
+	if s.egressGate != nil {
+		s.egressGate.closeDenied()
+	}
+	s.gateways = gs
+	return nil
 }
 
 // OverlayNet exposes the hub's userspace network stack for the panel and diagnostics.
@@ -285,7 +393,8 @@ func (s *Server) Run(ctx context.Context) error {
 		cancel()
 	}()
 
-	prefix := overlayPrefix(s.cfg)
+	go s.refreshHandshakeRoutes(runCtx)
+	prefix := egressDenied{policy: s.policy}
 	egress := socks.NewServer(
 		newEgressDialer(prefix, net.DefaultResolver),
 		func(ctx context.Context) (net.PacketConn, error) {
@@ -295,7 +404,10 @@ func (s *Server) Run(ctx context.Context) error {
 		// The relay must live inside the overlay. In netstack mode that is a
 		// netstack address; in real-TUN mode the kernel interface owns the
 		// overlay prefix, so bind the relay to it on the host network.
-		serverIP := netip.MustParseAddr(s.cfg.ServerIP)
+		serverIP, ok := addrIP(local)
+		if !ok {
+			return nil, fmt.Errorf("invalid relay local address")
+		}
 		var relay net.PacketConn
 		var err error
 		if s.ns != nil {
@@ -313,129 +425,184 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		return &sourceLockedRelay{PacketConn: relay, allow: remoteIP}, nil
 	})
-	gated := &gatedListener{inner: s.egressLn, policy: s.policy}
-	go egress.Serve(runCtx, gated)
+	go egress.Serve(runCtx, s.egressGate)
 
-	switch {
-	case s.sock != nil:
-		for {
-			c, err := s.sock.Accept()
-			if err != nil {
-				if runCtx.Err() != nil {
-					return nil
+	errs := make(chan error, 2)
+	for _, accept := range []func() (net.Conn, error){s.tcpLn.Accept, s.sock.Accept} {
+		go func() {
+			for {
+				c, err := accept()
+				if err != nil {
+					errs <- err
+					return
 				}
-				return fmt.Errorf("carrier accept: %w", err)
+				go s.acceptConn(runCtx, c)
 			}
-			go s.acceptConn(runCtx, c)
-		}
-	case s.tcpLn != nil:
-		for {
-			c, err := s.tcpLn.Accept()
-			if err != nil {
-				if runCtx.Err() != nil {
-					return nil
-				}
-				return fmt.Errorf("carrier accept: %w", err)
-			}
-			go s.acceptConn(runCtx, c)
+		}()
+	}
+	select {
+	case <-runCtx.Done():
+		return nil
+	case err := <-errs:
+		select {
+		case <-s.closed:
+			return nil
+		default:
+			return fmt.Errorf("carrier accept: %w", err)
 		}
 	}
-	<-runCtx.Done()
-	return nil
 }
 
-// Announce publishes the carrier address in the DHT until ctx is done.
-func (s *Server) Announce(ctx context.Context) error { return s.ann.Run(ctx) }
-
-// acceptConn performs the BitTorrent handshake inside the carrier
-// constructor, identifies the client by the returned peer ID, and attaches
-// the carrier to the AWG bind under the client's overlay endpoint.
-func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
-	var t carrier.Transport
-	var theirID [20]byte
-	var err error
-	switch s.cfg.Transport {
-	case "ext-utp", "ext-tcp":
-		t, theirID, err = carrier.NewExtended(c, s.infoHash, serverPeerID)
-	case "req-utp", "req-tcp":
-		t, theirID, err = carrier.NewRequestPiece(c, s.infoHash, serverPeerID, true)
-	default:
-		err = fmt.Errorf("unknown transport")
+// Announce publishes both framing hashes through DHT.
+func (s *Server) Announce(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	errs := make(chan error, len(s.anns))
+	for _, a := range s.anns {
+		go func() { errs <- a.Run(ctx) }()
 	}
-	if err != nil {
-		c.Close()
+	select {
+	case <-ctx.Done():
+		return nil
+	case <-s.closed:
+		return nil
+	case err := <-errs:
+		return err
+	}
+}
+
+func (s *Server) acceptConn(ctx context.Context, c net.Conn) {
+	if err := c.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		_ = c.Close()
 		return
 	}
-	s.mu.Lock()
-	rec, ok := s.byPeerID[hex.EncodeToString(theirID[:])]
-	s.mu.Unlock()
-	if !ok {
+	t, theirs, err := carrier.Accept(c, serverPeerID, s.hashes)
+	if err != nil {
+		_ = c.Close()
+		return
+	}
+	if err = c.SetDeadline(time.Time{}); err != nil {
 		t.Close()
 		return
 	}
-	ip := netip.MustParseAddr(rec.IP)
-	ep := bind.Endpoint(ip)
-	s.bd.Attach(ep, t)
+	id := hex.EncodeToString(theirs[:])
 	s.mu.Lock()
+	rec, ok := s.byPeerID[id]
+	if !ok {
+		s.mu.Unlock()
+		t.Close()
+		return
+	}
+	select {
+	case <-s.closed:
+		s.mu.Unlock()
+		t.Close()
+		return
+	default:
+	}
+	if s.sessions[id] == nil {
+		s.sessions[id] = make(map[carrier.Transport]struct{})
+	}
+	s.sessions[id][t] = struct{}{}
+	detach := s.bd.AddCarrier(netip.MustParseAddr(rec.IP), t)
 	s.attached[rec.IP]++
 	s.mu.Unlock()
-	go func() {
-		select {
-		case <-t.Done():
-		case <-ctx.Done():
-		case <-s.closed:
-		}
-		s.bd.Detach(ep)
-		s.mu.Lock()
+	select {
+	case <-t.Done():
+	case <-ctx.Done():
+	case <-s.closed:
+	}
+	detach()
+	s.mu.Lock()
+	delete(s.sessions[id], t)
+	if len(s.sessions[id]) == 0 {
+		delete(s.sessions, id)
+	}
+	if s.attached[rec.IP] > 1 {
 		s.attached[rec.IP]--
-		s.mu.Unlock()
-	}()
-}
-
-// RegisterClient adds a client at runtime (panel create): AWG peer entry,
-// carrier routing by peer ID, and an in-memory policy snapshot update so the
-// new client is immediately enforceable without a reload or restart.
-func (s *Server) RegisterClient(rec store.ClientRecord) error {
-	if rec.PeerID == "" {
-		rec.PeerID = awg.PeerID(rec.PubKey)
+	} else {
+		delete(s.attached, rec.IP)
 	}
-	store.NormalizeClientRecord(&rec)
-	if err := s.dev.IpcSet(awg.ServerPeerLine(rec.PubKey, rec.IP)); err != nil {
-		return fmt.Errorf("ipc add peer: %w", err)
-	}
-	s.mu.Lock()
-	s.byPeerID[rec.PeerID] = rec
 	s.mu.Unlock()
-	s.policy.upsert(rec, netip.MustParseAddr(s.cfg.ServerIP))
-	return nil
 }
 
-// RevokeClient removes a client at runtime (panel revoke): the AWG peer is
-// dropped, its carrier detached, future handshakes from its peer ID are
-// rejected, and the policy snapshot is updated to drop the revoked record.
-func (s *Server) RevokeClient(rec store.ClientRecord) error {
-	ipc := fmt.Sprintf("public_key=%s\nremove=true\n", rec.PubKey)
-	if err := s.dev.IpcSet(ipc); err != nil {
-		return fmt.Errorf("ipc remove peer: %w", err)
-	}
-	ip := netip.MustParseAddr(rec.IP)
-	s.bd.Detach(bind.Endpoint(ip))
-	s.mu.Lock()
-	delete(s.byPeerID, rec.PeerID)
-	s.mu.Unlock()
-	s.policy.remove(ip)
-	return nil
-}
-
-// overlayPrefix returns the hub's overlay subnet (ServerIP/24).
-func overlayPrefix(cfg config.ServerConfig) netip.Prefix {
-	p, err := netip.MustParseAddr(cfg.ServerIP).Prefix(24)
+func (s *Server) reloadPeers() error {
+	recs, err := s.st.ListClients()
 	if err != nil {
-		// A /24 is always valid for an IPv4 address; panic on programmer error.
-		panic(fmt.Sprintf("overlay prefix: %v", err))
+		return err
 	}
-	return p
+	next := make(map[string]store.ClientRecord, len(recs))
+	byPeerID := make(map[string]store.ClientRecord, len(recs))
+	for _, r := range recs {
+		if r.Revoked {
+			continue
+		}
+		if _, err := netip.ParseAddr(r.IP); err != nil {
+			return err
+		}
+		if _, err := awg.InfoHashBytes(r.PeerID); r.PeerID != "" && err != nil {
+			return fmt.Errorf("invalid carrier identity for user %q", r.ID)
+		}
+		if decoded, err := hex.DecodeString(r.PubKey); err != nil || len(decoded) != 32 || r.PubKey == s.pubKey {
+			return fmt.Errorf("invalid public key for user %q", r.ID)
+		}
+		if r.PeerID == "" {
+			r.PeerID = awg.PeerID(r.PubKey)
+		}
+		next[r.ID] = r
+		byPeerID[r.PeerID] = r
+	}
+	var closeList []carrier.Transport
+	s.mu.Lock()
+	s.byPeerID = byPeerID
+	for id, old := range s.peers {
+		if r, ok := next[id]; ok && r.IP == old.IP && r.PubKey == old.PubKey {
+			continue
+		}
+		for t := range s.sessions[old.PeerID] {
+			closeList = append(closeList, t)
+		}
+	}
+	s.mu.Unlock()
+	for _, t := range closeList {
+		t.Close()
+	}
+	for id, old := range s.peers {
+		if r, ok := next[id]; ok && r.IP == old.IP && r.PubKey == old.PubKey {
+			continue
+		}
+		ip := netip.MustParseAddr(old.IP)
+		s.policy.remove(ip)
+		s.router.forget(ip)
+		line := fmt.Sprintf("public_key=%s\nremove=true\n", old.PubKey)
+		if err := s.dev.IpcSet(line); err != nil {
+			return err
+		}
+		if err := s.wg.IpcSet(line); err != nil {
+			return err
+		}
+	}
+	for id, r := range next {
+		if old, ok := s.peers[id]; ok && old.IP == r.IP && old.PubKey == r.PubKey {
+			continue
+		}
+		line := fmt.Sprintf("public_key=%s\nreplace_allowed_ips=true\nallowed_ip=%s/32\n", r.PubKey, r.IP)
+		if err := s.dev.IpcSet(line); err != nil {
+			return err
+		}
+		if err := s.wg.IpcSet(line); err != nil {
+			return err
+		}
+	}
+	s.peers = next
+	return nil
 }
+
+// RegisterClient applies an enrollment already persisted by the panel.
+func (s *Server) RegisterClient(rec store.ClientRecord) error { return s.ReloadPolicy() }
+
+// RevokeClient applies a revocation already persisted by the panel.
+func (s *Server) RevokeClient(rec store.ClientRecord) error { return s.ReloadPolicy() }
 
 // hostResolver is the minimal resolver surface the egress dialer needs.
 type hostResolver interface {
@@ -447,12 +614,12 @@ type hostResolver interface {
 // client-to-client traffic must use the filtered OverlayDialTCP path.
 type overlayFilteredPacketConn struct {
 	net.PacketConn
-	prefix netip.Prefix
+	prefix interface{ Contains(netip.Addr) bool }
 }
 
 func (c *overlayFilteredPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	if ip, ok := addrIP(addr); ok && c.prefix.Contains(ip) {
-		return 0, fmt.Errorf("egress refused: UDP destination %v is inside overlay subnet", addr)
+	if ip, ok := addrIP(addr); !ok || c.prefix.Contains(ip.Unmap()) {
+		return 0, fmt.Errorf("egress refused: UDP destination %v is not allowed", addr)
 	}
 	return c.PacketConn.WriteTo(p, addr)
 }
@@ -486,7 +653,7 @@ func (r *sourceLockedRelay) ReadFrom(p []byte) (int, net.Addr, error) {
 // refuses if any returned IP lies inside the overlay subnet. After the check
 // succeeds, the dial uses the resolved address so the guard cannot be bypassed
 // by a name that resolves differently at dial time.
-func newEgressDialer(prefix netip.Prefix, resolver hostResolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
+func newEgressDialer(prefix interface{ Contains(netip.Addr) bool }, resolver hostResolver) func(ctx context.Context, network, addr string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {
@@ -495,8 +662,8 @@ func newEgressDialer(prefix netip.Prefix, resolver hostResolver) func(ctx contex
 		dialHost := host
 
 		if ip, err := netip.ParseAddr(host); err == nil {
-			if prefix.Contains(ip) {
-				return nil, fmt.Errorf("egress refused: destination %s is inside overlay subnet", addr)
+			if prefix.Contains(ip.Unmap()) {
+				return nil, fmt.Errorf("egress refused: destination %s is not allowed", addr)
 			}
 		} else {
 			ips, err := resolver.LookupIP(ctx, "ip", host)
@@ -511,7 +678,7 @@ func newEgressDialer(prefix netip.Prefix, resolver hostResolver) func(ctx contex
 				}
 				a = a.Unmap()
 				if prefix.Contains(a) {
-					return nil, fmt.Errorf("egress refused: hostname %s resolved to overlay IP %s", host, a)
+					return nil, fmt.Errorf("egress refused: hostname %s resolved to a prohibited IP %s", host, a)
 				}
 				addrs = append(addrs, net.JoinHostPort(a.String(), port))
 			}
@@ -544,7 +711,7 @@ func newEgressDialer(prefix netip.Prefix, resolver hostResolver) func(ctx contex
 }
 
 // newEgressUDP returns an upstream UDP socket that refuses overlay destinations.
-func newEgressUDP(prefix netip.Prefix) (net.PacketConn, error) {
+func newEgressUDP(prefix interface{ Contains(netip.Addr) bool }) (net.PacketConn, error) {
 	pc, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return nil, err
@@ -565,39 +732,45 @@ func (s *Server) ConnectedCount() map[string]int {
 
 // Close tears the hub down.
 func (s *Server) Close() error {
-	select {
-	case <-s.closed:
-		return nil
-	default:
-	}
-	close(s.closed)
-	return s.closeAll()
+	var err error
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		for _, a := range s.anns {
+			a.Close()
+		}
+		if s.sock != nil {
+			_ = s.sock.Close()
+		}
+		if s.tcpLn != nil {
+			_ = s.tcpLn.Close()
+		}
+		if s.udpPC != nil {
+			_ = s.udpPC.Close()
+		}
+		if s.egressGate != nil {
+			_ = s.egressGate.Close()
+		} else if s.egressLn != nil {
+			_ = s.egressLn.Close()
+		}
+		if s.dev != nil {
+			s.dev.Close()
+		}
+		if s.wg != nil {
+			s.wg.Close()
+		}
+		if s.kernel != nil {
+			err = s.kernel.Close()
+		}
+		if s.router != nil {
+			err = errors.Join(err, s.router.close())
+		}
+	})
+	return err
 }
 
-func (s *Server) closeAll() error {
-	if s.ann != nil {
-		s.ann.Close()
-	}
-	if s.sock != nil {
-		s.sock.Close()
-	}
-	if s.tcpLn != nil {
-		s.tcpLn.Close()
-	}
-	if s.udpPC != nil {
-		s.udpPC.Close()
-	}
-	if s.egressLn != nil {
-		s.egressLn.Close()
-	}
-	if s.dev != nil {
-		s.dev.Close()
-	}
-	return nil
-}
-
-// SetDHTBootstrap overrides the announcer's bootstrap node list; the next
-// announce cycle uses it (tests point it at a local relay).
+// SetDHTBootstrap updates discovery bootstrap for both framing hashes.
 func (s *Server) SetDHTBootstrap(hosts []string) {
-	s.ann.SetBootstrap(hosts)
+	for _, a := range s.anns {
+		a.SetBootstrap(hosts)
+	}
 }

@@ -32,10 +32,10 @@ func Setup(name string, addr netip.Prefix, route *netip.Prefix, mtu int, ipForwa
 			return err
 		}
 	}
-	if err := run("ip", "link", "set", "dev", name, "up"); err != nil {
-		return err
-	}
-	if err := run("ip", "link", "set", "dev", name, "mtu", fmt.Sprintf("%d", mtu)); err != nil {
+	// The stream carrier can briefly backpressure AWG during congestion or
+	// window refill. Leave room for a burst of GSO packets before Linux drops
+	// them and forces the inner TCP connections to restart congestion control.
+	if err := run("ip", "link", "set", "dev", name, "mtu", fmt.Sprintf("%d", mtu), "txqueuelen", "8192", "up"); err != nil {
 		return err
 	}
 	if route != nil && route.Masked() != addr.Masked() {

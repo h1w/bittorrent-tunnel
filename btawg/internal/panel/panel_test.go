@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
@@ -15,9 +16,11 @@ import (
 )
 
 type fakeRegistry struct {
-	registered  []store.ClientRecord
-	revoked     []store.ClientRecord
-	reloadCalls int
+	registered   []store.ClientRecord
+	revoked      []store.ClientRecord
+	reloadCalls  int
+	reloadErr    error
+	activeConfig config.ServerConfig
 }
 
 func (f *fakeRegistry) RegisterClient(rec store.ClientRecord) error {
@@ -32,7 +35,14 @@ func (f *fakeRegistry) RevokeClient(rec store.ClientRecord) error {
 
 func (f *fakeRegistry) ReloadPolicy() error {
 	f.reloadCalls++
-	return nil
+	return f.reloadErr
+}
+
+func (f *fakeRegistry) Config() config.ServerConfig {
+	if f.activeConfig.Transport != "" {
+		return f.activeConfig
+	}
+	return config.DefaultServerConfig()
 }
 
 func (f *fakeRegistry) ConnectedCount() map[string]int { return nil }
@@ -144,7 +154,8 @@ func TestServerConfigFormRoundTrip(t *testing.T) {
 		"s1": {"32"}, "s2": {"32"}, "s3": {"32"}, "s4": {"32"},
 		"h1": {"101"}, "h2": {"102"}, "h3": {"103"}, "h4": {"104"},
 		"transport":    {"ext-tcp"},
-		"carrier_port": {"17777"}, "socks_port": {"1080"}, "panel_port": {"8080"},
+		"carrier_port": {"17777"}, "awg_port": {"51821"}, "wg_port": {"51820"},
+		"socks_port": {"1080"}, "panel_port": {"8080"},
 		"external_ip": {"203.0.113.7"},
 	}
 	resp, err := c.PostForm(srv.URL+"/server", form)
@@ -347,9 +358,10 @@ func TestUpdateClientPolicy(t *testing.T) {
 
 	csrf := csrfOf(t, c, srv.URL, "/clients")
 	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
-		"csrf":  {csrf},
-		"id":    {idA},
-		"peers": {idB},
+		"csrf":     {csrf},
+		"id":       {idA},
+		"internet": {"off"},
+		"peers":    {idB},
 	})
 	if err != nil {
 		t.Fatalf("post policy: %v", err)
@@ -366,8 +378,8 @@ func TestUpdateClientPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get client: %v", err)
 	}
-	if !rec.NoInternet {
-		t.Fatalf("NoInternet = %v, want true", rec.NoInternet)
+	if rec.Internet == nil || *rec.Internet {
+		t.Fatalf("Internet = %v, want explicit false", rec.Internet)
 	}
 	if len(rec.VisiblePeers) != 1 || rec.VisiblePeers[0] != idB {
 		t.Fatalf("VisiblePeers = %v, want [%s]", rec.VisiblePeers, idB)
@@ -386,7 +398,7 @@ func TestUpdateClientPolicyInternetPresence(t *testing.T) {
 	resp, err := c.PostForm(srv.URL+"/clients/policy", map[string][]string{
 		"csrf":     {csrf},
 		"id":       {id},
-		"internet": {"1"},
+		"internet": {"on"},
 		"peers":    {"*"},
 	})
 	if err != nil {
@@ -401,8 +413,8 @@ func TestUpdateClientPolicyInternetPresence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get client: %v", err)
 	}
-	if rec.NoInternet {
-		t.Fatalf("NoInternet = %v, want false when internet field is present", rec.NoInternet)
+	if rec.Internet == nil || !*rec.Internet {
+		t.Fatalf("Internet = %v, want explicit true when internet field is on", rec.Internet)
 	}
 	if reg.reloadCalls != 1 {
 		t.Fatalf("ReloadPolicy calls = %d, want 1", reg.reloadCalls)
@@ -518,8 +530,8 @@ func TestUpdateClientPolicyEditInternetKeepsIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get client: %v", err)
 	}
-	if rec.NoInternet {
-		t.Fatalf("NoInternet = %v, want false", rec.NoInternet)
+	if rec.Internet == nil || !*rec.Internet {
+		t.Fatalf("Internet = %v, want explicit true", rec.Internet)
 	}
 	if len(rec.VisiblePeers) != 0 {
 		t.Fatalf("VisiblePeers = %v, want []", rec.VisiblePeers)
@@ -562,5 +574,262 @@ func TestServerPageShowsApplyBanner(t *testing.T) {
 	}
 	if !strings.Contains(page, "re-import") {
 		t.Fatalf("server page missing 're-import'; page:\n%s", page)
+	}
+}
+
+func TestCreateClientInGroup(t *testing.T) {
+	srv, st, reg := newTestPanel(t)
+	c := login(t, srv.URL)
+
+	// Create a custom group first.
+	csrf := csrfOf(t, c, srv.URL, "/groups")
+	resp, err := c.PostForm(srv.URL+"/groups/save", map[string][]string{
+		"csrf":         {csrf},
+		"name":         {"work"},
+		"subnet":       {"10.77.5.0/24"},
+		"server_ip":    {"10.77.5.1"},
+		"internet":     {"on"},
+		"visible_mode": {"same"},
+	})
+	if err != nil {
+		t.Fatalf("save group: %v", err)
+	}
+	resp.Body.Close()
+	groups, _ := st.ListGroups()
+	var groupID string
+	for _, g := range groups {
+		if g.Name == "work" {
+			groupID = g.ID
+		}
+	}
+	if groupID == "" {
+		t.Fatalf("work group not found in %d groups", len(groups))
+	}
+
+	// Create a client assigned to that group.
+	csrf = csrfOf(t, c, srv.URL, "/clients")
+	resp, err = c.PostForm(srv.URL+"/clients/create", map[string][]string{
+		"csrf":     {csrf},
+		"name":     {"laptop"},
+		"group_id": {groupID},
+	})
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+	resp.Body.Close()
+	if len(reg.registered) != 1 {
+		t.Fatalf("registered = %d, want 1", len(reg.registered))
+	}
+	rec := reg.registered[0]
+	if rec.GroupID != groupID {
+		t.Fatalf("GroupID = %q, want %q", rec.GroupID, groupID)
+	}
+	if !strings.HasPrefix(rec.IP, "10.77.5.") {
+		t.Fatalf("IP %q not in group subnet", rec.IP)
+	}
+}
+
+func TestMoveClientChangesGroup(t *testing.T) {
+	srv, st, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	id := createClientForTest(t, c, srv.URL, "A")
+
+	csrf := csrfOf(t, c, srv.URL, "/groups")
+	resp, err := c.PostForm(srv.URL+"/groups/save", map[string][]string{
+		"csrf":         {csrf},
+		"name":         {"work"},
+		"subnet":       {"10.77.5.0/24"},
+		"server_ip":    {"10.77.5.1"},
+		"internet":     {"on"},
+		"visible_mode": {"same"},
+	})
+	if err != nil {
+		t.Fatalf("save group: %v", err)
+	}
+	resp.Body.Close()
+	groups, _ := st.ListGroups()
+	var groupID string
+	for _, g := range groups {
+		if g.Name == "work" {
+			groupID = g.ID
+		}
+	}
+	if groupID == "" {
+		t.Fatalf("work group not found")
+	}
+
+	before, _ := st.GetClient(id)
+	csrf = csrfOf(t, c, srv.URL, "/clients")
+	resp, err = c.PostForm(srv.URL+"/clients/move", map[string][]string{
+		"csrf":     {csrf},
+		"id":       {id},
+		"group_id": {groupID},
+	})
+	if err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("move = %d, want 302", resp.StatusCode)
+	}
+
+	after, _ := st.GetClient(id)
+	if after.GroupID != groupID {
+		t.Fatalf("GroupID = %q, want %q", after.GroupID, groupID)
+	}
+	if after.IP == before.IP {
+		t.Fatalf("IP unchanged after move: %s", after.IP)
+	}
+	if !strings.HasPrefix(after.IP, "10.77.5.") {
+		t.Fatalf("IP %q not in new group subnet", after.IP)
+	}
+}
+
+func TestGroupCRUD(t *testing.T) {
+	srv, st, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+
+	csrf := csrfOf(t, c, srv.URL, "/groups")
+	resp, err := c.PostForm(srv.URL+"/groups/save", map[string][]string{
+		"csrf":         {csrf},
+		"name":         {"work"},
+		"subnet":       {"10.77.5.0/24"},
+		"server_ip":    {"10.77.5.1"},
+		"internet":     {"on"},
+		"visible_mode": {"all"},
+	})
+	if err != nil {
+		t.Fatalf("save group: %v", err)
+	}
+	resp.Body.Close()
+
+	groups, _ := st.ListGroups()
+	var g store.GroupRecord
+	for _, gr := range groups {
+		if gr.Name == "work" {
+			g = gr
+		}
+	}
+	if g.ID == "" {
+		t.Fatalf("work group not found after save in %d groups", len(groups))
+	}
+	if g.Name != "work" || len(g.VisibleGroups) != 1 || g.VisibleGroups[0] != "*" {
+		t.Fatalf("group = %+v", g)
+	}
+
+	// Edit to listed visibility.
+	csrf = csrfOf(t, c, srv.URL, "/groups")
+	resp, err = c.PostForm(srv.URL+"/groups/save", map[string][]string{
+		"csrf":           {csrf},
+		"id":             {g.ID},
+		"name":           {"work"},
+		"subnet":         {"10.77.5.0/24"},
+		"server_ip":      {"10.77.5.1"},
+		"internet":       {"on"},
+		"visible_mode":   {"list"},
+		"visible_groups": {"other"},
+	})
+	if err != nil {
+		t.Fatalf("edit group: %v", err)
+	}
+	resp.Body.Close()
+	g, _ = st.GetGroup(g.ID)
+	if len(g.VisibleGroups) != 1 || g.VisibleGroups[0] != "other" {
+		t.Fatalf("VisibleGroups after edit = %v", g.VisibleGroups)
+	}
+
+	// Delete.
+	csrf = csrfOf(t, c, srv.URL, "/groups")
+	resp, err = c.PostForm(srv.URL+"/groups/delete", map[string][]string{
+		"csrf": {csrf},
+		"id":   {g.ID},
+	})
+	if err != nil {
+		t.Fatalf("delete group: %v", err)
+	}
+	resp.Body.Close()
+	groups, _ = st.ListGroups()
+	for _, gr := range groups {
+		if gr.Name == "work" {
+			t.Fatalf("work group still present after delete")
+		}
+	}
+}
+
+func TestNativeExportRequiresExternalIP(t *testing.T) {
+	srv, _, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	id := createClientForTest(t, c, srv.URL, "A")
+
+	resp, err := c.Get(srv.URL + "/clients/native?id=" + id + "&mode=awg")
+	if err != nil {
+		t.Fatalf("get native: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusPreconditionFailed {
+		t.Fatalf("native without ExternalIP = %d, want 412", resp.StatusCode)
+	}
+}
+
+func TestRevokedClientRefusedExport(t *testing.T) {
+	srv, _, _ := newTestPanel(t)
+	c := login(t, srv.URL)
+	id := createClientForTest(t, c, srv.URL, "A")
+
+	csrf := csrfOf(t, c, srv.URL, "/clients")
+	resp, err := c.PostForm(srv.URL+"/clients/revoke", map[string][]string{
+		"csrf": {csrf},
+		"id":   {id},
+	})
+	if err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	resp.Body.Close()
+
+	resp, err = c.Get(srv.URL + "/clients/import?id=" + id)
+	if err != nil {
+		t.Fatalf("get import: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("import revoked = %d, want 403", resp.StatusCode)
+	}
+
+	resp, err = c.Get(srv.URL + "/clients/native?id=" + id + "&mode=awg")
+	if err != nil {
+		t.Fatalf("get native: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("native revoked = %d, want 403", resp.StatusCode)
+	}
+}
+
+func TestGroupSaveReloadRevert(t *testing.T) {
+	srv, st, reg := newTestPanel(t)
+	reg.reloadErr = fmt.Errorf("runtime reload failed")
+	c := login(t, srv.URL)
+
+	csrf := csrfOf(t, c, srv.URL, "/groups")
+	resp, err := c.PostForm(srv.URL+"/groups/save", map[string][]string{
+		"csrf":         {csrf},
+		"name":         {"work"},
+		"subnet":       {"10.77.5.0/24"},
+		"server_ip":    {"10.77.5.1"},
+		"internet":     {"on"},
+		"visible_mode": {"same"},
+	})
+	if err != nil {
+		t.Fatalf("save group: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("save group with failed reload = %d, want 500", resp.StatusCode)
+	}
+	groups, _ := st.ListGroups()
+	for _, gr := range groups {
+		if gr.Name == "work" {
+			t.Fatalf("work group was not reverted")
+		}
 	}
 }

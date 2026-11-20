@@ -7,6 +7,7 @@ require (
 	github.com/anacrolix/missinggo v1.2.1
 	github.com/go-quicktest/qt v1.102.0
 	golang.org/x/net v0.47.0
+	golang.org/x/sys v0.38.0
 )
 
 require (

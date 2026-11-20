@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ type Registry interface {
 	RegisterClient(store.ClientRecord) error
 	RevokeClient(store.ClientRecord) error
 	ReloadPolicy() error
+	Config() config.ServerConfig
 	ConnectedCount() map[string]int
 	InfoHash() string
 	PubKey() string
@@ -55,9 +57,10 @@ type Panel struct {
 	user string
 	pass []byte // bcrypt hash
 
-	mu       sync.Mutex
-	sessions map[string]*session
-	fails    map[string]*failState
+	mu        sync.Mutex
+	sessions  map[string]*session
+	fails     map[string]*failState
+	mutations sync.Mutex
 }
 
 // New builds the panel for the given store, hub registry and admin
@@ -85,8 +88,14 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("GET /clients", p.auth(p.clientsPage))
 	mux.HandleFunc("POST /clients/create", p.auth(p.clientCreate))
 	mux.HandleFunc("POST /clients/revoke", p.auth(p.clientRevoke))
+	mux.HandleFunc("POST /clients/move", p.auth(p.clientMove))
 	mux.HandleFunc("POST /clients/policy", p.auth(p.clientPolicy))
 	mux.HandleFunc("GET /clients/import", p.auth(p.clientImport))
+	mux.HandleFunc("GET /clients/native", p.auth(p.clientNative))
+	mux.HandleFunc("GET /groups", p.auth(p.groupsPage))
+	mux.HandleFunc("GET /groups/edit", p.auth(p.groupEdit))
+	mux.HandleFunc("POST /groups/save", p.auth(p.groupSave))
+	mux.HandleFunc("POST /groups/delete", p.auth(p.groupDelete))
 	return mux
 }
 
@@ -115,6 +124,8 @@ func (p *Panel) auth(next http.HandlerFunc) http.HandlerFunc {
 				http.Error(w, "bad csrf", http.StatusForbidden)
 				return
 			}
+			p.mutations.Lock()
+			defer p.mutations.Unlock()
 		}
 		next(w, r)
 	}
@@ -206,12 +217,14 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clients, _ := p.st.ListClients()
+	groups, _ := p.st.ListGroups()
 	data := map[string]any{
 		"CSRF":      p.session(r).csrf,
 		"Cfg":       cfg,
 		"InfoHash":  p.reg.InfoHash(),
 		"PubKey":    p.reg.PubKey(),
 		"Clients":   clients,
+		"Groups":    groups,
 		"Connected": p.reg.ConnectedCount(),
 		"Active":    "dashboard",
 	}
@@ -221,12 +234,18 @@ func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
 // ---- server settings ----
 
 func (p *Panel) serverPage(w http.ResponseWriter, r *http.Request) {
-	cfg, err := p.st.LoadServerConfig()
+	pending, err := p.st.LoadServerConfig()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	p.render(w, "server", map[string]any{"CSRF": p.session(r).csrf, "Cfg": cfg, "Saved": r.URL.Query().Get("saved") == "1", "Active": "server"})
+	p.render(w, "server", map[string]any{
+		"CSRF":      p.session(r).csrf,
+		"Cfg":       pending,
+		"ActiveCfg": p.reg.Config(),
+		"Saved":     r.URL.Query().Get("saved") == "1",
+		"Active":    "server",
+	})
 }
 
 func (p *Panel) serverSubmit(w http.ResponseWriter, r *http.Request) {
@@ -246,24 +265,33 @@ func (p *Panel) serverSubmit(w http.ResponseWriter, r *http.Request) {
 		H1: get("h1"), H2: get("h2"), H3: get("h3"), H4: get("h4"),
 	}
 	cfg.Transport = r.PostFormValue("transport")
-	switch cfg.Transport {
-	case "ext-utp", "ext-tcp", "req-utp", "req-tcp":
-	default:
+	if cfg.LegacyTransport == "" {
+		cfg.LegacyTransport = p.reg.Config().LegacyTransport
+	}
+	if !config.ValidClientMode(cfg.Transport) {
 		http.Error(w, "bad transport", http.StatusBadRequest)
 		return
 	}
 	cfg.CarrierPort = get("carrier_port")
+	cfg.AWGPort = get("awg_port")
+	cfg.WGPort = get("wg_port")
 	cfg.SocksPort = get("socks_port")
 	cfg.PanelPort = get("panel_port")
 	cfg.ExternalIP = strings.TrimSpace(r.PostFormValue("external_ip"))
 	if cfg.CarrierPort <= 0 || cfg.CarrierPort > 65535 ||
+		cfg.AWGPort <= 0 || cfg.AWGPort > 65535 ||
+		cfg.WGPort <= 0 || cfg.WGPort > 65535 ||
 		cfg.SocksPort <= 0 || cfg.SocksPort > 65535 ||
 		cfg.PanelPort <= 0 || cfg.PanelPort > 65535 {
 		http.Error(w, "bad port", http.StatusBadRequest)
 		return
 	}
+	if cfg.CarrierPort == cfg.AWGPort || cfg.CarrierPort == cfg.WGPort || cfg.AWGPort == cfg.WGPort {
+		http.Error(w, "UDP listener ports must be distinct", http.StatusBadRequest)
+		return
+	}
 	if cfg.ExternalIP != "" {
-		if _, err := netip.ParseAddr(cfg.ExternalIP); err != nil {
+		if ip, err := netip.ParseAddr(cfg.ExternalIP); err != nil || !ip.Is4() || ip.IsUnspecified() {
 			http.Error(w, "bad external ip", http.StatusBadRequest)
 			return
 		}
@@ -283,27 +311,28 @@ func (p *Panel) clientsPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	p.render(w, "clients", map[string]any{"CSRF": p.session(r).csrf, "Clients": clients, "Connected": p.reg.ConnectedCount(), "Active": "clients"})
+	groups, err := p.st.ListGroups()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	p.render(w, "clients", map[string]any{
+		"CSRF":      p.session(r).csrf,
+		"Clients":   clients,
+		"Groups":    groups,
+		"DefaultID": store.DefaultGroupID,
+		"Connected": p.reg.ConnectedCount(),
+		"Active":    "clients",
+	})
 }
 
 func (p *Panel) clientCreate(w http.ResponseWriter, r *http.Request) {
-	cfg, err := p.st.LoadServerConfig()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
 	name := strings.TrimSpace(r.PostFormValue("name"))
+	groupID := strings.TrimSpace(r.PostFormValue("group_id"))
+	if groupID == "" {
+		groupID = store.DefaultGroupID
+	}
 	priv, pub, err := awg.GenerateKeyPair()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	clients, err := p.st.ListClients()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	ip, err := nextFreeIP(cfg.Subnet, clients)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -313,17 +342,22 @@ func (p *Panel) clientCreate(w http.ResponseWriter, r *http.Request) {
 		Name:    name,
 		PubKey:  pub,
 		PrivKey: priv,
-		IP:      ip,
+		GroupID: groupID,
 		PeerID:  awg.PeerID(pub),
 		Created: time.Now(),
 	}
-	if err := p.st.CreateClient(rec); err != nil {
+	if err := p.st.AllocateClient(rec); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Reload the allocated record so the import page has the assigned IP.
+	rec, err = p.st.GetClient(rec.ID)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := p.reg.RegisterClient(rec); err != nil {
-		_ = p.st.DeleteClient(rec.ID)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		p.rollback(w, err, p.st.DeleteClient(rec.ID))
 		return
 	}
 	http.Redirect(w, r, "/clients/import?id="+rec.ID, http.StatusFound)
@@ -354,15 +388,31 @@ func (p *Panel) clientPolicy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown client", http.StatusNotFound)
 		return
 	}
+	old := rec
 
-	rec.NoInternet = len(r.PostForm["internet"]) == 0
-	peers, peersPresent := r.PostForm["peers"]
-	switch {
-	case len(peers) == 1 && peers[0] == "*":
+	// internet: "inherit" => nil, "on" => &true, "off" => &false.
+	switch r.PostFormValue("internet") {
+	case "inherit":
+		rec.Internet = nil
+	case "on":
+		v := true
+		rec.Internet = &v
+	case "off":
+		v := false
+		rec.Internet = &v
+	}
+
+	// visible_peers: "inherit" => nil; "*" => all; explicit list => override.
+	peers := r.PostForm["peers"]
+	if hasValue(peers, "inherit") {
+		rec.VisiblePeers = nil
+	} else if hasValue(peers, "*") {
 		rec.VisiblePeers = []string{"*"}
-	case peersPresent:
+	} else if hasValue(peers, "none") {
+		rec.VisiblePeers = []string{}
+	} else if len(peers) > 0 {
 		rec.VisiblePeers = peers
-	default:
+	} else {
 		rec.VisiblePeers = []string{}
 	}
 
@@ -371,46 +421,312 @@ func (p *Panel) clientPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := p.reg.ReloadPolicy(); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		p.rollback(w, err, p.st.SaveClient(old))
 		return
 	}
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
 func (p *Panel) clientImport(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
 	rec, err := p.st.GetClient(r.URL.Query().Get("id"))
 	if err != nil {
 		http.Error(w, "unknown client", http.StatusNotFound)
 		return
 	}
-	cfg, err := p.st.LoadServerConfig()
+	if rec.Revoked {
+		http.Error(w, "client revoked", http.StatusForbidden)
+		return
+	}
+	cfg := p.reg.Config()
+	ccfg, err := p.buildClientConfig(rec, cfg)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
-	}
-	ccfg := config.ClientConfig{
-		Version:       config.ClientVersion,
-		InfoHash:      p.reg.InfoHash(),
-		ServerPubKey:  p.reg.PubKey(),
-		ClientPrivKey: rec.PrivKey,
-		ClientPubKey:  rec.PubKey,
-		ClientIP:      rec.IP,
-		Subnet:        cfg.Subnet,
-		ServerIP:      cfg.ServerIP,
-		Transport:     cfg.Transport,
-		SocksPort:     1080,
-		EgressPort:    cfg.SocksPort,
-		Profile:       cfg.AWGProfile,
 	}
 	s, err := ccfg.ImportString()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	p.render(w, "import", map[string]any{"CSRF": p.session(r).csrf, "Client": rec, "Import": s, "Active": "clients"})
+	p.render(w, "import", map[string]any{
+		"CSRF":   p.session(r).csrf,
+		"Client": rec,
+		"Import": s,
+		"Active": "clients",
+	})
+}
+
+// buildClientConfig assembles the full client bootstrap from the active hub
+// configuration and a client record. It uses the client's group for subnet and
+// gateway, fills carrier hashes for all modes, native endpoints when a public
+// IPv4 is configured, and managed routes from visible group subnets.
+func (p *Panel) buildClientConfig(rec store.ClientRecord, cfg config.ServerConfig) (config.ClientConfig, error) {
+	base := p.reg.InfoHash()
+	preferred := cfg.Transport
+	legacy := cfg.LegacyTransport
+	if legacy == "" {
+		legacy = preferred
+	}
+	hashes := make(map[string]string)
+	for _, mode := range []string{config.ModeExtUTP, config.ModeExtTCP, config.ModeReqUTP, config.ModeReqTCP} {
+		h, err := config.CarrierHash(base, legacy, mode)
+		if err != nil {
+			return config.ClientConfig{}, err
+		}
+		hashes[mode] = h
+	}
+
+	group, err := p.st.GetGroup(rec.GroupID)
+	if err != nil {
+		return config.ClientConfig{}, fmt.Errorf("load client group: %w", err)
+	}
+
+	routes, err := p.groupRoutes()
+	if err != nil {
+		return config.ClientConfig{}, err
+	}
+
+	ccfg := config.ClientConfig{
+		Version:       config.ClientVersion,
+		InfoHash:      hashes[preferred],
+		ServerPubKey:  p.reg.PubKey(),
+		ClientPrivKey: rec.PrivKey,
+		ClientPubKey:  rec.PubKey,
+		ClientIP:      rec.IP,
+		Subnet:        group.Subnet,
+		ServerIP:      group.ServerIP,
+		Transport:     preferred,
+		SocksPort:     1080,
+		EgressPort:    cfg.SocksPort,
+		Profile:       cfg.AWGProfile,
+		CarrierHashes: hashes,
+		Routes:        routes,
+	}
+
+	if cfg.ExternalIP != "" {
+		ccfg.CarrierEndpoint = net.JoinHostPort(cfg.ExternalIP, strconv.Itoa(cfg.CarrierPort))
+		ccfg.AWGEndpoint = net.JoinHostPort(cfg.ExternalIP, strconv.Itoa(cfg.AWGPort))
+		ccfg.WGEndpoint = net.JoinHostPort(cfg.ExternalIP, strconv.Itoa(cfg.WGPort))
+	}
+
+	return ccfg, nil
+}
+
+// Route all managed subnets; hub ACLs, not client routing, grant access.
+func (p *Panel) groupRoutes() ([]string, error) {
+	groups, err := p.st.ListGroups()
+	if err != nil {
+		return nil, err
+	}
+	routes := make([]string, 0, len(groups))
+	for _, g := range groups {
+		routes = append(routes, g.Subnet)
+	}
+	return routes, nil
+}
+
+// clientNative renders a standard WireGuard/AmneziaWG config for the selected
+// native mode. It requires a public ExternalIP and refuses revoked clients.
+func (p *Panel) clientNative(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	rec, err := p.st.GetClient(r.URL.Query().Get("id"))
+	if err != nil {
+		http.Error(w, "unknown client", http.StatusNotFound)
+		return
+	}
+	if rec.Revoked {
+		http.Error(w, "client revoked", http.StatusForbidden)
+		return
+	}
+	cfg := p.reg.Config()
+	if cfg.ExternalIP == "" {
+		http.Error(w, "native config requires a public ExternalIP", http.StatusPreconditionFailed)
+		return
+	}
+	mode := r.URL.Query().Get("mode")
+	if !config.IsNativeMode(mode) {
+		http.Error(w, "bad native mode", http.StatusBadRequest)
+		return
+	}
+	ccfg, err := p.buildClientConfig(rec, cfg)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	native, err := ccfg.NativeConfig(mode)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	p.render(w, "native", map[string]any{
+		"CSRF":   p.session(r).csrf,
+		"Client": rec,
+		"Mode":   mode,
+		"Config": native,
+		"Active": "clients",
+	})
+}
+
+// ---- groups ----
+
+func (p *Panel) groupsPage(w http.ResponseWriter, r *http.Request) {
+	groups, err := p.st.ListGroups()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	p.render(w, "groups", map[string]any{
+		"CSRF":   p.session(r).csrf,
+		"Groups": groups,
+		"Active": "groups",
+	})
+}
+
+func (p *Panel) groupEdit(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Query().Get("id")
+	var rec store.GroupRecord
+	if id != "" {
+		var err error
+		rec, err = p.st.GetGroup(id)
+		if err != nil {
+			http.Error(w, "unknown group", http.StatusNotFound)
+			return
+		}
+	}
+	p.render(w, "group-edit", map[string]any{
+		"CSRF":   p.session(r).csrf,
+		"Group":  rec,
+		"Active": "groups",
+	})
+}
+
+func (p *Panel) groupSave(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PostFormValue("id"))
+	if id == "" {
+		id = randHex(8)
+	}
+	rec := store.GroupRecord{
+		ID:         id,
+		Name:       strings.TrimSpace(r.PostFormValue("name")),
+		Subnet:     strings.TrimSpace(r.PostFormValue("subnet")),
+		ServerIP:   strings.TrimSpace(r.PostFormValue("server_ip")),
+		NoInternet: len(r.PostForm["internet"]) == 0,
+	}
+	if rec.Name == "" || rec.Subnet == "" || rec.ServerIP == "" {
+		http.Error(w, "name, subnet and server IP required", http.StatusBadRequest)
+		return
+	}
+	// VisibleGroups: nil = same group only, [] = none, ["*"] = all, explicit list.
+	switch r.PostFormValue("visible_mode") {
+	case "all":
+		rec.VisibleGroups = []string{"*"}
+	case "list":
+		rec.VisibleGroups = splitIDs(r.PostFormValue("visible_groups"))
+	case "none":
+		rec.VisibleGroups = []string{}
+	case "same":
+		fallthrough
+	default:
+		rec.VisibleGroups = nil
+	}
+
+	old, oldErr := p.st.GetGroup(rec.ID)
+	if err := p.st.SaveGroup(rec); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := p.reg.ReloadPolicy(); err != nil {
+		if oldErr == nil {
+			p.rollback(w, err, p.st.SaveGroup(old))
+		} else {
+			p.rollback(w, err, p.st.DeleteGroup(rec.ID))
+		}
+		return
+	}
+	http.Redirect(w, r, "/groups", http.StatusFound)
+}
+
+func (p *Panel) groupDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PostFormValue("id")
+	if id == "" || id == store.DefaultGroupID {
+		http.Error(w, "cannot delete default group", http.StatusBadRequest)
+		return
+	}
+	old, err := p.st.GetGroup(id)
+	if err != nil {
+		http.Error(w, "unknown group", http.StatusNotFound)
+		return
+	}
+	if err := p.st.DeleteGroup(id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := p.reg.ReloadPolicy(); err != nil {
+		p.rollback(w, err, p.st.SaveGroup(old))
+		return
+	}
+	http.Redirect(w, r, "/groups", http.StatusFound)
+}
+
+func (p *Panel) clientMove(w http.ResponseWriter, r *http.Request) {
+	id := r.PostFormValue("id")
+	groupID := strings.TrimSpace(r.PostFormValue("group_id"))
+	if groupID == "" {
+		groupID = store.DefaultGroupID
+	}
+	rec, err := p.st.GetClient(id)
+	if err != nil {
+		http.Error(w, "unknown client", http.StatusNotFound)
+		return
+	}
+	old := rec
+	if err := p.st.MoveClient(id, groupID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if err := p.reg.ReloadPolicy(); err != nil {
+		p.rollback(w, err, p.st.SaveClient(old))
+		return
+	}
+
+	http.Redirect(w, r, "/clients", http.StatusFound)
 }
 
 // ---- helpers ----
+
+func (p *Panel) rollback(w http.ResponseWriter, applyErr, restoreErr error) {
+	if restoreErr != nil {
+		http.Error(w, fmt.Sprintf("apply failed: %v; restore failed: %v", applyErr, restoreErr), http.StatusInternalServerError)
+		return
+	}
+	if err := p.reg.ReloadPolicy(); err != nil {
+		http.Error(w, fmt.Sprintf("apply failed: %v; reconcile failed: %v", applyErr, err), http.StatusInternalServerError)
+		return
+	}
+	http.Error(w, applyErr.Error(), http.StatusInternalServerError)
+}
+
+func hasValue(vals []string, want string) bool {
+	for _, v := range vals {
+		if v == want {
+			return true
+		}
+	}
+	return false
+}
+
+func splitIDs(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 func randHex(n int) string {
 	b := make([]byte, n)
@@ -424,27 +740,4 @@ func remoteIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
-}
-
-// nextFreeIP picks the first free host address in the /24 overlay.
-func nextFreeIP(subnet string, clients []store.ClientRecord) (string, error) {
-	prefix, err := netip.ParsePrefix(subnet)
-	if err != nil {
-		return "", fmt.Errorf("bad subnet: %w", err)
-	}
-	if !prefix.Addr().Is4() || prefix.Bits() < 24 {
-		return "", fmt.Errorf("only IPv4 /24+ overlays are supported")
-	}
-	b := prefix.Masked().Addr().As4()
-	used := make(map[string]bool)
-	for _, c := range clients {
-		used[c.IP] = true
-	}
-	for i := 2; i < 255; i++ {
-		candidate := netip.AddrFrom4([4]byte{b[0], b[1], b[2], byte(i)}).String()
-		if !used[candidate] {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("overlay subnet exhausted")
 }

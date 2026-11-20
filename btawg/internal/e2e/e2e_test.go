@@ -55,7 +55,7 @@ func newRelay(t *testing.T) string {
 // the running server, the open store, and the generated records. Records are
 // created in the store before server.New so the initial policy snapshot and
 // AWG peer configuration include every client.
-func hubWithClients(t *testing.T, ctx context.Context, relay string, specs []clientSpec) (*server.Server, *store.Store, []*store.ClientRecord) {
+func hubWithClients(t *testing.T, ctx context.Context, relay string, specs []clientSpec, transport string) (*server.Server, *store.Store, []*store.ClientRecord) {
 	t.Helper()
 	st, err := store.Open(t.TempDir() + "/hub.db")
 	if err != nil {
@@ -87,8 +87,9 @@ func hubWithClients(t *testing.T, ctx context.Context, relay string, specs []cli
 	}
 
 	hubCfg := config.DefaultServerConfig()
-	hubCfg.Transport = "ext-utp"
+	hubCfg.Transport = transport
 	hubCfg.CarrierPort = 17781
+	hubCfg.AWGPort, hubCfg.WGPort = 17807, 17808
 	hubCfg.ExternalIP = "127.0.0.1"
 
 	srv, err := server.New(hubCfg, st)
@@ -112,7 +113,7 @@ func clientConfigFor(srv *server.Server, rec *store.ClientRecord, relay, ip stri
 		ClientIP:      ip,
 		Subnet:        "10.77.0.0/24",
 		ServerIP:      "10.77.0.1",
-		Transport:     "ext-utp",
+		Transport:     srv.Config().Transport,
 		SocksPort:     0,
 		EgressPort:    1080,
 		Profile:       config.DefaultProfile(),
@@ -152,6 +153,12 @@ func waitSocksAddr(t *testing.T, c *client.Client) string {
 // internet egress via each client's SOCKS5 (TCP CONNECT and UDP ASSOCIATE)
 // and client-to-client reachability through the hub's forwarding.
 func TestEndToEndSocksAndLan(t *testing.T) {
+	for _, mode := range []string{"ext-utp", "ext-tcp", "req-utp", "req-tcp"} {
+		t.Run(mode, func(t *testing.T) { testEndToEndSocksAndLan(t, mode) })
+	}
+}
+
+func testEndToEndSocksAndLan(t *testing.T, mode string) {
 	relay := newRelay(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
@@ -159,7 +166,7 @@ func TestEndToEndSocksAndLan(t *testing.T) {
 	srv, _, recs := hubWithClients(t, ctx, relay, []clientSpec{
 		{id: "e2e-a", ip: "10.77.0.2"},
 		{id: "e2e-b", ip: "10.77.0.3"},
-	})
+	}, mode)
 	recA, recB := recs[0], recs[1]
 
 	ca, err := client.New(clientConfigFor(srv, recA, relay, "10.77.0.2"))
@@ -179,73 +186,33 @@ func TestEndToEndSocksAndLan(t *testing.T) {
 	socksA := waitSocksAddr(t, ca)
 	socksB := waitSocksAddr(t, cb)
 
-	// --- Internet egress via client A's SOCKS5: TCP CONNECT through the chain.
-	echoAddr := tcpEcho(t)
-	app := socks.NewClient(socksA)
-	var conn net.Conn
+	// Loopback TCP and UDP endpoints live on the hub, not on the Internet.
+	// A connected client must not be able to use SOCKS to reach either.
 	deadline := time.Now().Add(20 * time.Second)
-	for conn == nil {
-		dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
-		conn, err = app.Dial(dialCtx, "tcp", echoAddr)
-		dialCancel()
-		if err != nil {
-			if time.Now().After(deadline) {
-				t.Fatalf("egress dial never succeeded: %v", err)
-			}
-			time.Sleep(300 * time.Millisecond)
+	for _, ip := range []string{"10.77.0.2", "10.77.0.3"} {
+		waitConnected(t, srv, ip)
+	}
+	for _, addr := range []string{tcpEcho(t), "localhost:1"} {
+		dialCtx, stop := context.WithTimeout(ctx, 10*time.Second)
+		conn, e := socks.NewClient(socksA).Dial(dialCtx, "tcp", addr)
+		stop()
+		if e == nil {
+			conn.Close()
+			t.Fatalf("proxy accepted non-Internet target %s", addr)
 		}
 	}
-	if _, err := conn.Write([]byte("internet")); err != nil {
-		t.Fatalf("egress write: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-	buf := make([]byte, len("internet"))
-	if _, err := readFull(conn, buf); err != nil {
-		t.Fatalf("egress read: %v", err)
-	}
-	if string(buf) != "internet" {
-		t.Fatalf("egress echo = %q", buf)
-	}
-	conn.Close()
-
-	// --- Domain egress: a CONNECT carrying a hostname must resolve at the
-	// hub (DNS-at-hub), never on the client.
-	_, echoPort, _ := net.SplitHostPort(echoAddr)
-	dconn, err := app.Dial(ctx, "tcp", "localhost:"+echoPort)
-	if err != nil {
-		t.Fatalf("domain egress dial: %v", err)
-	}
-	defer dconn.Close()
-	if _, err := dconn.Write([]byte("byname")); err != nil {
-		t.Fatalf("domain egress write: %v", err)
-	}
-	dconn.SetReadDeadline(time.Now().Add(20 * time.Second))
-	dbuf := make([]byte, len("byname"))
-	if _, err := readFull(dconn, dbuf); err != nil {
-		t.Fatalf("domain egress read: %v", err)
-	}
-	if string(dbuf) != "byname" {
-		t.Fatalf("domain egress echo = %q", dbuf)
-	}
-
-	// --- Internet egress via client B's SOCKS5: UDP ASSOCIATE through the chain.
 	udp := udpEcho(t)
 	pc, err := socks.NewClient(socksB).DialUDP(ctx)
 	if err != nil {
 		t.Fatalf("udp associate: %v", err)
 	}
 	defer pc.Close()
-	if _, err := pc.WriteTo([]byte("udp-through-chain"), udp); err != nil {
-		t.Fatalf("udp write: %v", err)
+	if _, err = pc.WriteTo([]byte("must not reach hub loopback"), udp); err != nil {
+		t.Fatal(err)
 	}
-	pc.SetReadDeadline(time.Now().Add(5 * time.Second))
-	ubuf := make([]byte, 128)
-	n, _, err := pc.ReadFrom(ubuf)
-	if err != nil {
-		t.Fatalf("udp read: %v", err)
-	}
-	if string(ubuf[:n]) != "udp-through-chain" {
-		t.Fatalf("udp echo = %q", ubuf[:n])
+	pc.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if _, _, err = pc.ReadFrom(make([]byte, 64)); err == nil {
+		t.Fatal("UDP loopback echo leaked through proxy")
 	}
 
 	// --- Client-to-client: B dials A's overlay address directly (never
@@ -317,7 +284,7 @@ func TestRuntimeRegistration(t *testing.T) {
 
 	srv, st, recs := hubWithClients(t, ctx, relay, []clientSpec{
 		{id: "e2e-a", ip: "10.77.0.2"},
-	})
+	}, "ext-utp")
 	recA := recs[0]
 
 	// Bring client A online in the normal pre-registered path.
@@ -357,39 +324,15 @@ func TestRuntimeRegistration(t *testing.T) {
 	}
 	t.Cleanup(cb.Close)
 	go cb.Run(ctx)
-	socksB := waitSocksAddr(t, cb)
 	waitConnected(t, srv, "10.77.0.3")
 
-	// B's chained internet egress works immediately.
-	echoAddr := tcpEcho(t)
-	appB := socks.NewClient(socksB)
-	deadline := time.Now().Add(20 * time.Second)
-	var conn net.Conn
-	for conn == nil {
-		dialCtx, dialCancel := context.WithTimeout(ctx, 5*time.Second)
-		conn, err = appB.Dial(dialCtx, "tcp", echoAddr)
-		dialCancel()
-		if err != nil {
-			if time.Now().After(deadline) {
-				t.Fatalf("B egress dial never succeeded: %v", err)
-			}
-			time.Sleep(300 * time.Millisecond)
-		}
-	}
-	if _, err := conn.Write([]byte("runtime-egress")); err != nil {
-		t.Fatalf("B egress write: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-	buf := make([]byte, len("runtime-egress"))
-	if _, err := readFull(conn, buf); err != nil {
-		t.Fatalf("B egress read: %v", err)
-	}
-	if string(buf) != "runtime-egress" {
-		t.Fatalf("B egress echo = %q", buf)
-	}
-	conn.Close()
-
 	// B can reach A over the overlay (mutual visibility by default).
+	// A needs one authenticated data packet to activate its return path.
+	ready, err := ca.OverlayDialTCP(ctx, netip.MustParseAddrPort("10.77.0.1:1080"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready.Close()
 	lanALn, err := ca.OverlayListenTCP(9004)
 	if err != nil {
 		t.Fatalf("A lan listen: %v", err)
@@ -435,7 +378,7 @@ func TestPolicyIsolationLive(t *testing.T) {
 		{id: "e2e-a", ip: "10.77.0.2"},
 		{id: "e2e-b", ip: "10.77.0.3", noInternet: true},
 		{id: "e2e-c", ip: "10.77.0.4", visiblePeers: []string{}},
-	})
+	}, "ext-utp")
 	recA, recB, recC := recs[0], recs[1], recs[2]
 
 	ca, err := client.New(clientConfigFor(srv, recA, relay, "10.77.0.2"))
@@ -459,7 +402,6 @@ func TestPolicyIsolationLive(t *testing.T) {
 	t.Cleanup(cc.Close)
 	go cc.Run(ctx)
 
-	socksA := waitSocksAddr(t, ca)
 	socksB := waitSocksAddr(t, cb)
 	_ = waitSocksAddr(t, cc)
 
@@ -534,27 +476,6 @@ func TestPolicyIsolationLive(t *testing.T) {
 	}
 	if failElapsed > 4*time.Second {
 		t.Fatalf("B chained egress took %v, want fast close", failElapsed)
-	}
-
-	// --- A's chained internet egress still works.
-	appA := socks.NewClient(socksA)
-	dialCtx, dialCancel = context.WithTimeout(ctx, 20*time.Second)
-	aConn, err := appA.Dial(dialCtx, "tcp", echoAddr)
-	dialCancel()
-	if err != nil {
-		t.Fatalf("A chained egress: %v", err)
-	}
-	defer aConn.Close()
-	if _, err := aConn.Write([]byte("a-egress")); err != nil {
-		t.Fatalf("A egress write: %v", err)
-	}
-	aConn.SetReadDeadline(time.Now().Add(20 * time.Second))
-	ebuf := make([]byte, len("a-egress"))
-	if _, err := readFull(aConn, ebuf); err != nil {
-		t.Fatalf("A egress read: %v", err)
-	}
-	if string(ebuf) != "a-egress" {
-		t.Fatalf("A egress echo = %q", ebuf)
 	}
 
 	// --- B can still send packets to the hub itself (dst == serverIP passes

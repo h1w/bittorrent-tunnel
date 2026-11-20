@@ -20,16 +20,20 @@ import (
 // EndpointPort is the fixed overlay port every peer's IpcSet endpoint uses.
 const EndpointPort = 51820
 
-type endpointID struct{ addr netip.AddrPort }
+type endpointID struct {
+	addr    netip.AddrPort
+	session uint64
+}
 
 func (e endpointID) ClearSrc()           {}
 func (e endpointID) SrcToString() string { return "" }
 func (e endpointID) DstToString() string { return e.addr.String() }
 func (e endpointID) DstToBytes() []byte {
 	a := e.addr.Addr().As4()
-	b := make([]byte, 6)
+	b := make([]byte, 14)
 	copy(b, a[:])
 	binary.BigEndian.PutUint16(b[4:], e.addr.Port())
+	binary.BigEndian.PutUint64(b[6:], e.session)
 	return b
 }
 func (e endpointID) DstIP() netip.Addr { return e.addr.Addr() }
@@ -45,7 +49,6 @@ type Bind struct {
 	mu       sync.Mutex
 	carriers map[endpointID]carrier.Transport
 	closed   chan struct{}
-	once     sync.Once
 	inbox    chan tagged
 }
 
@@ -53,7 +56,7 @@ type Bind struct {
 func New() *Bind {
 	return &Bind{
 		carriers: make(map[endpointID]carrier.Transport),
-		inbox:    make(chan tagged, 512),
+		inbox:    make(chan tagged, 2048),
 	}
 }
 
@@ -115,18 +118,33 @@ func (b *Bind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 		return nil, 0, conn.ErrBindAlreadyOpen
 	}
 	b.closed = make(chan struct{})
+	closed := b.closed
 	fn := func(p [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+		var m tagged
 		select {
-		case m := <-b.inbox:
-			if len(m.data) > len(p[0]) {
-				return 0, net.ErrClosed
-			}
-			sizes[0] = copy(p[0], m.data)
-			eps[0] = m.ep
-			return 1, nil
-		case <-b.closed:
+		case m = <-b.inbox:
+		case <-closed:
 			return 0, net.ErrClosed
 		}
+		limit := min(len(p), len(sizes), len(eps), b.BatchSize())
+		for i := range limit {
+			if len(m.data) > len(p[i]) {
+				return i, net.ErrClosed
+			}
+			sizes[i] = copy(p[i], m.data)
+			eps[i] = m.ep
+			if i+1 == limit {
+				return i + 1, nil
+			}
+			select {
+			case m = <-b.inbox:
+			case <-closed:
+				return i + 1, nil
+			default:
+				return i + 1, nil
+			}
+		}
+		return 0, nil
 	}
 	return []conn.ReceiveFunc{fn}, port, nil
 }
@@ -138,15 +156,11 @@ func (b *Bind) Close() error {
 		b.mu.Unlock()
 		return nil
 	}
-	carriers := make([]carrier.Transport, 0, len(b.carriers))
-	for _, t := range b.carriers {
-		carriers = append(carriers, t)
-	}
+	carriers := b.carriers
 	b.carriers = make(map[endpointID]carrier.Transport)
+	close(b.closed)
+	b.closed = nil
 	b.mu.Unlock()
-	b.once.Do(func() {
-		close(b.closed)
-	})
 	for _, t := range carriers {
 		t.Close()
 	}
@@ -160,11 +174,11 @@ func (b *Bind) ParseEndpoint(s string) (conn.Endpoint, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse endpoint: %w", err)
 	}
-	return endpointID{a}, nil
+	return endpointID{addr: a}, nil
 }
 
-// BatchSize is 1: carriers deliver one datagram per call.
-func (b *Bind) BatchSize() int { return 1 }
+// BatchSize caps each receive batch; we never wait for a batch to fill.
+func (b *Bind) BatchSize() int { return 32 }
 
 // Send routes each buffer to the carrier registered under ep.
 func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
@@ -178,6 +192,11 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	if t == nil {
 		return fmt.Errorf("bind: no carrier for %s", e.DstToString())
 	}
+	if len(bufs) > 1 {
+		if t, ok := t.(interface{ SendBatch([][]byte) error }); ok {
+			return t.SendBatch(bufs)
+		}
+	}
 	for _, p := range bufs {
 		if err := t.Send(p); err != nil {
 			return err
@@ -188,5 +207,5 @@ func (b *Bind) Send(bufs [][]byte, ep conn.Endpoint) error {
 
 // Endpoint builds the overlay endpoint for a client IP.
 func Endpoint(ip netip.Addr) conn.Endpoint {
-	return endpointID{netip.AddrPortFrom(ip, EndpointPort)}
+	return endpointID{addr: netip.AddrPortFrom(ip, EndpointPort)}
 }

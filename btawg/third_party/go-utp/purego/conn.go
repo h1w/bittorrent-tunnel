@@ -30,9 +30,10 @@ const (
 	ackNrAllowedWindow = duplicateAcksBeforeResend
 	// How long the window must have been left alone before it may be decayed again.
 	maxWindowDecay = 100 * time.Millisecond
-	// The largest reorder distance we'll buffer, and the largest send queue we'll build.
-	reorderBufferMaxSize  = 1024
-	outgoingBufferMaxSize = 1024
+	// At WAN RTTs the packet cap can bite before the byte window. Keep both
+	// bounds well below half the wrapping 16-bit sequence space.
+	reorderBufferMaxSize  = 16384
+	outgoingBufferMaxSize = 16384
 	// The furthest a single delay sample may sit from the average delay baseline. Samples are
 	// wrapping distances over a peer supplied field, so without a bound a peer can pick one that
 	// no average over it can represent.
@@ -149,14 +150,18 @@ type Conn struct {
 
 	retransmitCount uint16
 	reorderCount    uint16
+	reorderBytes    int
 	duplicateAck    uint8
 	// Packets in the send queue, sent or not. The oldest unacked packet is seqNr-curWindowPackets.
 	curWindowPackets uint16
+	// Number of tail packets not yet examined since enqueue or timeout.
+	queuedPackets uint16
 	// Bytes in flight. Packets not yet sent, and packets a timeout has written off, don't count.
-	curWindow int
-	maxWindow int
-	optSndBuf int
-	optRcvBuf int
+	curWindow       int
+	maxWindow       int
+	windowRemainder float64
+	optSndBuf       int
+	optRcvBuf       int
 	// Congestion control target, in microseconds.
 	targetDelay int
 
@@ -323,7 +328,7 @@ func (c *Conn) packetSize() int {
 // The receive window to advertise: what's left of the receive buffer once buffered data is
 // accounted for.
 func (c *Conn) rcvWindow() int {
-	n := c.readBuf.len()
+	n := c.readBuf.len() + c.reorderBytes
 	if c.optRcvBuf > n {
 		return c.optRcvBuf - n
 	}
@@ -385,11 +390,11 @@ func (c *Conn) scheduleAck() {
 }
 
 // Stamps and sends a datagram that's already been built. This is the one place packets leave.
-func (c *Conn) sendData(b []byte, dontFragment bool) {
+func (c *Conn) sendData(b []byte, dontFragment bool, now uint64) {
 	if traceEnabled {
 		trace("SEND %d type=%v seq=%d ack=%d len=%d", c.connIDRecv, packetType(b[0]>>4), headerSeqNr(b), binary.BigEndian.Uint16(b[18:20]), len(b))
 	}
-	stampHeader(b, uint32(nowMicros()), c.replyMicro)
+	stampHeader(b, uint32(now), c.replyMicro)
 	c.lastSentPacket = c.s.currentMS
 	c.s.send(b, c.addr, dontFragment)
 	c.unscheduleAck()
@@ -410,7 +415,9 @@ func (c *Conn) unscheduleAck() {
 
 // Sends a state packet, carrying a selective ack if anything is sitting in the reorder buffer.
 func (c *Conn) sendAck(synack bool) {
-	var b [headerSize + 6]byte
+	// The extension length is a byte and BEP 29 requires multiples of four.
+	const maxMask = 252
+	var b [headerSize + 2 + maxMask]byte
 	c.lastRcvWin = c.rcvWindow()
 	h := header{
 		Type:    stState,
@@ -424,27 +431,25 @@ func (c *Conn) sendAck(synack bool) {
 	// There's never a reason to send a selective ack on a connection that's shutting down.
 	if c.reorderCount != 0 && !c.gotFinReached {
 		h.Extension = extSelectiveAck
-		var m uint32
-		// The mask starts at ackNr+2, because ackNr+1 is by definition the packet we're missing.
-		window := uint32(14 + 16)
-		if s := c.inbuf.size(); s < window {
-			window = s
-		}
-		for i := uint32(0); i < window; i++ {
+		// ackNr+1 is missing; bit zero describes ackNr+2. Shorten the
+		// mask to the last reported packet to keep ordinary ACKs small.
+		mask := b[headerSize+2:]
+		span := min(uint32(len(mask)*8), c.inbuf.size())
+		used := 0
+		for i := uint32(0); i < span; i++ {
 			if c.inbuf.get(uint32(c.ackNr)+i+2) != nil {
-				m |= 1 << i
+				j := int(i >> 3)
+				mask[j] |= 1 << (i & 7)
+				used = j + 1
 			}
 		}
+		used = max(4, (used+3)&^3)
 		b[headerSize] = extNone
-		b[headerSize+1] = 4
-		b[headerSize+2] = byte(m)
-		b[headerSize+3] = byte(m >> 8)
-		b[headerSize+4] = byte(m >> 16)
-		b[headerSize+5] = byte(m >> 24)
-		n += 6
+		b[headerSize+1] = byte(used)
+		n += 2 + used
 	}
 	h.marshalTo(b[:])
-	c.sendData(b[:n], false)
+	c.sendData(b[:n], false, nowMicros())
 }
 
 // Sends an ack for one before what we've actually received, to draw out a response from the peer
@@ -463,7 +468,14 @@ func (c *Conn) sendPacket(pkt *outgoingPacket) {
 	}
 	pkt.needResend = false
 	setHeaderAckNr(pkt.data, c.ackNr)
-	pkt.timeSent = nowMicros()
+	if tx := c.s.tx; tx != nil && tx.active {
+		if tx.stamp == 0 {
+			tx.stamp = nowMicros()
+		}
+		pkt.timeSent = tx.stamp
+	} else {
+		pkt.timeSent = nowMicros()
+	}
 
 	if c.mtuDiscoverTime < c.s.currentMS {
 		// Time to throw away our MTU assumptions and search again.
@@ -486,7 +498,7 @@ func (c *Conn) sendPacket(pkt *outgoingPacket) {
 		c.s.logf(logMTU, "%v: MTU [PROBE] floor:%d ceiling:%d current:%d", c, c.mtuFloor, c.mtuCeiling, c.mtuProbeSize)
 	}
 	pkt.transmissions++
-	c.sendData(pkt.data, useAsMTUProbe)
+	c.sendData(pkt.data, useAsMTUProbe, pkt.timeSent)
 }
 
 // Reports whether another bytes bytes may be put in flight. Pass -1 for a full packet.
@@ -497,12 +509,17 @@ func (c *Conn) isFull(bytes int) bool {
 	} else if bytes > ps {
 		bytes = ps
 	}
-	maxSend := min(c.maxWindow, c.optSndBuf, c.maxWindowUser)
-	// Leave one slot for the FIN.
+	// Leave one slot for the FIN. This is an enqueue limit, not a limit on
+	// sending packets already in the queue.
 	if int(c.curWindowPackets) >= outgoingBufferMaxSize-1 {
 		c.lastMaxedOutWindow = c.s.currentMS
 		return true
 	}
+	return c.windowFull(bytes)
+}
+
+func (c *Conn) windowFull(bytes int) bool {
+	maxSend := min(c.maxWindow, c.optSndBuf, c.maxWindowUser)
 	if c.curWindow+bytes > maxSend {
 		c.lastMaxedOutWindow = c.s.currentMS
 		return true
@@ -512,27 +529,28 @@ func (c *Conn) isFull(bytes int) bool {
 
 // Sends whatever is queued and allowed out. Returns whether it stopped because the window is full.
 func (c *Conn) flushPackets() bool {
-	ps := c.packetSize()
-	// i must wrap the same way sequence numbers do.
-	for i := c.seqNr - c.curWindowPackets; i != c.seqNr; i++ {
-		pkt := c.outbuf.get(uint32(i))
-		if pkt == nil || (pkt.transmissions > 0 && !pkt.needResend) {
+	c.queuedPackets = min(c.queuedPackets, c.curWindowPackets)
+	for c.queuedPackets != 0 {
+		pkt := c.outbuf.get(uint32(c.seqNr - c.queuedPackets))
+		if pkt == nil || pkt.transmissions > 0 && !pkt.needResend {
+			c.queuedPackets--
 			continue
 		}
-		if c.isFull(-1) {
+		if c.windowFull(pkt.payload) {
 			return true
 		}
-		// Nagle: hold back a partial packet while there's already one in flight.
-		if MatrixDisableNagle || i != (c.seqNr-1)&ackNrMask || c.curWindowPackets == 1 || pkt.payload >= ps {
-			c.sendPacket(pkt)
+		if !MatrixDisableNagle && c.queuedPackets == 1 && c.curWindowPackets > 1 && pkt.payload < c.packetSize() {
+			break
 		}
+		c.sendPacket(pkt)
+		c.queuedPackets--
 	}
 	return false
 }
+
 // MatrixDisableNagle is a send-policy switch: when true, flushPackets sends
 // partial packets immediately instead of holding them while one is in flight.
 var MatrixDisableNagle bool
-
 
 // Queues payload for sending, appending to the last unsent packet where there's room, and flushes.
 // flags is stData or stFin.
@@ -591,6 +609,7 @@ func (c *Conn) writeOutgoingPacket(payload []byte, flags packetType) {
 			c.outbuf.put(uint32(c.seqNr), pkt)
 			c.seqNr++
 			c.curWindowPackets++
+			c.queuedPackets++
 		}
 		if len(payload) == 0 {
 			break
@@ -610,6 +629,7 @@ func (c *Conn) maybeDecayWin(currentMS uint64) {
 	}
 	// TCP uses 0.5 here too.
 	c.maxWindow /= 2
+	c.windowRemainder = 0
 	c.lastRwinDecay = currentMS
 	if c.maxWindow < minWindowSize {
 		c.maxWindow = minWindowSize
@@ -620,7 +640,7 @@ func (c *Conn) maybeDecayWin(currentMS uint64) {
 
 // Acks the packet with the given sequence number. Reports 0 if it was acked now, 1 if it was
 // already acked or never sent, and 2 if it hasn't gone out yet.
-func (c *Conn) ackPacket(seq uint16) int {
+func (c *Conn) ackPacket(seq uint16, now uint64) int {
 	pkt := c.outbuf.get(uint32(seq))
 	if pkt == nil {
 		return 1
@@ -631,8 +651,8 @@ func (c *Conn) ackPacket(seq uint16) int {
 	c.outbuf.put(uint32(seq), nil)
 	// Only packets that went out exactly once produce a usable RTT sample: for anything resent
 	// there's no telling which transmission is being acked.
-	if pkt.transmissions == 1 {
-		ertt := uint32((nowMicros() - pkt.timeSent) / 1000)
+	if pkt.transmissions == 1 && now >= pkt.timeSent {
+		ertt := uint32((now - pkt.timeSent) / 1000)
 		if c.rtt == 0 {
 			c.rtt = ertt
 			c.rttVar = ertt / 2
@@ -645,7 +665,11 @@ func (c *Conn) ackPacket(seq uint16) int {
 			c.rtt = c.rtt - c.rtt/8 + ertt/8
 			c.rttHist.addSample(ertt, c.s.currentMS)
 		}
-		c.rto = max(c.rtt+c.rttVar*4, 1000)
+		floor := uint32(1000)
+		if c.s.paceBytesPerSecond > 0 {
+			floor = 250
+		}
+		c.rto = max(c.rtt+c.rttVar*4, floor)
 	}
 	c.retransmitTimeout = c.rto
 	c.rtoTimeout = c.s.currentMS + uint64(c.rto)
@@ -659,12 +683,11 @@ func (c *Conn) ackPacket(seq uint16) int {
 
 // Counts the bytes acked by a selective ack header, and folds the round trip times of those
 // packets into minRTT.
-func (c *Conn) selectiveAckBytes(base uint32, mask []byte, minRTT *int64) int {
+func (c *Conn) selectiveAckBytes(base uint32, mask []byte, minRTT *int64, now uint64) int {
 	if c.curWindowPackets == 0 {
 		return 0
 	}
 	ackedBytes := 0
-	now := nowMicros()
 	// Unlike libutp, which starts one bit past the end of the mask, we start at the last bit that
 	// actually exists. The extra iteration there can read a byte past the header.
 	for bits := len(mask)*8 - 1; bits >= -1; bits-- {
@@ -695,7 +718,7 @@ const maxEack = 128
 
 // Processes a selective ack header: acks what it reports received, and fast resends the gaps that
 // have enough acked packets in front of them to look like real loss.
-func (c *Conn) selectiveAck(base uint32, mask []byte) {
+func (c *Conn) selectiveAck(base uint32, mask []byte, now uint64) {
 	if c.curWindowPackets == 0 {
 		return
 	}
@@ -727,7 +750,7 @@ func (c *Conn) selectiveAck(base uint32, mask []byte) {
 			continue
 		}
 		if bitSet {
-			c.ackPacket(uint16(v))
+			c.ackPacket(uint16(v), now)
 			continue
 		}
 		// A gap. Only resend it if enough packets past it have been acked, and we haven't already
@@ -748,6 +771,11 @@ func (c *Conn) selectiveAck(base uint32, mask []byte) {
 		nr++
 	}
 
+	maxResends := 4
+	if c.s.paceBytesPerSecond > 0 {
+		// Pacing bounds the wire burst even when several holes are repaired.
+		maxResends = 12
+	}
 	backOff := false
 	for i := 0; nr > 0; {
 		nr--
@@ -762,7 +790,7 @@ func (c *Conn) selectiveAck(base uint32, mask []byte) {
 		c.sendPacket(pkt)
 		c.fastResendSeqNr = uint16(v+1) & ackNrMask
 		i++
-		if i >= 4 {
+		if i >= maxResends {
 			break
 		}
 	}
@@ -800,7 +828,13 @@ func (c *Conn) applyCControl(bytesAcked int, minRTT int64) {
 	// was just shrunk below what's being acked.
 	windowFactor := float64(min(bytesAcked, c.maxWindow)) / float64(max(c.maxWindow, bytesAcked))
 	delayFactor := offTarget / float64(target)
-	scaledGain := maxCwndIncreaseBytesPerRTT * windowFactor * delayFactor
+	maxGain := float64(maxCwndIncreaseBytesPerRTT)
+	if c.s.paceBytesPerSecond > 0 {
+		// Refill a loss-reduced WAN window faster without raising the
+		// configured send rate or changing the LEDBAT delay target.
+		maxGain *= 3
+	}
+	scaledGain := maxGain * windowFactor * delayFactor
 
 	if scaledGain > 0 && c.s.currentMS-c.lastMaxedOutWindow > 1000 {
 		// It's been more than a second since we last filled the window, so we're rate limited by
@@ -809,26 +843,37 @@ func (c *Conn) applyCControl(bytesAcked int, minRTT int64) {
 		scaledGain = 0
 	}
 
-	ledbatCwnd := minWindowSize
-	if float64(c.maxWindow)+scaledGain >= minWindowSize {
-		ledbatCwnd = int(float64(c.maxWindow) + scaledGain)
-	}
+	gain := scaledGain + c.windowRemainder
+	wholeGain := int(gain)
+	c.windowRemainder = gain - float64(wholeGain)
+	ledbatCwnd := c.maxWindow + wholeGain
 
 	if c.slowStart {
-		ssCwnd := int(float64(c.maxWindow) + windowFactor*float64(c.packetSize()))
-		if ssCwnd > c.ssthresh {
-			c.slowStart = false
-		} else if float64(ourDelay) > float64(target)*0.9 {
+		// In slow start grow by acknowledged bytes, doubling the window over
+		// a fully acknowledged flight, including when ACKs are coalesced.
+		ssCwnd := min(c.maxWindow+min(bytesAcked, c.maxWindow), c.ssthresh)
+		if float64(ourDelay) > float64(target)*0.9 {
 			// Even a little under the target is reason enough to stop growing exponentially.
 			c.slowStart = false
 			c.ssthresh = c.maxWindow
 		} else {
+			c.slowStart = ssCwnd < c.ssthresh
 			c.maxWindow = max(ssCwnd, ledbatCwnd)
 		}
 	} else {
 		c.maxWindow = ledbatCwnd
 	}
-	c.maxWindow = min(max(c.maxWindow, minWindowSize), c.optSndBuf)
+	window := min(max(c.maxWindow, minWindowSize), c.optSndBuf)
+	if c.s.paceBytesPerSecond > 0 && c.rttHist.initialized && ourDelay < int32(target/8) {
+		// Refill at most 90% of the paced bandwidth-delay product. Only
+		// do this when the queue is quiet; otherwise LEDBAT can back off.
+		floor := c.s.paceBytesPerSecond * int64(c.rttHist.delayBase) * 9 / 10_000
+		window = max(window, int(min(floor, int64(c.optSndBuf))))
+	}
+	if window != c.maxWindow {
+		c.windowRemainder = 0
+	}
+	c.maxWindow = window
 }
 
 // Runs the retransmit, keep alive and window reset timers. Called on every connection roughly
@@ -893,6 +938,7 @@ func (c *Conn) checkTimeouts() {
 
 		if !ignoreLoss {
 			c.duplicateAck = 0
+			c.windowRemainder = 0
 			ps := c.packetSize()
 			if c.curWindowPackets == 0 && c.maxWindow > ps {
 				// Nothing was in flight even though there could have been, so the connection is
@@ -909,6 +955,7 @@ func (c *Conn) checkTimeouts() {
 		}
 
 		// Everything outstanding is written off.
+		c.queuedPackets = c.curWindowPackets
 		for i := uint16(0); i < c.curWindowPackets; i++ {
 			pkt := c.outbuf.get(uint32(c.seqNr - i - 1))
 			if pkt == nil || pkt.transmissions == 0 || pkt.needResend {
@@ -944,13 +991,11 @@ func (c *Conn) checkTimeouts() {
 
 // Handles one incoming packet for this connection. syn is set for the SYN that created it, which
 // stops parsing once the header has been taken in. Returns the number of payload bytes consumed.
-func (c *Conn) processIncoming(p *packet, syn bool) {
+func (c *Conn) processIncoming(p *packet, syn bool, now uint64) {
 	currentMS := c.s.currentMS
 	pkSeqNr := p.h.SeqNr
 	pkAckNr := p.h.AckNr
 
-	// Mark receipt time before doing anything that could take a while.
-	now := nowMicros()
 	if traceEnabled {
 		trace("RECV %d type=%v seq=%d ack=%d payload=%d syn=%v state=%v myAck=%d mySeq=%d cwp=%d selack=%v", c.connIDRecv, p.h.Type, pkSeqNr, pkAckNr, len(p.payload), syn, c.state, c.ackNr, c.seqNr, c.curWindowPackets, p.selAck)
 	}
@@ -1050,7 +1095,7 @@ func (c *Conn) processIncoming(p *packet, syn bool) {
 		}
 	}
 	if p.selAck != nil {
-		ackedBytes += c.selectiveAckBytes((uint32(pkAckNr)+2)&ackNrMask, p.selAck, &minRTT)
+		ackedBytes += c.selectiveAckBytes((uint32(pkAckNr)+2)&ackNrMask, p.selAck, &minRTT, now)
 	}
 
 	c.lastMeasuredDelay = currentMS
@@ -1134,7 +1179,7 @@ func (c *Conn) processIncoming(p *packet, syn bool) {
 		}
 
 		for i := 0; i < acks; i++ {
-			status := c.ackPacket(c.seqNr - c.curWindowPackets)
+			status := c.ackPacket(c.seqNr-c.curWindowPackets, now)
 			// A packet that hasn't been sent yet can't be acked. This can happen when the ack
 			// number covers packets we've queued but not transmitted, and there's nothing past it
 			// worth looking at.
@@ -1172,7 +1217,7 @@ func (c *Conn) processIncoming(p *packet, syn bool) {
 	}
 
 	if p.selAck != nil {
-		c.selectiveAck((uint32(pkAckNr)+2)&ackNrMask, p.selAck)
+		c.selectiveAck((uint32(pkAckNr)+2)&ackNrMask, p.selAck, now)
 	}
 
 	// Acks free up window space, so send whatever the queue has been holding. libutp leaves this
@@ -1218,10 +1263,11 @@ func (c *Conn) processIncoming(p *packet, syn bool) {
 				c.rtoTimeout = currentMS + uint64(min(c.rto*3, 60))
 				c.gotEOF = true
 				c.cond.Broadcast()
-				// The peer wants to close, so ack it right away.
-				c.sendAck(false)
-				// Anything left in the reorder buffer is past the FIN, so drop it.
+				// Release any packets buffered beyond the peer's FIN.
+				clear(c.inbuf.elems)
 				c.reorderCount = 0
+				c.reorderBytes = 0
+				c.sendAck(false)
 				break
 			}
 			if c.reorderCount == 0 {
@@ -1232,6 +1278,7 @@ func (c *Conn) processIncoming(p *packet, syn bool) {
 				break
 			}
 			c.inbuf.put(uint32(c.ackNr+1), nil)
+			c.reorderBytes -= len(ip.data)
 			if len(ip.data) > 0 && !c.readShutdown {
 				c.readBuf.writeOwned(ip.data)
 				c.cond.Broadcast()
@@ -1247,8 +1294,8 @@ func (c *Conn) processIncoming(p *packet, syn bool) {
 		if c.gotFin && wrappingCompareLess(uint32(c.eofPkt), uint32(pkSeqNr), seqNrMask) {
 			return
 		}
-		// Don't size the reorder buffer from untrusted input alone.
-		if seqNr > 0x3ff {
+		if len(p.payload) > c.rcvWindow() {
+			c.scheduleAck()
 			return
 		}
 		// Grow before the duplicate check, so we don't look at an older packet that the smaller
@@ -1260,6 +1307,7 @@ func (c *Conn) processIncoming(p *packet, syn bool) {
 		}
 		c.inbuf.put(uint32(pkSeqNr), &inboundPacket{data: append([]byte(nil), p.payload...)})
 		c.reorderCount++
+		c.reorderBytes += len(p.payload)
 		c.scheduleAck()
 	}
 }
@@ -1407,6 +1455,13 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 func (c *Conn) writeNoWait(b []byte) int {
 	if c.state != csConnected || c.finSent {
 		return 0
+	}
+	if tx := c.s.tx; tx != nil && len(b) > c.packetSize() {
+		tx.active = true
+		defer func() {
+			tx.active = false
+			c.s.flushWrites()
+		}()
 	}
 	sent := 0
 	ps := c.packetSize()

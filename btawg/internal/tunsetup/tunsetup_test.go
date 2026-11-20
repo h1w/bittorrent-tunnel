@@ -1,6 +1,7 @@
 package tunsetup
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strconv"
@@ -67,6 +68,20 @@ func TestSetupRequiresRoot(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "10.99.0.1/24") {
 		t.Fatalf("interface address missing from ip output:\n%s", out)
+	}
+
+	link, err := exec.Command("ip", "-j", "link", "show", "dev", name).Output()
+	if err != nil {
+		t.Fatalf("ip link show: %v", err)
+	}
+	var links []struct {
+		QueueLength int `json:"txqlen"`
+	}
+	if err := json.Unmarshal(link, &links); err != nil {
+		t.Fatalf("decode ip link output: %v", err)
+	}
+	if len(links) != 1 || links[0].QueueLength < 2048 {
+		t.Fatalf("TUN queue too small to absorb bursts: %s", link)
 	}
 
 	routes, err := exec.Command("ip", "route", "show", "dev", name).Output()

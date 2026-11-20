@@ -6,9 +6,13 @@
 package config
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/netip"
 	"strings"
 )
 
@@ -18,6 +22,42 @@ const ImportPrefix = "btawg://"
 // ClientVersion is the only import-string format version accepted by
 // ParseImportString.
 const ClientVersion = 1
+
+// Supported client transport modes.
+const (
+	ModeExtUTP = "ext-utp"
+	ModeExtTCP = "ext-tcp"
+	ModeReqUTP = "req-utp"
+	ModeReqTCP = "req-tcp"
+	ModeAWG    = "awg"
+	ModeWG     = "wg"
+)
+
+// clientModes is the ordered list used for help text and validation.
+var clientModes = []string{ModeExtUTP, ModeExtTCP, ModeReqUTP, ModeReqTCP, ModeAWG, ModeWG}
+
+// IsCarrierMode reports whether mode uses the BitTorrent carrier path.
+func IsCarrierMode(mode string) bool {
+	switch mode {
+	case ModeExtUTP, ModeExtTCP, ModeReqUTP, ModeReqTCP:
+		return true
+	}
+	return false
+}
+
+// IsNativeMode reports whether mode uses a direct AWG or WireGuard UDP path.
+func IsNativeMode(mode string) bool {
+	switch mode {
+	case ModeAWG, ModeWG:
+		return true
+	}
+	return false
+}
+
+// ValidClientMode reports whether mode is one of the supported modes.
+func ValidClientMode(mode string) bool {
+	return IsCarrierMode(mode) || IsNativeMode(mode)
+}
 
 // AWGProfile holds the AmneziaWG obfuscation parameters shared by the server
 // hub and every client.
@@ -53,19 +93,24 @@ func (p AWGProfile) String() string {
 // issued by the server panel. ServerIP is the overlay hub address, not a
 // reachable endpoint: it exists only inside the tunnel.
 type ClientConfig struct {
-	Version       int        `json:"version"`
-	InfoHash      string     `json:"infohash"`       // 20-byte hex
-	ServerPubKey  string     `json:"server_pubkey"`  // hex
-	ClientPrivKey string     `json:"client_privkey"` // hex (secret)
-	ClientPubKey  string     `json:"client_pubkey"`  // hex
-	ClientIP      string     `json:"client_ip"`      // overlay, e.g. 10.77.0.2
-	Subnet        string     `json:"subnet"`         // overlay, e.g. 10.77.0.0/24
-	ServerIP      string     `json:"server_ip"`      // overlay hub, e.g. 10.77.0.1
-	Transport     string     `json:"transport"`      // ext-utp|ext-tcp|req-utp|req-tcp
-	SocksPort     int        `json:"socks_port"`     // client's local no-auth SOCKS5
-	EgressPort    int        `json:"egress_port"`    // hub's overlay SOCKS5 the chain targets
-	Profile       AWGProfile `json:"awg_profile"`
-	DHTBootstrap  []string   `json:"dht_bootstrap,omitempty"`
+	Version         int               `json:"version"`
+	InfoHash        string            `json:"infohash"`       // legacy 20-byte hex (old framing)
+	ServerPubKey    string            `json:"server_pubkey"`  // hex
+	ClientPrivKey   string            `json:"client_privkey"` // hex (secret)
+	ClientPubKey    string            `json:"client_pubkey"`  // hex
+	ClientIP        string            `json:"client_ip"`      // overlay, e.g. 10.77.0.2
+	Subnet          string            `json:"subnet"`         // overlay, e.g. 10.77.0.0/24
+	ServerIP        string            `json:"server_ip"`      // overlay hub, e.g. 10.77.0.1
+	Transport       string            `json:"transport"`      // user-selected mode
+	SocksPort       int               `json:"socks_port"`     // client's local no-auth SOCKS5
+	EgressPort      int               `json:"egress_port"`    // hub's overlay SOCKS5 the chain targets
+	Profile         AWGProfile        `json:"awg_profile"`
+	DHTBootstrap    []string          `json:"dht_bootstrap,omitempty"`
+	CarrierHashes   map[string]string `json:"carrier_hashes,omitempty"`   // mode -> 20-byte hex infohash
+	CarrierEndpoint string            `json:"carrier_endpoint,omitempty"` // public IPv4 address and carrier port
+	AWGEndpoint     string            `json:"awg_endpoint,omitempty"`     // host:port for native AWG
+	WGEndpoint      string            `json:"wg_endpoint,omitempty"`      // host:port for native WG
+	Routes          []string          `json:"routes,omitempty"`           // managed VPN CIDRs (no default route)
 }
 
 // ImportString encodes the config as btawg:// + base64url(JSON).
@@ -96,21 +141,231 @@ func ParseImportString(s string) (ClientConfig, error) {
 	return c, nil
 }
 
+// framing returns the carrier framing family of a mode: "ext" or "req".
+// Native modes have no carrier framing.
+func framing(mode string) string {
+	if i := strings.Index(mode, "-"); i > 0 {
+		return mode[:i]
+	}
+	return mode
+}
+
+// CarrierHash returns a deterministic 20-byte hex infohash for a carrier mode.
+// The base infohash is preserved for every mode that shares the preferred
+// mode's framing family (ext or req) so old clients and old hub imports keep
+// working; the other framing family gets a stable derivative.
+func CarrierHash(base, preferred, mode string) (string, error) {
+	if mode == "" {
+		return "", fmt.Errorf("mode required")
+	}
+	if err := validateInfoHash(base); err != nil {
+		return "", fmt.Errorf("invalid base infohash: %w", err)
+	}
+	if framing(mode) == framing(preferred) {
+		return base, nil
+	}
+	h := sha256.New()
+	h.Write([]byte(base))
+	h.Write([]byte(framing(mode)))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum[:20]), nil
+}
+
+// NativeConfig renders a wg-quick / awg-quick INI configuration for direct
+// native modes. Keys are exported as base64, the endpoint is the real public
+// UDP endpoint, and AllowedIPs come from Routes (no default route).
+func (c ClientConfig) NativeConfig(mode string) (string, error) {
+	if !IsNativeMode(mode) {
+		return "", fmt.Errorf("native mode must be %q or %q, got %q", ModeAWG, ModeWG, mode)
+	}
+	privB64, pubB64, endpoint, routes, err := c.nativeCommon(mode)
+	if err != nil {
+		return "", err
+	}
+
+	subnet, err := netip.ParsePrefix(c.Subnet)
+	if err != nil || !subnet.Addr().Is4() || subnet.Bits() == 0 {
+		return "", fmt.Errorf("invalid IPv4 subnet %q", c.Subnet)
+	}
+
+	var b strings.Builder
+	b.WriteString("[Interface]\n")
+	fmt.Fprintf(&b, "PrivateKey = %s\n", privB64)
+	fmt.Fprintf(&b, "Address = %s/%d\n", c.ClientIP, subnet.Bits())
+	fmt.Fprintf(&b, "MTU = 1420\n")
+	if mode == ModeAWG {
+		p := c.Profile
+		fmt.Fprintf(&b, "Jc = %d\nJmin = %d\nJmax = %d\n", p.JC, p.JMin, p.JMax)
+		fmt.Fprintf(&b, "S1 = %d\nS2 = %d\nS3 = %d\nS4 = %d\n", p.S1, p.S2, p.S3, p.S4)
+		fmt.Fprintf(&b, "H1 = %d\nH2 = %d\nH3 = %d\nH4 = %d\n", p.H1, p.H2, p.H3, p.H4)
+	}
+	b.WriteString("\n[Peer]\n")
+	fmt.Fprintf(&b, "PublicKey = %s\n", pubB64)
+	fmt.Fprintf(&b, "AllowedIPs = %s\n", strings.Join(routes, ", "))
+	fmt.Fprintf(&b, "Endpoint = %s\n", endpoint)
+	fmt.Fprintf(&b, "PersistentKeepalive = 25\n")
+	return b.String(), nil
+}
+
+// NativeDeviceConfig renders the line-oriented IPC configuration consumed by
+// the AmneziaWG device for native modes. Keys are kept as hex (the engine's
+// IPC format) and routes use allowed_ip stanzas.
+func (c ClientConfig) NativeDeviceConfig(mode string) (string, error) {
+	if !IsNativeMode(mode) {
+		return "", fmt.Errorf("native mode must be %q or %q, got %q", ModeAWG, ModeWG, mode)
+	}
+	_, _, endpoint, _, err := c.nativeCommon(mode)
+	if err != nil {
+		return "", err
+	}
+	if c.ClientPrivKey == "" {
+		return "", fmt.Errorf("client private key required")
+	}
+	if c.ServerPubKey == "" {
+		return "", fmt.Errorf("server public key required")
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "private_key=%s\n", c.ClientPrivKey)
+	if mode == ModeAWG {
+		b.WriteString(c.Profile.String())
+	}
+	b.WriteString("replace_peers=true\n")
+	fmt.Fprintf(&b, "public_key=%s\n", c.ServerPubKey)
+	// The device accepts any inner source so that the hub can forward
+	// overlay replies, internet unicast traffic, and user-managed routes.
+	b.WriteString("allowed_ip=0.0.0.0/0\n")
+	fmt.Fprintf(&b, "endpoint=%s\n", endpoint)
+	b.WriteString("persistent_keepalive_interval=25\n")
+	return b.String(), nil
+}
+
+// nativeCommon validates keys and endpoint and returns the managed VPN routes
+// shared by the export renderer and the internal IPC renderer.
+func (c ClientConfig) nativeCommon(mode string) (privB64, pubB64, endpoint string, routes []string, err error) {
+	if c.ClientPrivKey == "" {
+		return "", "", "", nil, fmt.Errorf("client private key required")
+	}
+	if c.ServerPubKey == "" {
+		return "", "", "", nil, fmt.Errorf("server public key required")
+	}
+	privB64, err = keyHexToBase64(c.ClientPrivKey)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("client private key: %w", err)
+	}
+	pubB64, err = keyHexToBase64(c.ServerPubKey)
+	if err != nil {
+		return "", "", "", nil, fmt.Errorf("server public key: %w", err)
+	}
+
+	endpoint = c.AWGEndpoint
+	if mode == ModeWG {
+		endpoint = c.WGEndpoint
+	}
+	if endpoint == "" {
+		return "", "", "", nil, fmt.Errorf("no %s endpoint in config", mode)
+	}
+	if _, _, err := net.SplitHostPort(endpoint); err != nil {
+		return "", "", "", nil, fmt.Errorf("invalid %s endpoint %q: %w", mode, endpoint, err)
+	}
+
+	routes, err = c.nativeRoutes()
+	if err != nil {
+		return "", "", "", nil, err
+	}
+	return privB64, pubB64, endpoint, routes, nil
+}
+
+// nativeRoutes returns the managed VPN CIDRs to advertise to the peer.
+// It falls back to the client subnet when no explicit routes are present,
+// always ensures the hub overlay address is reachable, and rejects IPv6 and
+// default routes.
+func (c ClientConfig) nativeRoutes() ([]string, error) {
+	routes := make([]string, 0, len(c.Routes)+2)
+	for _, r := range c.Routes {
+		p, err := netip.ParsePrefix(r)
+		if err != nil {
+			return nil, fmt.Errorf("invalid route %q: %w", r, err)
+		}
+		if !p.Addr().Is4() {
+			return nil, fmt.Errorf("IPv6 routes are not supported: %q", r)
+		}
+		if p.Bits() == 0 {
+			return nil, fmt.Errorf("default route is not allowed: %q", r)
+		}
+		routes = append(routes, p.Masked().String())
+	}
+	if len(routes) == 0 {
+		p, err := netip.ParsePrefix(c.Subnet)
+		if err != nil {
+			return nil, fmt.Errorf("invalid subnet %q: %w", c.Subnet, err)
+		}
+		if !p.Addr().Is4() {
+			return nil, fmt.Errorf("IPv6 subnet is not supported: %q", c.Subnet)
+		}
+		if p.Bits() == 0 {
+			return nil, fmt.Errorf("default subnet is not allowed: %q", c.Subnet)
+		}
+		routes = append(routes, p.Masked().String())
+	}
+
+	serverIP, err := netip.ParseAddr(c.ServerIP)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server_ip %q: %w", c.ServerIP, err)
+	}
+	if !serverIP.Is4() {
+		return nil, fmt.Errorf("IPv6 server_ip is not supported: %q", c.ServerIP)
+	}
+	coversServer := false
+	for _, r := range routes {
+		p := netip.MustParsePrefix(r)
+		if p.Contains(serverIP) {
+			coversServer = true
+			break
+		}
+	}
+	if !coversServer {
+		routes = append(routes, netip.PrefixFrom(serverIP, serverIP.BitLen()).String())
+	}
+	return routes, nil
+}
+
+func validateInfoHash(s string) error {
+	if len(s) != 40 {
+		return fmt.Errorf("infohash must be 40 hex chars, got %d", len(s))
+	}
+	if _, err := hex.DecodeString(s); err != nil {
+		return fmt.Errorf("infohash must be hex: %w", err)
+	}
+	return nil
+}
+
+func keyHexToBase64(s string) (string, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return "", fmt.Errorf("invalid key")
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
+}
+
 // ServerConfig is the persistent hub configuration edited through the web
 // panel. ExternalIP is the announced carrier address; empty means autodetect
 // from the default-route interface.
 type ServerConfig struct {
-	AWGProfile    AWGProfile `json:"awg_profile"`
-	Subnet        string     `json:"subnet"`
-	ServerIP      string     `json:"server_ip"`
-	Transport     string     `json:"transport"`
-	CarrierPort   int        `json:"carrier_port"`
-	SocksPort     int        `json:"socks_port"`
-	PanelPort     int        `json:"panel_port"`
-	ExternalIP    string     `json:"external_ip"`
-	InfoHash      string     `json:"infohash"`        // 20-byte hex, generated at first boot
-	ServerPrivKey string     `json:"server_privkey"`  // hex (secret), generated at first boot
-	AdminPassHash string     `json:"admin_pass_hash"` // bcrypt hash of the panel password
+	AWGProfile      AWGProfile `json:"awg_profile"`
+	Subnet          string     `json:"subnet"`
+	ServerIP        string     `json:"server_ip"`
+	Transport       string     `json:"transport"`
+	LegacyTransport string     `json:"legacy_transport,omitempty"`
+	CarrierPort     int        `json:"carrier_port"`
+	AWGPort         int        `json:"awg_port"`
+	WGPort          int        `json:"wg_port"`
+	SocksPort       int        `json:"socks_port"`
+	PanelPort       int        `json:"panel_port"`
+	ExternalIP      string     `json:"external_ip"`
+	InfoHash        string     `json:"infohash"`        // 20-byte hex, generated at first boot
+	ServerPrivKey   string     `json:"server_privkey"`  // hex (secret), generated at first boot
+	AdminPassHash   string     `json:"admin_pass_hash"` // bcrypt hash of the panel password
 }
 
 // DefaultServerConfig returns the shipped defaults used when the store has no
@@ -122,7 +377,42 @@ func DefaultServerConfig() ServerConfig {
 		ServerIP:    "10.77.0.1",
 		Transport:   "ext-utp",
 		CarrierPort: 6881,
+		AWGPort:     51821,
+		WGPort:      51820,
 		SocksPort:   1080,
 		PanelPort:   8080,
+	}
+}
+
+// Normalize fills zero values with the shipped defaults. It is intended for
+// persisted legacy configs that predate the native AWG/WG listener ports.
+func (c *ServerConfig) Normalize() {
+	def := DefaultServerConfig()
+	if c.AWGProfile == (AWGProfile{}) {
+		c.AWGProfile = def.AWGProfile
+	}
+	if c.Subnet == "" {
+		c.Subnet = def.Subnet
+	}
+	if c.ServerIP == "" {
+		c.ServerIP = def.ServerIP
+	}
+	if c.Transport == "" {
+		c.Transport = def.Transport
+	}
+	if c.CarrierPort == 0 {
+		c.CarrierPort = def.CarrierPort
+	}
+	if c.AWGPort == 0 {
+		c.AWGPort = def.AWGPort
+	}
+	if c.WGPort == 0 {
+		c.WGPort = def.WGPort
+	}
+	if c.SocksPort == 0 {
+		c.SocksPort = def.SocksPort
+	}
+	if c.PanelPort == 0 {
+		c.PanelPort = def.PanelPort
 	}
 }

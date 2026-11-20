@@ -16,34 +16,30 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
-	utp "github.com/anacrolix/go-utp"
-	"github.com/anacrolix/go-utp/purego"
 
 	"bittorrent-tunnel/btawg/internal/awg"
-	"bittorrent-tunnel/btawg/internal/bind"
+	carrierbind "bittorrent-tunnel/btawg/internal/bind"
 	"bittorrent-tunnel/btawg/internal/carrier"
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/dht"
 	"bittorrent-tunnel/btawg/internal/socks"
+	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
-
-// Real-time traffic must not wait on µTP's Nagle-like holdback: set the
-// global send policy once, before any goroutine can race on it.
-func init() { purego.MatrixDisableNagle = true }
 
 // retryDelay spaces carrier reconnect attempts.
 const retryDelay = 3 * time.Second
 
 // Client is the assembled btawg client node.
 type Client struct {
-	cfg config.ClientConfig
-	bd  *bind.Bind
-	dev *device.Device
-	ns  *netstack.Net // non-nil in netstack mode
-	tun tun.Device    // non-nil in real-TUN mode
+	cfg  config.ClientConfig
+	bind conn.Bind
+	dev  *device.Device
+	ns   *netstack.Net // non-nil in netstack mode
+	tun  tun.Device    // non-nil in real-TUN mode
 
 	chainTCP func(ctx context.Context, addr string) (net.Conn, error)
 	chainUDP func(ctx context.Context) (net.PacketConn, error)
@@ -56,10 +52,7 @@ type Client struct {
 // New builds the client in userspace netstack mode: the overlay lives inside
 // the process and the SOCKS5 chain dials through it.
 func New(cfg config.ClientConfig) (*Client, error) {
-	c := &Client{
-		cfg: cfg,
-		bd:  bind.New(),
-	}
+	c := &Client{cfg: cfg}
 	clientIP := netip.MustParseAddr(cfg.ClientIP)
 	tunDev, ns, err := netstack.CreateNetTUN([]netip.Addr{clientIP}, nil, 1420)
 	if err != nil {
@@ -88,10 +81,7 @@ func New(cfg config.ClientConfig) (*Client, error) {
 // overlay address and subnet route are configured by the caller (main);
 // nothing here takes over the default route.
 func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
-	c := &Client{
-		cfg: cfg,
-		bd:  bind.New(),
-	}
+	c := &Client{cfg: cfg}
 	tunDev, err := tun.CreateTUN(tunName, 1420)
 	if err != nil {
 		return nil, fmt.Errorf("create tun: %w", err)
@@ -100,7 +90,16 @@ func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
 	if err := c.start(tunDev); err != nil {
 		return nil, err
 	}
-	// Kernel defaults: the overlay route on the TUN carries chain traffic.
+	clientIP := netip.MustParseAddr(cfg.ClientIP)
+	dialer := net.Dialer{Control: tunsetup.OverlayTCP}
+	c.chainTCP = func(ctx context.Context, addr string) (net.Conn, error) {
+		return dialer.DialContext(ctx, "tcp4", addr)
+	}
+	c.chainUDP = func(ctx context.Context) (net.PacketConn, error) {
+		// Bind the overlay source address so the kernel selects the TUN
+		// interface for traffic to the hub's SOCKS5 UDP relay.
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IP(clientIP.AsSlice())})
+	}
 	return c, nil
 }
 
@@ -111,24 +110,78 @@ func (c *Client) start(tunDev tun.Device) error {
 		// the wire when the tunnel does not come up.
 		level = device.LogLevelVerbose
 	}
-	c.dev = device.NewDevice(tunDev, c.bd, device.NewLogger(level, "btawg-client: "))
-	if err := c.dev.IpcSet(awg.ClientConf(c.cfg)); err != nil {
+
+	mode := c.cfg.Transport
+	if config.IsNativeMode(mode) {
+		c.bind = conn.NewDefaultBind()
+	} else {
+		c.bind = carrierbind.New()
+	}
+
+	c.dev = device.NewDevice(tunDev, c.bind, device.NewLogger(level, "btawg-client: "))
+
+	var ipc string
+	var err error
+	if config.IsNativeMode(mode) {
+		ipc, err = c.cfg.NativeDeviceConfig(mode)
+	} else {
+		ipc = awg.ClientConf(c.cfg)
+	}
+	if err != nil {
+		c.dev.Close()
+		return fmt.Errorf("client config (%s): %w", mode, err)
+	}
+	if err := c.dev.IpcSet(ipc); err != nil {
 		c.dev.Close()
 		return fmt.Errorf("client IpcSet: %w", err)
 	}
-	infoHash, err := awg.InfoHashBytes(c.cfg.InfoHash)
-	if err != nil {
+	if err := c.dev.Up(); err != nil {
 		c.dev.Close()
-		return fmt.Errorf("config infohash: %w", err)
+		return fmt.Errorf("client up: %w", err)
 	}
-	c.disc = func(ctx context.Context) ([]netip.AddrPort, error) {
-		return dht.Discover(ctx, infoHash, c.cfg.DHTBootstrap)
+
+	if config.IsCarrierMode(mode) {
+		hash, err := c.carrierInfoHash()
+		if err != nil {
+			c.dev.Close()
+			return fmt.Errorf("carrier infohash: %w", err)
+		}
+		infoHash, err := awg.InfoHashBytes(hash)
+		if err != nil {
+			c.dev.Close()
+			return fmt.Errorf("config infohash: %w", err)
+		}
+		if c.cfg.CarrierEndpoint != "" {
+			ap, err := netip.ParseAddrPort(c.cfg.CarrierEndpoint)
+			if err != nil || !ap.Addr().Is4() || ap.Addr().IsUnspecified() || ap.Port() == 0 {
+				c.dev.Close()
+				return fmt.Errorf("invalid carrier endpoint %q", c.cfg.CarrierEndpoint)
+			}
+			c.disc = func(context.Context) ([]netip.AddrPort, error) { return []netip.AddrPort{ap}, nil }
+			return nil
+		}
+		c.disc = func(ctx context.Context) ([]netip.AddrPort, error) {
+			return dht.Discover(ctx, infoHash, c.cfg.DHTBootstrap)
+		}
 	}
 	return nil
 }
 
-// SetDiscovery replaces the DHT discovery function (tests inject a relay or a
-// direct address; production always uses DHT).
+// carrierInfoHash returns the infohash to use for the selected carrier mode.
+// It prefers an explicit entry in CarrierHashes and falls back to the legacy
+// base InfoHash for backward compatibility.
+func (c *Client) carrierInfoHash() (string, error) {
+	mode := c.cfg.Transport
+	if h := c.cfg.CarrierHashes[mode]; h != "" {
+		if _, err := awg.InfoHashBytes(h); err != nil {
+			return "", fmt.Errorf("invalid carrier hash for %s: %w", mode, err)
+		}
+		return h, nil
+	}
+	return c.cfg.InfoHash, nil
+}
+
+// SetDiscovery replaces endpoint selection for an integration test.
 func (c *Client) SetDiscovery(fn func(ctx context.Context) ([]netip.AddrPort, error)) {
 	if fn != nil {
 		c.disc = fn
@@ -164,8 +217,9 @@ func (c *Client) OverlayListenTCP(port uint16) (net.Listener, error) {
 	return c.ns.ListenTCPAddrPort(netip.AddrPortFrom(netip.MustParseAddr(c.cfg.ClientIP), port))
 }
 
-// Run serves the local SOCKS5 and keeps a carrier connection to the hub
-// alive: discovery is always through DHT, and a dead carrier reconnects.
+// Run serves the local SOCKS5 and keeps the data path alive. In carrier modes
+// it discovers the hub via DHT and reconnects on failure; in native modes it
+// relies on the direct UDP endpoint configured in the import string.
 func (c *Client) Run(ctx context.Context) error {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", c.cfg.SocksPort))
 	if err != nil {
@@ -180,7 +234,13 @@ func (c *Client) Run(ctx context.Context) error {
 	})
 	go local.Serve(ctx, ln)
 
-	serverEp := bind.Endpoint(serverIP)
+	if config.IsNativeMode(c.cfg.Transport) {
+		<-ctx.Done()
+		return nil
+	}
+
+	serverEp := carrierbind.Endpoint(serverIP)
+	hash, _ := c.carrierInfoHash()
 	for {
 		// DHT announces may not have landed yet when we look: retry the
 		// discovery for a bounded window, then fail explicitly.
@@ -203,7 +263,7 @@ func (c *Client) Run(ctx context.Context) error {
 			}
 		}
 		if len(addrs) == 0 {
-			return fmt.Errorf("dht discovery: %v (infohash %s)", discErr, c.cfg.InfoHash)
+			return fmt.Errorf("dht discovery: %v (infohash %s)", discErr, hash)
 		}
 		t, err := c.connectCarrier(ctx, addrs[0])
 		if err != nil {
@@ -221,27 +281,37 @@ func (c *Client) Run(ctx context.Context) error {
 			continue
 		}
 		fmt.Printf("btawg-client: carrier connected to %s\n", addrs[0])
-		c.bd.Attach(serverEp, t)
+		c.bind.(*carrierbind.Bind).Attach(serverEp, t)
+		var key device.NoisePublicKey
+		if key.FromHex(c.cfg.ServerPubKey) == nil {
+			if peer := c.dev.LookupPeer(key); peer != nil {
+				peer.SendKeepalive()
+			}
+		}
 		select {
 		case <-t.Done():
-			c.bd.Detach(serverEp)
+			c.bind.(*carrierbind.Bind).Detach(serverEp)
 			select {
 			case <-ctx.Done():
 				return nil
 			case <-time.After(retryDelay):
 			}
 		case <-ctx.Done():
-			c.bd.Detach(serverEp)
+			c.bind.(*carrierbind.Bind).Detach(serverEp)
 			return nil
 		}
 	}
 }
 
-// connectCarrier dials the hub's real carrier address (learned via DHT) over
+// connectCarrier dials the hub's carrier address over
 // the host network and performs the BitTorrent handshake. This dial never
 // goes through the tunnel: the carrier IS the tunnel's transport.
 func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carrier.Transport, error) {
-	infoHash, err := awg.InfoHashBytes(c.cfg.InfoHash)
+	hash, err := c.carrierInfoHash()
+	if err != nil {
+		return nil, err
+	}
+	infoHash, err := awg.InfoHashBytes(hash)
 	if err != nil {
 		return nil, err
 	}
@@ -250,18 +320,14 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 		return nil, err
 	}
 	var conn net.Conn
+	var closeSocket func() error
 	switch c.cfg.Transport {
-	case "ext-utp", "req-utp":
+	case config.ModeExtUTP, config.ModeReqUTP:
 		pc, err := net.ListenUDP("udp4", nil)
 		if err != nil {
 			return nil, fmt.Errorf("carrier udp: %w", err)
 		}
-		// 100 ms target delay is the library default (what the rest of the
-		// µTP network uses); buffers are 4 MiB so the window can cover the
-		// bandwidth-delay product of fast WAN paths. The 64 KiB / 5 ms
-		// tuning formerly here strangled throughput to ~400 KiB/s.
-		sock, err := utp.NewSocketFromPacketConn(pc,
-			utp.WithBufferSizes(4<<20, 4<<20))
+		sock, err := carrier.NewUTPSocket(pc)
 		if err != nil {
 			pc.Close()
 			return nil, fmt.Errorf("carrier utp socket: %w", err)
@@ -271,8 +337,9 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 			sock.Close()
 			return nil, fmt.Errorf("carrier dial %s: %w", addr, err)
 		}
-	case "ext-tcp", "req-tcp":
-		var d net.Dialer
+		closeSocket = sock.Close
+	case config.ModeExtTCP, config.ModeReqTCP:
+		d := net.Dialer{Control: carrier.TCPControl}
 		conn, err = d.DialContext(ctx, "tcp", addr.String())
 		if err != nil {
 			return nil, fmt.Errorf("carrier dial %s: %w", addr, err)
@@ -282,21 +349,30 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 	}
 	var t carrier.Transport
 	switch c.cfg.Transport {
-	case "ext-utp", "ext-tcp":
+	case config.ModeExtUTP, config.ModeExtTCP:
 		t, _, err = carrier.NewExtended(conn, infoHash, peerID)
-	case "req-utp", "req-tcp":
+	case config.ModeReqUTP, config.ModeReqTCP:
 		t, _, err = carrier.NewRequestPiece(conn, infoHash, peerID, false)
 	}
 	if err != nil {
 		conn.Close()
+		if closeSocket != nil {
+			closeSocket()
+		}
 		return nil, fmt.Errorf("carrier handshake: %w", err)
+	}
+	if closeSocket != nil {
+		go func() {
+			<-t.Done()
+			closeSocket()
+		}()
 	}
 	return t, nil
 }
 
 // Close tears the client down.
 func (c *Client) Close() {
-	c.bd.Close()
+	c.bind.Close()
 	c.dev.Close()
 	if c.ns != nil {
 		// The netstack TUN is owned by the device; nothing extra to close.

@@ -1,10 +1,10 @@
 package client
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -78,6 +78,7 @@ func TestClientFullFlow(t *testing.T) {
 	hubCfg := config.DefaultServerConfig()
 	hubCfg.Transport = "ext-utp"
 	hubCfg.CarrierPort = 17783 // unique across parallel test packages (server: 17777-17779, e2e: 17781)
+	hubCfg.AWGPort, hubCfg.WGPort = 17809, 17810
 	hubCfg.ExternalIP = "127.0.0.1"
 
 	clientPriv, clientPub, err := awg.GenerateKeyPair()
@@ -150,36 +151,24 @@ func TestClientFullFlow(t *testing.T) {
 		t.Fatal("client SOCKS5 never came up")
 	}
 
-	// App: no-auth SOCKS5 on loopback, chaining through the whole tunnel.
+	// The request reaches the connected hub, which must refuse its own loopback.
 	echo := tcpEcho(t)
 	app := socks.NewClient(socksAddr)
-	dialCtx, dialCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer dialCancel()
-	var conn net.Conn
-	for conn == nil {
-		select {
-		case err := <-runErr:
-			t.Fatalf("client Run exited: %v", err)
-		default:
+	deadline = time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		probe, stop := context.WithTimeout(ctx, time.Second)
+		c0, e := c.OverlayDialTCP(probe, netip.MustParseAddrPort("10.77.0.1:1080"))
+		stop()
+		if e != nil {
+			continue
 		}
-		conn, err = app.Dial(dialCtx, "tcp", echo)
-		if err != nil {
-			if dialCtx.Err() != nil {
-				t.Fatalf("app dial never succeeded: %v", err)
-			}
-			time.Sleep(200 * time.Millisecond)
+		c0.Close()
+		conn, e := app.Dial(ctx, "tcp", echo)
+		if e == nil {
+			conn.Close()
+			t.Fatal("proxy reached hub loopback")
 		}
+		return
 	}
-	defer conn.Close()
-	if _, err := conn.Write([]byte("chained")); err != nil {
-		t.Fatalf("app write: %v", err)
-	}
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	got := make([]byte, len("chained"))
-	if _, err := io.ReadFull(conn, got); err != nil {
-		t.Fatalf("app read: %v", err)
-	}
-	if !bytes.Equal(got, []byte("chained")) {
-		t.Fatalf("echo = %q, want chained", got)
-	}
+	t.Fatal("client never reached the hub")
 }

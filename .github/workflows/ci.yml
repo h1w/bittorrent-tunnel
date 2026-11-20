@@ -19,8 +19,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: btawg/go.mod
-      # third_party/ is a vendored upstream copy (one local patch); keep
-      # upstream formatting there and check only our code.
+      # The vendored µTP module keeps upstream formatting; check our module here.
       - name: gofmt
         run: test -z "$(gofmt -l cmd internal)" || (gofmt -l cmd internal && exit 1)
       - name: vet
@@ -29,5 +28,8 @@ jobs:
         run: CGO_ENABLED=0 go build ./...
       - name: test
         run: go test ./... -count=1 -timeout 300s
+      - name: pure-Go uTP transport regressions
+        working-directory: btawg/third_party/go-utp
+        run: go test ./purego -run 'Test(CongestionAvoidanceAccumulatesSmallACKs|WideWindowSendsBeyond1024Packets|SlowStartGrowsWithAcknowledgedBytes|TransferOverLossyNetwork|UDPBatchDeliversValidTailAfterSendError)$' -count=1 -timeout 120s
       - name: test -race
         run: go test ./... -count=1 -race -timeout 600s

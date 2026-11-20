@@ -2,10 +2,16 @@ package carrier
 
 import "io"
 
-// BlockSize is the fixed data region of every BitTorrent message that carries
-// AWG traffic: a uint16 length prefix, the AWG datagram, and cryptographically
-// random tail padding so each message reads as high-entropy content.
+// BlockSize limits the frame data region including the uint16 datagram length.
+// Request/piece also uses it as the fixed block length.
 const BlockSize = 2048
+
+const (
+	// Let a burst of decoded packets through even when the AWG consumer
+	// briefly yields on a single-core host; backpressure remains bounded.
+	receiveQueuePackets = 2048
+	streamReadBuffer    = 128 << 10
+)
 
 // Transport is the carrier contract the AWG Bind consumes: send one AWG
 // datagram, receive datagrams from the peer, and close/wait for shutdown.

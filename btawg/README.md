@@ -36,7 +36,7 @@ First boot prints, once:
 
 ```
 btawg-server: panel login admin / <password> (shown once, loopback :8080)
-btawg-server: transport=ext-utp carrier=:6881 socks=1080 infohash=<…>
+btawg-server: modes=ext-tcp,req-tcp,ext-utp,req-utp,awg,wg carrier=:6881 awg=:51821/udp wg=:51820/udp …
 ```
 
 **Save that password now** — it is never shown again. If lost, delete the db
@@ -59,13 +59,12 @@ CapabilityBoundingSet=CAP_NET_ADMIN
 WantedBy=multi-user.target
 ```
 
-Firewall: allow **6881/udp** inbound (carrier) and, when a firewall filters
-per-interface with a drop policy (e.g. `ufw default deny`), also **in on the
-hub's TUN** — `ufw allow in on btawg0`. Overlay packets the AWG device writes
-into the kernel arrive on that interface and never reach the SOCKS egress
-without an allow rule; the symptom is a handshake that completes (keepalives
-flow) while every SOCKS dial times out. Nothing else needs to be open — DHT,
-AWG and panel traffic all ride the carrier socket or stay on loopback.
+Open **6881/TCP**, **6881/UDP**, **51821/UDP** (AWG), and **51820/UDP**
+(WG) on the hub, or the configured equivalents. DHT also needs outbound
+UDP. The admin panel stays on loopback. Real-TUN mode requires `ip`,
+`sysctl`, and `nft` (with kernel IPv4 NAT support). If the host firewall
+drops overlay traffic, allow the overlay SOCKS port on `btawg0`, and allow
+the intended forwarding paths; btawg does not override the host firewall.
 
 ### 2. Panel → first client
 
@@ -85,9 +84,9 @@ sudo ./btawg-client 'btawg://…'      # root = btawg0 interface; without: sudo 
 ./btawg-client -no-tun 'btawg://…'   # no interface, SOCKS5-only mode
 ```
 
-The client needs no server address anywhere: it finds the hub strictly
-through the DHT (give it up to ~30 s), then serves no-auth SOCKS5 on
-`127.0.0.1:1080`.
+New imports contain the public hub endpoint and connect directly by default.
+For a BitTorrent carrier, `-dht` chooses discovery instead; earlier imports
+without an endpoint continue to use DHT. SOCKS5 listens on `127.0.0.1:1080`.
 
 ### 4. Verify
 
@@ -103,18 +102,14 @@ default route.
 
 ### 5. Policy (panel, live)
 
-On the dashboard each client has **Internet** (egress toggle) and
-**Visible peers** (who it may talk to; mutual). Example presets:
+In **Groups**, create an IPv4 subnet and set its peer visibility and
+Internet policy. In **Clients**, choose a group when creating a user, or
+move an existing user. Users inherit both group rules unless explicitly
+overridden. The hub gives the user the same address in all six modes.
 
-| Scenario | Internet | Visible peers |
-|---|---|---|
-| Full VPN (обход ограничений) | on, all clients | All |
-| Рабочая сеть без интернета | off, all clients | All |
-| Пары: 1↔2 и 5↔6, остальные изолированы | as needed | only each other |
-
-Saves apply immediately — no restart, no re-import. A denied peer dial
-just times out (silent drop, like a router). To isolate a client
-completely, select no peers at all.
+Permission changes apply live, including closing disallowed active SOCKS
+sessions. A move to another subnet or a changed group CIDR needs a new
+import. Denied peer traffic is silently dropped.
 
 ### Troubleshooting
 
@@ -136,16 +131,15 @@ completely, select no peers at all.
 First boot generates and prints (once) the panel password and the deployment
 infohash; the panel listens on `127.0.0.1:8080` — reach it via SSH
 port-forward (`ssh -L 8080:127.0.0.1:8080 vps`). Flags:
-`-transport ext-utp|ext-tcp|req-utp|req-tcp`, `-carrier-port`,
-`-external-ip`, `-dht-bootstrap host:port[,host:port…]` (private bootstrap
-island for DHT-hostile networks; the default is the public bootstrap list).
+`-transport` sets the preferred client mode, not which listeners are
+enabled. `-carrier-port` and `-dht-bootstrap host:port[,host:port…]` apply
+to the four carrier modes. `-external-ip` is the public IPv4 written into
+imports; set it explicitly if the outbound interface address is not public.
 
-In the panel: **Server settings** (AWG profile inside BitTorrent, camouflage
-method & transport, ports), **Clients → Create** → copy the import string.
-
-The hub announces its carrier address in the public BitTorrent DHT under the
-deployment infohash; clients learn the current server address from the DHT
-alone. Public bootstrap nodes are baked into the client binary.
+The four carriers support both a direct endpoint and DHT discovery. Native
+AWG/WG use their explicit UDP endpoints. No mode silently falls back to
+another. The panel exposes one `btawg://` import and native config
+downloads for the same registered user.
 
 Ports: the carrier listens on **6881** (the canonical BitTorrent port,
 override with `-carrier-port`), and every DHT socket in the system — hub
@@ -154,26 +148,37 @@ torrent client range **6881–6889**, falling back to an ephemeral port only if
 the whole range is busy. A server + client on one machine coexist in the
 range, exactly like two torrent clients would.
 
+Upgrade hub and client together for the faster `req-tcp` and `req-utp` paths.
+New peers negotiate a larger request window and 1536-byte blocks, fragmenting
+only datagrams that do not fit. Old peers keep the 2048-byte block and 32-request
+window and still stop at the original index limit. The import string and TUN
+routes do not change if the selected transport stays the same.
+
+For a lossy WAN, set `BTAWG_UTP_PACE_MBPS` independently on each host to
+cap that process's outgoing µTP bulk data (50–10000 Mbit/s; unset or `0`
+disables it). Measure direct UDP goodput and packet loss in each direction
+before tuning. The cap is not a promised application throughput; all µTP
+peers on the hub share its pacing budget. TCP modes ignore this setting.
+
 ## Run a client (any PC)
 
 ```sh
-./btawg-client 'btawg://…'        # paste the import string (a secret)
+./btawg-client -transport ext-tcp 'btawg://…'  # pick any listed mode
+./btawg-client -transport ext-tcp -dht 'btawg://…' # explicitly use DHT
 ```
 
 or `./btawg-client -config file.txt`. The client then:
 
-- joins the DHT via public bootstrap nodes and `get_peers` the infohash —
-  no server address is configured anywhere;
-- dials the discovered address, performs the real BitTorrent handshake
-  (same infohash) and carries all AWG traffic inside it — no bare-AWG
-  fallback exists;
+- for a BitTorrent mode, connects to the imported endpoint or discovers it
+  through DHT when requested; for `awg` or `wg`, connects directly over UDP
+  to the selected native endpoint;
 - serves **no-auth SOCKS5 on 127.0.0.1:1080**: point any app there; traffic
   is chained through the tunnel to the hub's egress, which dials the real
   internet (DNS resolves at the hub — no client-side leak);
-- with root (`-no-tun` skips this) creates the `btawg0` interface with the
-  client's overlay address (default `10.77.0.x`) and a route for the overlay
-  subnet **only** — never a default route, so the system's own traffic is
-  untouched.
+- with real TUN, creates `btawg0` with the assigned VPN address and the
+  managed IPv4 subnet routes from the import. It never installs a default
+  route. To send selected public prefixes through the VPN, add explicit
+  client routes; the hub still decides whether to forward them.
 
 ### Client-to-client
 
@@ -184,52 +189,26 @@ like kernel WireGuard's ip_forward). In netstack mode use
 through `btawg0`. **Do not** route LAN traffic through SOCKS5 — the egress
 dials destinations on the hub's host, which is for the internet only.
 
-## Routing policy
+## Routing policy and groups
 
-Policy is enforced on the hub and configured only in the panel. Each client
-has two independent controls:
+Each group owns a non-overlapping IPv4 CIDR and a hub address. New groups
+allow communication within the group and deny internet by default. Group
+visibility and user exceptions are mutual: both endpoints must allow the
+other. Different transports do not create separate IP networks. These are
+routed IPv4 networks, not shared Ethernet segments.
 
-- **Internet** checkbox — gates the chained SOCKS5 egress to the real internet.
-  The hub host itself (`10.77.0.1`) stays reachable regardless; turning this
-  off produces a pure work-net client.
-- **Visible peers** multi-select — the list of other clients this client may
-  exchange overlay packets with. Visibility is mutual: A can talk to B only
-  when A lists B **and** B lists A.
+The hub enforces the policy after VPN authentication, on both overlay
+routing and internet egress. Internet can only use the central server.
+Real-TUN mode supports explicitly routed IPv4 packets via scoped NAT;
+SOCKS5 is available in real-TUN and `-no-tun` modes. The client never
+installs a system-wide default route. To use internet egress with standalone
+WG/AWG, add the selected public prefixes to `AllowedIPs` and the OS routes.
 
-Examples (in the owner's spirit):
-
-- Mutual pairs: client 1 sees only client 2, and client 2 sees only client 1;
-  client 5 ↔ client 6 the same way. Everyone else is isolated from them.
-- Full VPN: every client has **Internet** on and **Visible peers** = All.
-- Work net without internet: every client has **Internet** off and **Visible
-  peers** = All, so they can reach each other and the hub but nothing else.
-
-Changes are saved to the store and reloaded into the hub snapshot live via
-`POST /clients/policy`. **No server restart and no re-import of clients are
-required** for policy changes; only AWG-profile / transport / port changes
-require the restart + re-import banner shown on the server-settings page.
-
-### Hub TUN mode and the no-route-takeover invariant
-
-`btawg-server` defaults to real TUN mode and creates `btawg0` with the hub
-overlay address (`10.77.0.1/24` by default). Flags:
-
-```sh
-./btawg-server -tun btawg0        # default real-TUN mode (root required)
-./btawg-server -no-tun            # userspace netstack mode (tests, dev)
-```
-
-The hub adds **no routes** — not even a subnet route. Clients add only the
-overlay subnet route into their own `btawg0`; they never install a default
-route. No node in the system takes over the system's routing table.
-
-### Egress gate semantics
-
-The hub's egress SOCKS5 is the only path from a client to the public
-internet. If a client's **Internet** toggle is off, the gate closes that
-client's egress connections immediately (fail-closed). The hub itself and
-overlay peer-to-peer traffic still flow through the AWG device; only the
-SOCKS5 egress is gated.
+Back up the database before upgrading. Existing IPs and settings move to
+the default group; existing per-user permissions become explicit. Policy
+edits are live. Changing the hub listener ports or AWG profile requires a
+restart and a fresh import. In `-no-tun` mode the group gateway addresses
+are fixed at startup; use real TUN to change group networks live.
 
 ## Import string
 
@@ -244,10 +223,53 @@ hub's IP via DHT, but without AWG keys the channel stays opaque.
 - Carrier framing, SOCKS5 (CONNECT + UDP ASSOCIATE), bbolt store, DHT
   announce/discover (loopback relay), panel handlers: unit tests.
 - Full suite `go test ./...` green incl. `-race` on the networking paths.
-- End-to-end: hub announces in DHT → client discovers strictly via DHT →
-  µTP carrier → AWG handshake → SOCKS5 internet egress (TCP and UDP) →
-  client-to-client overlay dial through hub forwarding
-  (`internal/e2e/e2e_test.go`).
+- End-to-end in all four carrier modes: DHT discovery through a local relay,
+  AWG handshake, SOCKS5 TCP and UDP egress, and client-to-client traffic
+  through the hub (`internal/e2e/e2e_test.go`). These are functional checks,
+  not throughput benchmarks.
+
+On a single Linux host, separate network namespaces connected by a kernel
+`netkit` link (RTT approximately 0.06 ms) transferred and verified 1 GiB per
+mode and direction through real TUN interfaces, AWG, and SOCKS5. The
+benchmark supplies the discovered peer address locally; it measures bulk
+transfer after connect, not DHT or session setup. The speeds below are
+application goodput, not link rate.
+
+| Carrier | 1 stream down | 1 stream up | 4 streams down | 4 streams up |
+|---|---:|---:|---:|---:|
+| `ext-tcp` | 1.846 | 2.288 | 2.306 | 2.372 |
+| `ext-utp` | 1.484 | 1.514 | 1.445 | 1.443 |
+| `req-tcp` | 2.236 | 2.256 | 2.222 | 2.204 |
+| `req-utp` | 1.349 | 1.375 | 1.308 | 1.303 |
+
+All values are in Gbit/s. The Linux IPv4 µTP path batches UDP I/O and uses
+UDP segmentation when available, without changing individual wire datagrams.
+These numbers do not describe a physical 1 GbE link or public WAN path.
+
+### Two-VPS WAN measurement
+
+One external carrier per client. Each run transferred and verified 512 MiB
+through real TUN, AWG and SOCKS5: four application flows for TCP, two for
+µTP. The table reports medians and ranges of three runs per direction at
+fixed settings, in Mbit/s. Download is hub to client.
+
+| Carrier | Download median (range) | Upload median (range) | Median vs. direct, down / up |
+|---|---:|---:|---:|
+| `ext-tcp` | 821.3 (694.8–852.7) | 795.4 (778.0–873.9) | 93.4% / 80.2% |
+| `req-tcp` | 738.4 (718.4–760.8) | 823.8 (789.5–832.1) | 84.0% / 83.0% |
+| `ext-utp` | 181.3 (177.8–181.9) | 279.6 (253.7–281.4) | 76.2% / 74.0% |
+| `req-utp` | 175.6 (172.7–182.9) | 294.5 (253.1–295.2) | 73.8% / 78.0% |
+
+TCP percentages use the original four-stream direct control of 879/992
+Mbit/s. A fresh direct TCP run on the same path measured 944.2/639.1.
+Direct UDP delivered 237.9/377.7 Mbit/s with 1382-byte datagrams over six
+seconds, offered at 250/390 Mbit/s (4.6%/2.9% packet loss).
+
+Set `BTAWG_UTP_PACE_MBPS` to 275 on the hub and 410 on the client for
+the measured `ext-utp` profile, or 355 and 455 respectively for `req-utp`.
+These are pacing ceilings for this route, not throughput guarantees.
+Both µTP upload medians exceeded 70% of direct UDP; each mode also had
+one run below that threshold.
 
 ## Honest limits
 
@@ -265,12 +287,35 @@ hub's IP via DHT, but without AWG keys the channel stays opaque.
 - The hub needs a public IP (or that forward): client-to-client traffic
   always routes through the hub, so there is no direct client↔client NAT
   traversal in this MVP.
-- Real WAN, loss, and a production VPS were not exercised; the latency claim
-  comes from the emulated 20 ms one-way channel benchmark.
-- No ACL groups, rate limits, LAN-behind-client routing, kill switch, or
-  IPv6 in this MVP; revocation removes the AWG peer and detaches the carrier.
-- Hub real-TUN mode requires root and is verified only by the root-gated unit
-  tests and design review, not on this non-root dev host. Run it on the VPS
-  with `sudo ./btawg-server`.
+- A local latency benchmark is not a WAN throughput guarantee. Measure raw
+  TCP to the same hub in both directions and compare it with completed SOCKS
+  transfers of the same size. A speed test to a different host is not a
+  baseline for the VPN path. `ext-*` rounds the datagram plus its length field
+  up to 32 bytes rather than padding every frame to 2 KiB. `req-*` uses
+  1536-byte blocks between new peers and 2048-byte blocks with old peers.
+  For a long-distance benchmark, apply 100 ms one-way delay in each
+  direction (200 ms RTT total) to the carrier only. Place `netem` on an
+  intermediate router's egress toward each endpoint, not on the TCP
+  sender's egress, where TCP Small Queues can distort the result.
+  Keep the SOCKS endpoint and test source local to their respective hosts,
+  verify the complete payload at the receiver, and report upload and
+  download separately.
+  In an isolated Linux run at 201 ms RTT, all four modes delivered 512 MiB
+  through real TUN and SOCKS5 in four parallel TCP streams per direction.
+  Download/upload goodput was 559/564 Mbit/s (`ext-tcp`), 535/533 (`req-tcp`),
+  547/542 (`ext-utp`), and 516/514 (`req-utp`). Direct TCP reached 719/719
+  Mbit/s on the same lab path. The run used an already-established AWG
+  session and injected the discovery result; it does not measure startup,
+  single-stream speed, or a public WAN. Earlier `req-utp` tuning trials
+  also fell below 500 Mbit/s, so the result is not a sustained minimum.
+  Real-TUN mode uses Reno and a bounded send buffer on the inner SOCKS TCP
+  sockets and a larger transmit queue on the overlay TUN. The outer TCP
+  carrier uses BBR where available; other TCP sockets keep the host default.
+  Loopback SOCKS CONNECT legs use bounded buffers. No host-wide TCP setting
+  or WAN qdisc is changed.
+- No IPv6 overlay, rate limits, LAN-behind-client routing, or kill switch.
+  Revocation removes the peer from both engines and closes its carriers.
+- Hub real-TUN mode requires `CAP_NET_ADMIN`. Run it on the VPS with
+  `sudo ./btawg-server` or use the systemd unit above.
 - Disallowed client↔client dials are silently dropped by design, so they time
   out rather than returning a clean error or RST.

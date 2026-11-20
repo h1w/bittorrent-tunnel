@@ -41,6 +41,7 @@ func TestServerClientEcho(t *testing.T) {
 	cfg := config.DefaultServerConfig()
 	cfg.Transport = "ext-utp"
 	cfg.CarrierPort = 17777
+	cfg.AWGPort, cfg.WGPort = 17801, 17802
 
 	clientPriv, clientPub, err := awg.GenerateKeyPair()
 	if err != nil {
@@ -221,6 +222,7 @@ func TestRegisterClientUpdatesSnapshot(t *testing.T) {
 	cfg := config.DefaultServerConfig()
 	cfg.ServerIP = "10.77.0.1"
 	cfg.CarrierPort = 17779
+	cfg.AWGPort, cfg.WGPort = 17803, 17804
 
 	aPriv, aPub, err := awg.GenerateKeyPair()
 	if err != nil {
@@ -264,6 +266,9 @@ func TestRegisterClientUpdatesSnapshot(t *testing.T) {
 		PeerID:  awg.PeerID(bPub),
 		Created: time.Unix(1, 0),
 	}
+	if err := st.CreateClient(b); err != nil {
+		t.Fatal(err)
+	}
 	if err := srv.RegisterClient(b); err != nil {
 		t.Fatalf("RegisterClient: %v", err)
 	}
@@ -277,6 +282,9 @@ func TestRegisterClientUpdatesSnapshot(t *testing.T) {
 		t.Errorf("internetFor(B): want true, got false")
 	}
 
+	if err := st.RevokeClient(b.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := srv.RevokeClient(b); err != nil {
 		t.Fatalf("RevokeClient: %v", err)
 	}
@@ -415,7 +423,7 @@ func TestNewRealTUNLive(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRealTUN: %v", err)
 	}
-	defer s.closeAll()
+	defer s.Close()
 
 	out, err := exec.Command("ip", "addr", "show", "dev", tunName).CombinedOutput()
 	if err != nil {

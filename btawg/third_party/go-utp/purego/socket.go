@@ -8,8 +8,11 @@ import (
 	"math"
 	"math/rand/v2"
 	"net"
+	"runtime"
 	"sync"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 const (
@@ -62,6 +65,10 @@ type FirewallCallback = func(net.Addr) bool
 type Socket struct {
 	mu sync.Mutex
 	pc net.PacketConn
+	tx *udpWriteBatch
+	// Pacing is optional; these fields are guarded by mu with the send path.
+	paceBytesPerSecond int64
+	paceNext           time.Time
 
 	conns   map[socketKey]*Conn
 	backlog chan *Conn
@@ -131,6 +138,13 @@ func WithBufferSizes(send, receive int) NewSocketOpt {
 	}
 }
 
+// WithPacingRate limits bursts of outgoing data to bytesPerSecond. Zero
+// leaves only the normal µTP congestion controller in charge. Control
+// packets do not wait for the pacer.
+func WithPacingRate(bytesPerSecond int64) NewSocketOpt {
+	return func(s *Socket) { s.paceBytesPerSecond = bytesPerSecond }
+}
+
 // WithTargetDelay sets the one way queuing delay the congestion controller aims for on
 // connections from this Socket. The default is 100ms, as in libutp.
 func WithTargetDelay(d time.Duration) NewSocketOpt {
@@ -168,6 +182,9 @@ func NewSocketFromPacketConn(pc net.PacketConn, opts ...NewSocketOpt) (*Socket, 
 		optSndBuf:   defaultBufferSize,
 		optRcvBuf:   defaultBufferSize,
 		resolveAddr: func(network, addr string) (net.Addr, error) { return net.ResolveUDPAddr(network, addr) },
+	}
+	if udp, ok := pc.(*net.UDPConn); runtime.GOOS == "linux" && ok && udp.LocalAddr().(*net.UDPAddr).IP.To4() != nil {
+		s.tx = newUDPWriteBatch(udp)
 	}
 	s.nonUtpReadCond.L = &s.mu
 	for _, opt := range opts {
@@ -229,13 +246,120 @@ func (s *Socket) updateCurrentMS() {
 // it isn't honoured yet, so a probe that's too large is dropped somewhere along the path instead
 // of reported back, which the discovery search handles either way.
 func (s *Socket) send(b []byte, addr net.Addr, dontFragment bool) {
+	if tx := s.tx; tx != nil && tx.active {
+		i := tx.n
+		tx.messages[i].Buffers[0] = b
+		tx.messages[i].Addr = addr
+		tx.n++
+		if tx.n == len(tx.messages) {
+			s.flushWrites()
+		}
+		return
+	}
+	if s.paceBytesPerSecond > 0 && pacedData(b) {
+		s.paceData(len(b) + 28)
+	}
 	_, err := s.pc.WriteTo(b, addr)
 	if err != nil {
 		s.logf(logNormal, "error writing to %v: %v", addr, err)
 	}
 }
 
+const udpWriteBatchSize = 32
+
+// Only Conn.writeNoWait queues datagrams, under Socket.mu. The bytes are
+// retained by outgoingPacket until ACK processing can acquire that lock.
+type udpWriteBatch struct {
+	pc       *ipv4.PacketConn
+	messages [udpWriteBatchSize]ipv4.Message
+	buffers  [udpWriteBatchSize][1][]byte
+	segments [udpWriteBatchSize][]byte
+	control  [32]byte
+	segment  [1]ipv4.Message
+	noGSO    bool
+	stamp    uint64
+	n        int
+	active   bool
+}
+
+func newUDPWriteBatch(c *net.UDPConn) *udpWriteBatch {
+	tx := &udpWriteBatch{pc: ipv4.NewPacketConn(c)}
+	for i := range tx.messages {
+		tx.messages[i].Buffers = tx.buffers[i][:]
+	}
+	return tx
+}
+
+func (s *Socket) flushWrites() {
+	tx := s.tx
+	messages := tx.messages[:tx.n]
+	if len(messages) == 0 {
+		return
+	}
+	if s.paceBytesPerSecond > 0 {
+		bytes := 0
+		for _, m := range messages {
+			if pacedData(m.Buffers[0]) {
+				bytes += len(m.Buffers[0]) + 28
+			}
+		}
+		if bytes != 0 {
+			s.paceData(bytes)
+		}
+	}
+	if len(messages) == 1 {
+		m := &messages[0]
+		if _, err := s.pc.WriteTo(m.Buffers[0], m.Addr); err != nil {
+			s.logf(logNormal, "error writing to %v: %v", m.Addr, err)
+		}
+	} else if !tx.trySegment(messages) {
+		for pending := messages; len(pending) > 0; {
+			n, err := tx.pc.WriteBatch(pending, 0)
+			pending = pending[max(n, 0):]
+			if err != nil || n == 0 {
+				// Preserve individual write behavior for the unsent tail.
+				for _, m := range pending {
+					if _, err := s.pc.WriteTo(m.Buffers[0], m.Addr); err != nil {
+						s.logf(logNormal, "error writing to %v: %v", m.Addr, err)
+					}
+				}
+				break
+			}
+		}
+	}
+	for i := range messages {
+		messages[i].Buffers[0] = nil
+		messages[i].Addr = nil
+	}
+	clear(tx.segments[:len(messages)])
+	tx.stamp = 0
+	tx.n = 0
+}
+
+func pacedData(b []byte) bool {
+	// Tiny data datagrams carry interactive traffic or inner ACKs. Even a
+	// long selective ACK is a control packet and must not consume the rate.
+	return len(b) > 64 && packetType(b[0]>>4) == stData
+}
+
+// Pace whole batches, not individual datagrams. Limit catch-up after timer
+// jitter so an idle connection does not accrue a budget for a large burst.
+func (s *Socket) paceData(bytes int) {
+	now := time.Now()
+	if s.paceNext.Before(now.Add(-100 * time.Microsecond)) {
+		s.paceNext = now
+	}
+	if wait := s.paceNext.Sub(now); wait > 0 {
+		time.Sleep(wait)
+	}
+	s.paceNext = s.paceNext.Add(time.Duration(int64(bytes) * int64(time.Second) / s.paceBytesPerSecond))
+}
+
 func (s *Socket) reader() {
+	if s.tx != nil {
+		s.readBatches()
+		return
+	}
 	b := make([]byte, maxDatagramSize)
 	// Some systems raise read errors that don't mean the socket is finished, so tolerate a run of
 	// them before giving up.
@@ -264,13 +388,57 @@ func (s *Socket) reader() {
 	}
 }
 
+func (s *Socket) readBatches() {
+	const batchSize = 16
+	var messages [batchSize]ipv4.Message
+	var buffers [batchSize][1][]byte
+	storage := make([]byte, batchSize*maxDatagramSize)
+	for i := range messages {
+		buffers[i][0] = storage[i*maxDatagramSize : (i+1)*maxDatagramSize]
+		messages[i].Buffers = buffers[i][:]
+	}
+	for consecutiveErrors := 0; ; {
+		n, err := s.tx.pc.ReadBatch(messages[:], 0)
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return
+		}
+		if err == nil {
+			now := nowMicros()
+			s.currentMS = now / 1000
+			for _, m := range messages[:n] {
+				s.dispatch(m.Buffers[0][:m.N], m.Addr, now)
+			}
+		}
+		s.mu.Unlock()
+		if err == nil {
+			consecutiveErrors = 0
+			continue
+		}
+		s.logger.Warn("ignoring socket read error", "err", err)
+		consecutiveErrors++
+		if consecutiveErrors >= 100 {
+			s.logger.Error("too many consecutive errors, closing socket")
+			s.Close()
+			return
+		}
+	}
+}
+
 func (s *Socket) processReceivedMessage(b []byte, addr net.Addr) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
-	if s.processPacket(b, addr) {
+	now := nowMicros()
+	s.currentMS = now / 1000
+	s.dispatch(b, addr, now)
+}
+
+func (s *Socket) dispatch(b []byte, addr net.Addr, now uint64) {
+	if s.processPacket(b, addr, now) {
 		s.afterReceivingUtpMessage()
 	} else {
 		s.onReadNonUtp(b, addr)
@@ -341,12 +509,11 @@ func (s *Socket) connSlice() []*Conn {
 }
 
 // Dispatches an incoming datagram. Reports whether it was uTP. Mirrors utp_process_udp.
-func (s *Socket) processPacket(b []byte, addr net.Addr) bool {
+func (s *Socket) processPacket(b []byte, addr net.Addr, now uint64) bool {
 	p, err := parsePacket(b)
 	if err != nil {
 		return false
 	}
-	s.updateCurrentMS()
 	ak := connKey(addr)
 	id := p.h.ConnID
 
@@ -383,7 +550,7 @@ func (s *Socket) processPacket(b []byte, addr net.Addr) bool {
 
 	if p.h.Type != stSyn {
 		if c := s.conns[socketKey{ak, id}]; c != nil {
-			c.processIncoming(&p, false)
+			c.processIncoming(&p, false, now)
 			c.maybeDestroy()
 			return true
 		}
@@ -431,7 +598,7 @@ func (s *Socket) processPacket(b []byte, addr net.Addr) bool {
 	c.seqNr = uint16(rand.Uint32())
 	c.fastResendSeqNr = c.seqNr
 	c.state = csSynRecv
-	c.processIncoming(&p, true)
+	c.processIncoming(&p, true, now)
 	c.sendAck(true)
 	s.pushBacklog(c)
 	return true

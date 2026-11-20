@@ -24,9 +24,9 @@ import (
 
 func main() {
 	storePath := flag.String("store", "btawg.db", "path to the bbolt database")
-	transport := flag.String("transport", "", "override carrier transport (ext-utp|ext-tcp|req-utp|req-tcp)")
+	transport := flag.String("transport", "", "preferred carrier for legacy imports (all six modes listen)")
 	carrierPort := flag.Int("carrier-port", 0, "override carrier listen port")
-	externalIP := flag.String("external-ip", "", "override announced IP (autodetect if empty)")
+	externalIP := flag.String("external-ip", "", "public IPv4 for native imports (default: outbound interface address)")
 	dhtBootstrap := flag.String("dht-bootstrap", "", "override DHT bootstrap nodes, comma-separated host:port (default: public)")
 	noTun := flag.Bool("no-tun", false, "userspace netstack mode: no OS interface is created")
 	tunName := flag.String("tun", "btawg0", "TUN interface name in real-TUN mode")
@@ -116,8 +116,9 @@ func main() {
 	go func() { errCh <- srv.Run(ctx) }()
 	go func() { errCh <- srv.Announce(ctx) }()
 
-	fmt.Printf("btawg-server: transport=%s carrier=:%d socks=%d infohash=%s\n",
-		cfg.Transport, cfg.CarrierPort, cfg.SocksPort, srv.InfoHash())
+	active := srv.Config()
+	fmt.Printf("btawg-server: modes=ext-tcp,req-tcp,ext-utp,req-utp,awg,wg carrier=:%d awg=:%d/udp wg=:%d/udp socks=%d infohash=%s\n",
+		active.CarrierPort, active.AWGPort, active.WGPort, active.SocksPort, srv.InfoHash())
 	fmt.Println("btawg-server: DHT announce loop started (strictly-DHT discovery)")
 
 	select {

@@ -3,6 +3,7 @@ package server
 import (
 	"net"
 	"net/netip"
+	"sync"
 )
 
 // gatedListener wraps a net.Listener and enforces the hub routing policy on
@@ -11,8 +12,11 @@ import (
 // fail-closed gate: if the source cannot be parsed or is unknown, the
 // connection is dropped.
 type gatedListener struct {
-	inner  net.Listener
-	policy *policySnapshot
+	inner          net.Listener
+	policy         *policySnapshot
+	mu             sync.Mutex
+	active         map[*egressSession]netip.Addr
+	requireGateway bool
 }
 
 // Accept returns the next connection whose source is allowed to use internet
@@ -25,17 +29,63 @@ func (g *gatedListener) Accept() (net.Conn, error) {
 		}
 
 		src, ok := addrIP(c.RemoteAddr())
+		if g.requireGateway {
+			dst, bound := addrIP(c.LocalAddr())
+			if !bound || !g.policy.isGateway(dst) {
+				_ = c.Close()
+				continue
+			}
+		}
+		g.mu.Lock()
 		if !ok || !g.policy.internetFor(src) {
+			g.mu.Unlock()
 			_ = c.Close()
 			continue
 		}
-		return c, nil
+		if g.active == nil {
+			g.mu.Unlock()
+			return c, nil
+		}
+		s := &egressSession{Conn: c, gate: g}
+		g.active[s] = src
+		g.mu.Unlock()
+		return s, nil
+	}
+}
+
+type egressSession struct {
+	net.Conn
+	gate *gatedListener
+}
+
+func (c *egressSession) Close() error {
+	c.gate.mu.Lock()
+	delete(c.gate.active, c)
+	c.gate.mu.Unlock()
+	return c.Conn.Close()
+}
+
+func (g *gatedListener) closeDenied() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for c, src := range g.active {
+		if !g.policy.internetFor(src) {
+			delete(g.active, c)
+			_ = c.Conn.Close()
+		}
 	}
 }
 
 // Close delegates to the inner listener.
 func (g *gatedListener) Close() error {
-	return g.inner.Close()
+	err := g.inner.Close()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for c := range g.active {
+		delete(g.active, c)
+		_ = c.Conn.Close()
+	}
+	return err
 }
 
 // Addr delegates to the inner listener.
