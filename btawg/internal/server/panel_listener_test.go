@@ -15,6 +15,28 @@ import (
 	"bittorrent-tunnel/btawg/internal/store"
 )
 
+// freeTCPPort and freeUDPPort return ephemeral ports so the hub's fixed
+// service ports do not collide with other packages running in parallel.
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return l.Addr().(*net.TCPAddr).Port
+}
+
+func freeUDPPort(t *testing.T) int {
+	t.Helper()
+	c, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	return c.LocalAddr().(*net.UDPAddr).Port
+}
+
 func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 	st, err := store.Open(t.TempDir() + "/panel.db")
 	if err != nil {
@@ -23,6 +45,9 @@ func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 
 	cfg := config.DefaultServerConfig()
+	cfg.CarrierPort = freeTCPPort(t)
+	cfg.AWGPort = freeUDPPort(t)
+	cfg.WGPort = freeUDPPort(t)
 	srv, err := New(cfg, st)
 	if err != nil {
 		t.Fatalf("New: %v", err)

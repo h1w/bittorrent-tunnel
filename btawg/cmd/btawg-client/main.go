@@ -1,5 +1,7 @@
-// btawg-client runs a VPN node from a btawg:// import string, with local
-// SOCKS5 and an optional OS TUN interface. It never installs a default route.
+// btawg-client is the VPN client binary. It installs and manages its systemd
+// service, runs the managed multi-mode daemon, or opens a TUI to toggle
+// connection modes and view/rotate the shared SOCKS5 credentials. A bare
+// import string still runs a single foreground connection for compatibility.
 package main
 
 import (
@@ -13,145 +15,256 @@ import (
 	"strings"
 	"syscall"
 
+	"golang.org/x/term"
+
 	"bittorrent-tunnel/btawg/internal/client"
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/service"
 	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
 
 func main() {
-	importFile := flag.String("config", "", "path to a file containing the btawg:// import string")
-	transport := flag.String("transport", "", "connection chain ("+strings.Join(config.ClientModes(), "|")+")")
-	dhtOnly := flag.Bool("dht", false, "discover the carrier through DHT instead of using the import endpoint")
-	noTun := flag.Bool("no-tun", false, "userspace netstack mode: no OS interface is created")
-	socksListen := flag.String("socks-listen", "127.0.0.1", "local SOCKS5 listen IPv4 address (0.0.0.0 for all IPv4 interfaces)")
-	tunName := flag.String("tun", "btawg0", "TUN interface name in real-TUN mode")
-	flag.Parse()
+	if len(os.Args) >= 2 {
+		switch os.Args[1] {
+		case "install":
+			if err := installMain(os.Args[2:]); err != nil {
+				fatal(err)
+			}
+			return
+		case "run":
+			if err := runMain(os.Args[2:]); err != nil {
+				fatal(err)
+			}
+			return
+		}
+	}
+	if err := legacyOrTUI(os.Args[1:]); err != nil {
+		fatal(err)
+	}
+}
 
-	raw := strings.TrimSpace(flag.Arg(0))
+func fatal(err error) {
+	fmt.Fprintf(os.Stderr, "btawg-client: %v\n", err)
+	os.Exit(1)
+}
+
+// installMain persists the client configuration and installs the systemd
+// service. The import secret is read from a file or a hidden prompt and is
+// never placed in unit arguments.
+func installMain(args []string) error {
+	fs := flag.NewFlagSet("install", flag.ExitOnError)
+	importFile := fs.String("import-file", "", "file containing the btawg:// import string (secret)")
+	socksListen := fs.String("socks-listen", "127.0.0.1", "SOCKS5 listen IPv4 address")
+	noTun := fs.Bool("no-tun", false, "userspace netstack mode: no OS interface")
+	tunName := fs.String("tun", "btawg0", "TUN interface name prefix")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	raw, err := readImport(*importFile)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.ParseImportString(raw)
+	if err != nil {
+		return err
+	}
+	listenIP, err := netip.ParseAddr(*socksListen)
+	if err != nil || !listenIP.Is4() {
+		return fmt.Errorf("-socks-listen requires an IPv4 address")
+	}
+	creds, err := client.GenerateCredentials()
+	if err != nil {
+		return err
+	}
+	mc := client.ManagedConfig{
+		Import:      raw,
+		Enabled:     []string{cfg.Transport},
+		ListenIP:    listenIP.String(),
+		Credentials: creds,
+	}
+	if err := mc.Save(client.ManagedConfigPath); err != nil {
+		return err
+	}
+	// Pass the TUN/no-tun choice through the unit's environment-free argv only
+	// as non-secret flags.
+	var extra []string
+	if *noTun {
+		extra = append(extra, "-no-tun")
+	}
+	if *tunName != "btawg0" {
+		extra = append(extra, "-tun", *tunName)
+	}
+	if err := service.Client.Install(extra...); err != nil {
+		return err
+	}
+	fmt.Println("btawg-client: installed and started")
+	fmt.Printf("btawg-client: SOCKS5 login %s / %s (all inbounds; view or rotate in the TUI)\n", creds.Username, creds.Password)
+	fmt.Printf("btawg-client: SOCKS5 inbounds 127.0.0.1:%d-%d\n", client.ManagedPortBase, client.ManagedPortBase+len(config.ClientModes())-1)
+	return nil
+}
+
+// readImport reads the import secret from a file or a hidden terminal prompt.
+func readImport(path string) (string, error) {
+	if path != "" {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return "", fmt.Errorf("pass -import-file FILE or run in a terminal to type the import")
+	}
+	fmt.Fprint(os.Stderr, "btawg-client: paste btawg:// import string: ")
+	b, err := term.ReadPassword(fd)
+	fmt.Fprintln(os.Stderr)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// runMain runs either the managed daemon (`run -managed`, started by systemd)
+// or a single foreground connection (`run <import>`).
+func runMain(args []string) error {
+	fs := flag.NewFlagSet("run", flag.ExitOnError)
+	managed := fs.Bool("managed", false, "run as the managed multi-mode daemon")
+	noTun := fs.Bool("no-tun", false, "userspace netstack mode")
+	tunName := fs.String("tun", "btawg0", "TUN interface name prefix")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *managed {
+		return runManaged(*noTun, *tunName)
+	}
+	raw := strings.TrimSpace(fs.Arg(0))
+	if raw == "" {
+		return fmt.Errorf("run: pass the btawg:// import string or -managed")
+	}
+	return runSingle(raw, *noTun, *tunName)
+}
+
+func runManaged(noTun bool, tunName string) error {
+	mc, err := client.LoadManagedConfig(client.ManagedConfigPath)
+	if err != nil {
+		return fmt.Errorf("load %s: %w", client.ManagedConfigPath, err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return client.RunManaged(ctx, mc, !noTun, tunName)
+}
+
+// legacyOrTUI runs a bare import string (single foreground connection) or the
+// TUI when no import is given.
+func legacyOrTUI(args []string) error {
+	fs := flag.NewFlagSet("btawg-client", flag.ExitOnError)
+	importFile := fs.String("config", "", "file containing the btawg:// import string")
+	transport := fs.String("transport", "", "connection chain")
+	dhtOnly := fs.Bool("dht", false, "discover the carrier through DHT")
+	noTun := fs.Bool("no-tun", false, "userspace netstack mode")
+	socksListen := fs.String("socks-listen", "127.0.0.1", "SOCKS5 listen IPv4 address")
+	tunName := fs.String("tun", "btawg0", "TUN interface name")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	raw := strings.TrimSpace(fs.Arg(0))
 	if raw == "" && *importFile != "" {
 		b, err := os.ReadFile(*importFile)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "btawg-client: read config: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		raw = strings.TrimSpace(string(b))
 	}
 	if raw == "" {
-		fmt.Fprintln(os.Stderr, "btawg-client: pass the btawg:// import string as the argument or -config FILE")
-		os.Exit(1)
+		return client.RunTUI()
 	}
+	if *transport != "" || *dhtOnly || *socksListen != "127.0.0.1" {
+		return runSingleOpts(raw, *transport, *dhtOnly, *socksListen, *noTun, *tunName)
+	}
+	return runSingle(raw, *noTun, *tunName)
+}
+
+func runSingle(raw string, noTun bool, tunName string) error {
+	return runSingleOpts(raw, "", false, "127.0.0.1", noTun, tunName)
+}
+
+// runSingleOpts keeps the original single-connection foreground behavior.
+func runSingleOpts(raw, transport string, dhtOnly bool, socksListen string, noTun bool, tunName string) error {
 	cfg, err := config.ParseImportString(raw)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "btawg-client: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	listenIP, err := netip.ParseAddr(*socksListen)
+	listenIP, err := netip.ParseAddr(socksListen)
 	if err != nil || !listenIP.Is4() {
-		fmt.Fprintln(os.Stderr, "btawg-client: -socks-listen requires an IPv4 address")
-		os.Exit(1)
+		return fmt.Errorf("-socks-listen requires an IPv4 address")
 	}
 	cfg.SocksListenIP = listenIP
-	if *transport != "" {
-		cfg.Transport = *transport
+	if transport != "" {
+		cfg.Transport = transport
 	}
 	cfg.Transport = config.CanonicalMode(cfg.Transport)
 	if !config.ValidClientMode(cfg.Transport) {
-		fmt.Fprintf(os.Stderr, "btawg-client: unsupported transport %q (want %s)\n", cfg.Transport, strings.Join(config.ClientModes(), "|"))
-		os.Exit(1)
+		return fmt.Errorf("unsupported transport %q (want %s)", cfg.Transport, strings.Join(config.ClientModes(), "|"))
 	}
-	if *dhtOnly {
+	if dhtOnly {
 		if !config.IsCarrierMode(cfg.Transport) {
-			fmt.Fprintln(os.Stderr, "btawg-client: -dht is only available for carrier modes")
-			os.Exit(1)
+			return fmt.Errorf("-dht is only available for carrier modes")
 		}
 		cfg.CarrierEndpoint = ""
 	}
 
 	var c *client.Client
-	if *noTun {
+	if noTun {
 		c, err = client.New(cfg)
 	} else {
 		subnet, perr := netip.ParsePrefix(cfg.Subnet)
 		if perr != nil || !subnet.Addr().Is4() || subnet.Bits() == 0 {
-			fmt.Fprintf(os.Stderr, "btawg-client: invalid IPv4 subnet %q\n", cfg.Subnet)
-			os.Exit(1)
+			return fmt.Errorf("invalid IPv4 subnet %q", cfg.Subnet)
 		}
 		addr := netip.PrefixFrom(netip.MustParseAddr(cfg.ClientIP), subnet.Bits())
-		if serr := tunsetup.Setup(*tunName, addr, &subnet, config.DefaultMTU, false); serr != nil {
-			fmt.Fprintf(os.Stderr, "btawg-client: tun setup (root required): %v\n", serr)
-			os.Exit(1)
+		if serr := tunsetup.Setup(tunName, addr, &subnet, config.DefaultMTU, false); serr != nil {
+			return fmt.Errorf("tun setup (root required): %w", serr)
 		}
-		if err := addRoutes(*tunName, cfg.Routes, subnet); err != nil {
-			fmt.Fprintf(os.Stderr, "btawg-client: add routes: %v\n", err)
-			os.Exit(1)
+		if err := addRoutes(tunName, cfg.Routes, subnet); err != nil {
+			return fmt.Errorf("add routes: %w", err)
 		}
-		// Deliberately assigns the outer err: the failure of NewRealTUN
-		// must reach the check below, not a shadowed copy.
-		c, err = client.NewRealTUN(cfg, *tunName)
+		c, err = client.NewRealTUN(cfg, tunName)
 	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "btawg-client: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	defer c.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-
-	go func() {
-		if config.IsNativeMode(cfg.Transport) {
-			fmt.Printf("btawg-client: native %s mode\n", cfg.Transport)
-			return
-		}
-		if cfg.CarrierEndpoint != "" {
-			fmt.Printf("btawg-client: connecting directly to %s (%s)\n", cfg.CarrierEndpoint, cfg.Transport)
-			return
-		}
-		fmt.Printf("btawg-client: connecting via DHT (infohash %s)...\n", cfg.InfoHash)
-	}()
-	errCh := make(chan error, 1)
-	go func() { errCh <- c.Run(ctx) }()
-
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("btawg-client: shutting down")
-			return
-		case err := <-errCh:
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "btawg-client: %v\n", err)
-				os.Exit(1)
-			}
-			return
-		}
+	if err := c.Run(ctx); err != nil {
+		return err
 	}
+	return nil
 }
 
-// addRoutes installs explicit managed CIDRs on the TUN interface. It skips
-// the subnet itself (already installed by tunsetup.Setup) and the default
-// route, and ignores "file exists" errors so repeated runs are idempotent.
+// addRoutes installs explicit managed CIDRs on the TUN interface. It skips the
+// subnet itself and any default route, and ignores duplicate additions.
 func addRoutes(tunName string, routes []string, subnet netip.Prefix) error {
 	for _, r := range routes {
 		p, err := netip.ParsePrefix(r)
 		if err != nil {
 			return fmt.Errorf("parse route %q: %w", r, err)
 		}
-		if !p.Addr().Is4() {
-			return fmt.Errorf("IPv6 route %q not supported", r)
-		}
-		if p.Bits() == 0 {
-			return fmt.Errorf("default route %q not allowed", r)
+		if !p.Addr().Is4() || p.Bits() == 0 {
+			continue
 		}
 		if p.Masked() == subnet.Masked() {
 			continue
 		}
 		cmd := exec.Command("ip", "route", "add", p.Masked().String(), "dev", tunName)
 		if out, err := cmd.CombinedOutput(); err != nil {
-			msg := string(out)
-			if strings.Contains(msg, "File exists") {
+			if strings.Contains(string(out), "File exists") {
 				continue
 			}
-			return fmt.Errorf("ip route add %s: %w: %s", p.String(), err, msg)
+			return fmt.Errorf("ip route add %s: %w: %s", p.Masked().String(), err, strings.TrimSpace(string(out)))
 		}
 	}
 	return nil
