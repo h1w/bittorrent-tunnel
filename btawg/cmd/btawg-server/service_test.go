@@ -100,4 +100,3 @@ func TestInstallCmdCopiesBinaryAndPrintsPassword(t *testing.T) {
 		t.Fatalf("password should not be printed again: %q", out.String())
 	}
 }
-

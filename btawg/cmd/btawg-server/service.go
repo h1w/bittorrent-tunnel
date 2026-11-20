@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/crypto/bcrypt"
 
@@ -75,16 +76,17 @@ func installCmd(args []string) error {
 	if launch.Store == managedStorePath {
 		pendingPath = "/etc/btawg/.admin-password"
 	}
+	state, _, err := service.Server.State()
 	if err != nil {
 		return err
 	}
-	defer st.Close()
-
-	// Persist a root-only plaintext copy so the password survives a failed
-	// enable/start and can still be printed on the next attempt.
-	if generated {
-		if err := service.WriteFile(pendingPassPath, []byte(pw), 0o600); err != nil {
-			return fmt.Errorf("save pending password: %w", err)
+	if state != "active" {
+		st, _, _, err := openOrCreateServerStore(launch.Store, pendingPath)
+		if err != nil {
+			return err
+		}
+		if err := st.Close(); err != nil {
+			return err
 		}
 	}
 	data, err := json.MarshalIndent(launch, "", "  ")

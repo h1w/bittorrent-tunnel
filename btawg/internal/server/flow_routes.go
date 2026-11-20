@@ -65,9 +65,9 @@ type flowTable struct {
 	maxEntries int
 	flowTTL    time.Duration
 
-	flows   map[flowKey]flowEntry
-	frags   map[fragmentKey]*engineTun
-	lru     []flowKey // oldest first, updated on hit
+	flows    map[flowKey]flowEntry
+	frags    map[fragmentKey]*engineTun
+	lru      []flowKey // oldest first, updated on hit
 	lruFrags []fragmentKey
 }
 

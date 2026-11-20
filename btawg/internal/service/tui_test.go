@@ -163,4 +163,3 @@ func TestTUIRunsOnPTY(t *testing.T) {
 		t.Fatal("TUI did not exit on pty")
 	}
 }
-

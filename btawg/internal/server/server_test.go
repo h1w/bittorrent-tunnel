@@ -350,4 +350,3 @@ func TestNewRealTUNLive(t *testing.T) {
 		t.Fatalf("tun %s missing %q, has:\n%s", tunName, cfg.ServerIP+"/24", out)
 	}
 }
-

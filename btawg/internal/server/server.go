@@ -46,17 +46,17 @@ type Server struct {
 	pubKey      string
 	tlsIdentity *iptunnel.Identity
 
-	dev     *device.Device // native AWG
-	wg      *device.Device // native WG
-	modeDevs map[string]*device.Device // AWG crypto per carrier mode
-	modeBinds map[string]*bind.Bind    // stream bind per carrier mode
-	ns       *netstack.Net
-	router   *packetRouter
-	kernel   *tunsetup.Hub
-	tunName  string
+	dev       *device.Device            // native AWG
+	wg        *device.Device            // native WG
+	modeDevs  map[string]*device.Device // AWG crypto per carrier mode
+	modeBinds map[string]*bind.Bind     // stream bind per carrier mode
+	ns        *netstack.Net
+	router    *packetRouter
+	kernel    *tunsetup.Hub
+	tunName   string
 
 	modeCarriers map[string]carrier.Transport // mode/IP -> current carrier
-	managed      bool                          // true when run by the managed systemd path
+	managed      bool                         // true when run by the managed systemd path
 
 	mu           sync.Mutex
 	applyMu      sync.Mutex

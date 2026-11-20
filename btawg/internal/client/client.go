@@ -38,9 +38,9 @@ type Client struct {
 	ns   *netstack.Net // non-nil in netstack mode
 	ip   *tlsTunnel    // non-nil for TLS carrier modes
 
-	proxyTCP   func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
-	proxyUDP   func(ctx context.Context) (net.PacketConn, error)
-	proxyRoute *tunsetup.ProxyRoute
+	proxyTCP    func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
+	proxyUDP    func(ctx context.Context) (net.PacketConn, error)
+	proxyRoute  *tunsetup.ProxyRoute
 	markedRoute *tunsetup.MarkedRoute
 
 	disc func(ctx context.Context) ([]netip.AddrPort, error)
