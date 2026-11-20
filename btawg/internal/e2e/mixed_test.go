@@ -11,6 +11,7 @@ import (
 
 	"bittorrent-tunnel/btawg/internal/client"
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/server"
 )
 
 func TestMixedTransportStableAddress(t *testing.T) {
@@ -18,7 +19,7 @@ func TestMixedTransportStableAddress(t *testing.T) {
 	defer cancel()
 	relay := newRelay(t)
 	specs := []clientSpec{{id: "a", ip: "10.77.0.2"}, {id: "b", ip: "10.77.0.3"}, {id: "c", ip: "10.77.0.4"}, {id: "d", ip: "10.77.0.5"}, {id: "e", ip: "10.77.0.6"}, {id: "f", ip: "10.77.0.7"}}
-	hub, _, recs := hubWithClients(t, ctx, relay, specs, "ext-utp")
+	hub, st, recs := hubWithClients(t, ctx, relay, specs, "ext-utp")
 	modes := []string{"ext-tcp", "req-tcp", "ext-utp", "req-utp", "awg", "wg"}
 	cs := make([]*client.Client, len(modes))
 	ls := make([]net.Listener, len(modes))
@@ -97,9 +98,29 @@ func TestMixedTransportStableAddress(t *testing.T) {
 	for i := range modes {
 		probe(i, (i+1)%len(modes))
 	}
+	before := hub.Traffic()[recs[5].ID]
+	if before.Up == 0 || before.Down == 0 || before.LastSeen == 0 {
+		t.Fatalf("WG traffic not accounted: %+v", before)
+	}
 	// A new stack using the same identity and address can leave WG for AWG.
 	ls[5].Close()
 	cs[5].Close()
 	cs[5] = start(5, "awg")
 	probe(5, 0)
+	after := hub.Traffic()[recs[5].ID]
+	if after.Up <= before.Up || after.Down <= before.Down {
+		t.Fatalf("changing transport lost traffic: before %+v, after %+v", before, after)
+	}
+	if err := hub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := server.New(cfg, st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	saved := restarted.Traffic()[recs[5].ID]
+	if saved.Up < after.Up || saved.Down < after.Down || saved.LastSeen < after.LastSeen {
+		t.Fatalf("traffic after restart: got %+v; want at least %+v", saved, after)
+	}
 }

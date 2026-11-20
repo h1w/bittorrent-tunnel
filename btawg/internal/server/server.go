@@ -53,15 +53,18 @@ type Server struct {
 	kernel  *tunsetup.Hub
 	tunName string
 
-	mu        sync.Mutex
-	applyMu   sync.Mutex
-	closeOnce sync.Once
-	hashes    map[[20]byte]string
-	peers     map[string]store.ClientRecord
-	sessions  map[string]map[carrier.Transport]struct{}
-	gateways  []netip.Prefix
-	byPeerID  map[string]store.ClientRecord
-	attached  map[string]int // client IP -> carrier count
+	mu           sync.Mutex
+	applyMu      sync.Mutex
+	closeOnce    sync.Once
+	closeErr     error
+	trafficWG    sync.WaitGroup
+	savedTraffic map[string]store.Traffic
+	hashes       map[[20]byte]string
+	peers        map[string]store.ClientRecord
+	sessions     map[string]map[carrier.Transport]struct{}
+	gateways     []netip.Prefix
+	byPeerID     map[string]store.ClientRecord
+	attached     map[string]int // client IP -> carrier count
 
 	policy *policySnapshot
 
@@ -128,6 +131,7 @@ func newServer(cfg config.ServerConfig, st *store.Store, tunName string) (*Serve
 		s.Close()
 		return nil, err
 	}
+	s.trafficWG.Go(s.refreshHandshakeRoutes)
 	return s, nil
 }
 
@@ -237,6 +241,17 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 	}
 
 	s.policy = newPolicySnapshot()
+	s.savedTraffic, err = st.LoadTraffic()
+	if err != nil {
+		return nil, fmt.Errorf("load traffic: %w", err)
+	}
+	for id, v := range s.savedTraffic {
+		c := new(trafficCounter)
+		c.up.Store(v.Up)
+		c.down.Store(v.Down)
+		c.lastSeen.Store(v.LastSeen)
+		s.policy.traffic[id] = c
+	}
 	if err := s.policy.reload(st, serverIP); err != nil {
 		return nil, fmt.Errorf("load policy: %w", err)
 	}
@@ -393,7 +408,6 @@ func (s *Server) Run(ctx context.Context) error {
 		cancel()
 	}()
 
-	go s.refreshHandshakeRoutes(runCtx)
 	prefix := egressDenied{policy: s.policy}
 	egress := socks.NewServer(
 		newEgressDialer(prefix, net.DefaultResolver),
@@ -732,9 +746,9 @@ func (s *Server) ConnectedCount() map[string]int {
 
 // Close tears the hub down.
 func (s *Server) Close() error {
-	var err error
 	s.closeOnce.Do(func() {
 		close(s.closed)
+		s.trafficWG.Wait()
 		for _, a := range s.anns {
 			a.Close()
 		}
@@ -759,13 +773,13 @@ func (s *Server) Close() error {
 			s.wg.Close()
 		}
 		if s.kernel != nil {
-			err = s.kernel.Close()
+			s.closeErr = s.kernel.Close()
 		}
 		if s.router != nil {
-			err = errors.Join(err, s.router.close())
+			s.closeErr = errors.Join(s.closeErr, s.router.close(), s.flushTraffic())
 		}
 	})
-	return err
+	return s.closeErr
 }
 
 // SetDHTBootstrap updates discovery bootstrap for both framing hashes.

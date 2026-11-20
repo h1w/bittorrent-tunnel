@@ -45,9 +45,9 @@ func (f *fakeRegistry) Config() config.ServerConfig {
 	return config.DefaultServerConfig()
 }
 
-func (f *fakeRegistry) ConnectedCount() map[string]int { return nil }
-func (f *fakeRegistry) InfoHash() string               { return "aabbccddeeff00112233445566778899aabbccdd" }
-func (f *fakeRegistry) PubKey() string                 { return "11223344556677889900aabbccddeeff00112233" }
+func (f *fakeRegistry) Traffic() map[string]store.Traffic { return nil }
+func (f *fakeRegistry) InfoHash() string                  { return "aabbccddeeff00112233445566778899aabbccdd" }
+func (f *fakeRegistry) PubKey() string                    { return "11223344556677889900aabbccddeeff00112233" }
 
 func importParse(raw string) (config.ClientConfig, error) {
 	return config.ParseImportString(raw)

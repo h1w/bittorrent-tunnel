@@ -1,101 +1,91 @@
 package panel
 
 import (
+	_ "embed"
 	"html/template"
 	"net/http"
 )
 
-// layout is the 3x-ui-inspired shell: dark top bar, sidebar, content pane.
+//go:embed panel.css
+var panelCSS string
+
+//go:embed panel.js
+var panelJS string
+
+// layout is shared by all server-rendered screens.
 const layout = `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>btawg</title>
-<style>
-:root{--bg:#12151c;--panel:#1a1f2a;--line:#2a3140;--fg:#e6e9f0;--muted:#8b94a7;--accent:#4f8cff;--ok:#3ecf8e;--warn:#e5b455}
-*{box-sizing:border-box}
-body{margin:0;font:14px/1.5 system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-a{color:var(--accent);text-decoration:none}
-header{display:flex;align-items:center;gap:16px;padding:12px 20px;background:var(--panel);border-bottom:1px solid var(--line)}
-header .brand{font-weight:700;font-size:16px}
-header form{margin-left:auto}
-.container{display:flex;min-height:calc(100vh - 53px)}
-nav{width:190px;background:var(--panel);border-right:1px solid var(--line);padding:14px 0}
-nav a{display:block;padding:10px 20px;color:var(--muted)}
-nav a.active,nav a:hover{color:var(--fg);background:var(--line)}
-main{flex:1;padding:24px;max-width:860px}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px;margin-bottom:18px}
-h1{font-size:18px;margin:0 0 14px}
-h2{font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin:0 0 10px}
-table{width:100%;border-collapse:collapse}
-td,th{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left}
-th{color:var(--muted);font-weight:500}
-input,select{background:var(--bg);border:1px solid var(--line);border-radius:5px;color:var(--fg);padding:7px 9px;width:100%}
-input:focus,select:focus{outline:1px solid var(--accent)}
-button{background:var(--accent);border:0;border-radius:5px;color:#fff;padding:8px 16px;cursor:pointer;font-weight:600}
-button.warn{background:var(--warn)}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
-.grid label{font-size:12px;color:var(--muted)}
-.row{display:flex;gap:10px;align-items:flex-end}
-.row>div{flex:1}
-.tag{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px}
-.tag.ok{background:rgba(62,207,142,.15);color:var(--ok)}
-.tag.off{background:rgba(139,148,167,.15);color:var(--muted)}
-.mono{font-family:ui-monospace,monospace;font-size:12px;word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:10px}
-.note{color:var(--warn);font-size:12px}
-.err{color:#ff6b6b;margin-bottom:10px}
-</style>
+<link rel="stylesheet" href="/assets/panel.css">
+<script src="/assets/panel.js" defer></script>
 </head>
 <body>
-<header><span class="brand">⚡ btawg</span>
-{{if .Active}}<form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button>Logout</button></form>{{end}}
-</header>
-<div class="container">
+<header><div class="top"><a class="brand" href="/"><span class="mark" aria-hidden="true">◈</span> btawg</a>
 {{if .Active}}
-<nav>
-<a href="/" {{if eq .Active "dashboard"}}class="active"{{end}}>Dashboard</a>
-<a href="/server" {{if eq .Active "server"}}class="active"{{end}}>Server settings</a>
-<a href="/groups" {{if eq .Active "groups"}}class="active"{{end}}>Groups</a>
-<a href="/clients" {{if eq .Active "clients"}}class="active"{{end}}>Clients</a>
+<nav aria-label="Main navigation">
+<a href="/" {{if eq .Active "dashboard"}}class="active" aria-current="page"{{end}}>Overview</a>
+<a href="/clients" {{if eq .Active "clients"}}class="active" aria-current="page"{{end}}>Clients</a>
+<a href="/groups" {{if eq .Active "groups"}}class="active" aria-current="page"{{end}}>Groups</a>
+<a href="/server" {{if eq .Active "server"}}class="active" aria-current="page"{{end}}>Server</a>
 </nav>
+<form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="quiet">Sign out</button></form>
 {{end}}
+</div></header>
 <main>{{template "content" .}}</main>
-</div>
 </body></html>`
 
 const loginTmpl = `{{define "content"}}
-<div class="card" style="max-width:360px;margin:80px auto">
-<h1>Sign in to btawg</h1>
-{{if .Error}}<div class="err">{{.Error}}</div>{{end}}
-<form method="post" action="/login">
-<label>Username<br><input name="username" autocomplete="username"></label><br><br>
-<label>Password<br><input type="password" name="password" autocomplete="current-password"></label><br><br>
-<button style="width:100%">Login</button>
+<div class="card form-card">
+<h1>Sign in</h1>
+<p class="intro">Manage your VPN hub.</p>
+{{if .Error}}<div class="err" role="alert">{{.Error}}</div>{{end}}
+<form class="stack" method="post" action="/login">
+<label>Username<input name="username" autocomplete="username" required></label>
+<label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+<button>Sign in</button>
 </form>
 </div>
 {{end}}`
 
 const dashboardTmpl = `{{define "content"}}
-<h1>Dashboard</h1>
-<div class="card"><h2>Hub</h2>
-<table>
-<tr><th>Infohash</th><td class="mono">{{.InfoHash}}</td></tr>
-<tr><th>Public key</th><td class="mono">{{.PubKey}}</td></tr>
-<tr><th>Transport</th><td>{{.Cfg.Transport}}</td></tr>
-<tr><th>Carrier port</th><td>{{.Cfg.CarrierPort}}</td></tr>
-<tr><th>Native ports</th><td>AWG {{.Cfg.AWGPort}}, WG {{.Cfg.WGPort}}</td></tr>
-<tr><th>Clients</th><td>{{len .Clients}}</td></tr>
-<tr><th>Groups</th><td>{{len .Groups}}</td></tr>
-</table>
+<div data-live>
+<div class="page-head"><div><span class="eyebrow">VPN hub</span><h1>Overview</h1><p class="intro">Live client activity and total VPN traffic.</p></div><a class="button" href="/clients#new-client">Add client</a></div>
+<section class="summary" aria-label="Traffic summary">
+<div class="card"><span>Recently active / registered</span><strong data-metric="active">— / {{len .Clients}}</strong></div>
+<div class="card"><span>↑ Upload from clients</span><strong data-metric="up">—</strong></div>
+<div class="card"><span>↓ Download to clients</span><strong data-metric="down">—</strong></div>
+<div class="card"><span>Traffic since tracking began</span><strong data-metric="total">—</strong></div>
+</section>
+{{template "live-table" .}}
 </div>
-<div class="card"><h2>Connected carriers</h2>
-{{if .Connected}}
-<table><tr><th>Overlay IP</th><th>Carriers</th></tr>
-{{range $ip, $n := .Connected}}<tr><td>{{$ip}}</td><td>{{$n}}</td></tr>{{end}}
-</table>
-{{else}}<div class="tag off">no clients connected</div>{{end}}
-</div>
+{{end}}`
+
+const liveTableTmpl = `{{define "live-table"}}
+<section class="card" data-live-table>
+<div class="toolbar"><div><h2>Clients</h2><span class="sub" data-health role="status">Waiting for live data…</span><a class="sub" data-reload href="" hidden>Client list changed. Reload to update.</a></div>
+{{if .Clients}}<label><input type="search" data-filter placeholder="Filter by name, group or IP" aria-label="Filter by name, group or IP"></label>{{end}}</div>
+{{if .Clients}}
+<div class="scroll live-scroll" tabindex="0" role="region" aria-label="Client activity table">
+<table class="live-table" role="table" aria-label="Client activity"><thead role="rowgroup"><tr role="row"><th role="columnheader" scope="col">Client / Group</th><th role="columnheader" scope="col">VPN address</th><th role="columnheader" scope="col">Activity / Last seen</th><th role="columnheader" scope="col">Current speed</th><th role="columnheader" scope="col">Total VPN traffic</th><th role="columnheader" scope="col">Actions</th></tr></thead><tbody role="rowgroup">
+{{range .Clients}}{{$group := index $.GroupNames .GroupID}}{{$live := index $.Live .ID}}
+<tr id="client-{{.ID}}" role="row" data-client="{{.ID}}" data-revoked="{{.Revoked}}" data-search="{{.Name}} {{$group}} {{.IP}}">
+<td role="cell" class="identity"><strong>{{.Name}}</strong><span class="sub">{{$group}}</span></td><td role="cell" class="address numbers">{{.IP}}</td>
+<td role="cell" class="live-state"><span data-status class="tag{{if eq $live.Status "active"}} ok{{else if .Revoked}} revoked{{end}}">{{statusLabel $live.Status}}</span><span class="sub" data-seen>{{seenAt $live.LastSeen}}</span></td>
+<td role="cell" class="rates numbers"><span class="mobile-label">Current speed</span><span data-rates>↑ — · ↓ —</span></td>
+<td role="cell" class="usage numbers"><span class="mobile-label">Total VPN traffic</span><strong data-total>{{byteSize (sum $live.Up $live.Down)}}</strong><span class="sub" data-breakdown>↑ {{byteSize $live.Up}} · ↓ {{byteSize $live.Down}}</span></td>
+<td role="cell" class="actions">{{if not .Revoked}}<a href="/clients/import?id={{.ID}}">Import config</a>
+{{if eq $.Active "clients"}}{{template "client-actions" (clientActions . $)}}{{else}}<span class="sub"><a href="/clients#client-{{.ID}}">Manage</a></span>{{end}}
+{{else}}<span class="sub">Access disabled</span>{{end}}</td></tr>
+{{end}}
+</tbody></table></div>
+<p class="empty" data-no-matches hidden>No clients match your search.</p>
+{{else}}<p class="empty">No clients yet. <a href="/clients#new-client">Add your first client</a>.</p>{{end}}
+<p class="hint">Active means a verified handshake or upload in the past 3 minutes. Counters include traffic to the hub, other clients and the Internet. ↑ and ↓ are from each client’s perspective.</p>
+<noscript><p class="note">Enable JavaScript for live speeds and automatic refresh.</p></noscript>
+</section>
 {{end}}`
 
 const serverTmpl = `{{define "content"}}
@@ -152,65 +142,56 @@ const serverTmpl = `{{define "content"}}
 {{end}}`
 
 const clientsTmpl = `{{define "content"}}
-<h1>Clients</h1>
-<div class="card"><h2>Create client</h2>
+<div data-live>
+<div class="page-head"><div><span class="eyebrow">Access</span><h1>Clients</h1><p class="intro">Add devices, manage access and retrieve client configuration.</p></div></div>
+<section class="card" id="new-client"><h2>Add client</h2>
 <form method="post" action="/clients/create">
 <input type="hidden" name="csrf" value="{{.CSRF}}">
-<div class="row"><div><label>Name (optional)<input name="name" placeholder="laptop"></label></div>
-<div><label>Group
-<select name="group_id">
-<option value="{{.DefaultID}}">Default</option>
-{{range .Groups}}<option value="{{.ID}}">{{.Name}}</option>{{end}}
-</select></label></div>
-<div style="flex:0"><button>Create → import string</button></div></div>
+<div class="row"><div><label>Device name (optional)<input name="name" placeholder="Laptop"></label></div>
+<div><label>Group<select name="group_id">{{range .Groups}}<option value="{{.ID}}" {{if eq .ID "default"}}selected{{end}}>{{.Name}}</option>{{end}}</select></label></div>
+<button>Create &amp; get config</button></div>
 </form>
+</section>
+{{template "live-table" .}}
 </div>
-<div class="card"><h2>Deployed</h2>
-{{if .Clients}}
-<table><tr><th>Name</th><th>Group</th><th>Overlay IP</th><th>Status</th><th>Policy</th><th></th><th></th><th></th></tr>
-{{$cs := .Connected}}{{$groups := .Groups}}{{$def := .DefaultID}}
-{{range .Clients}}
-<tr><td>{{.Name}}</td><td>{{if eq .GroupID $def}}Default{{else}}{{.GroupID}}{{end}}</td><td>{{.IP}}</td>
-<td>{{if index $cs .IP}}<span class="tag ok">connected</span>{{else if .Revoked}}<span class="tag off">revoked</span>{{else}}<span class="tag off">offline</span>{{end}}</td>
-<td>{{if not .Revoked}}
-<form method="post" action="/clients/policy" style="display:flex;gap:8px;align-items:center">
-<input type="hidden" name="csrf" value="{{$.CSRF}}">
-<input type="hidden" name="id" value="{{.ID}}">
-<select name="internet" style="min-width:90px">
-<option value="inherit" {{if not .Internet}}selected{{end}}>inherit</option>
-<option value="on" {{if and .Internet (deref .Internet)}}selected{{end}}>internet on</option>
-<option value="off" {{if and .Internet (not (deref .Internet))}}selected{{end}}>internet off</option>
-</select>
-<select name="peers" multiple size="3" style="min-width:120px">
-<option value="inherit" {{if unset .VisiblePeers}}selected{{end}}>inherit (group)</option>
-<option value="none" {{if and (not (unset .VisiblePeers)) (not .VisiblePeers)}}selected{{end}}>Nobody</option>
-<option value="*" {{if contains .VisiblePeers "*"}}selected{{end}}>All</option>
-{{$self := .ID}}{{$vp := .VisiblePeers}}
-{{range $.Clients}}{{if ne .ID $self}}<option value="{{.ID}}" {{if contains $vp .ID}}selected{{end}}>{{.Name}}</option>{{end}}{{end}}
-</select>
-<button>Save</button>
+{{end}}`
+
+const clientActionsTmpl = `{{define "client-actions"}}
+{{$c := .Client}}
+<details><summary>Access &amp; actions</summary>
+<form class="stack" method="post" action="/clients/policy">
+<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="id" value="{{$c.ID}}">
+<label>Internet<select name="internet">
+<option value="inherit" {{if not $c.Internet}}selected{{end}}>Use group setting</option>
+<option value="on" {{if and $c.Internet (deref $c.Internet)}}selected{{end}}>Allow</option>
+<option value="off" {{if and $c.Internet (not (deref $c.Internet))}}selected{{end}}>Block</option>
+</select></label>
+<label>Visible clients<select name="peers" multiple size="4">
+<option value="inherit" {{if unset $c.VisiblePeers}}selected{{end}}>Use group setting</option>
+<option value="none" {{if and (not (unset $c.VisiblePeers)) (not $c.VisiblePeers)}}selected{{end}}>Nobody</option>
+<option value="*" {{if contains $c.VisiblePeers "*"}}selected{{end}}>Everyone</option>
+{{range .Clients}}{{if and (ne .ID $c.ID) (not .Revoked)}}<option value="{{.ID}}" {{if contains $c.VisiblePeers .ID}}selected{{end}}>{{.Name}}</option>{{end}}{{end}}
+</select></label>
+<button class="quiet">Save access</button>
 </form>
-{{end}}</td>
-<td><a href="/clients/import?id={{.ID}}">import</a></td>
-<td>{{if not .Revoked}}<form method="post" action="/clients/move" style="display:flex;gap:4px">
-<input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}">
-<select name="group_id"><option value="{{$def}}">Default</option>{{range $groups}}<option value="{{.ID}}">{{.Name}}</option>{{end}}</select>
-<button>Move</button></form>{{end}}</td>
-<td>{{if not .Revoked}}<form method="post" action="/clients/revoke" onsubmit="return confirm('Revoke this client?')">
-<input type="hidden" name="csrf" value="{{$.CSRF}}"><input type="hidden" name="id" value="{{.ID}}">
-<button class="warn">Revoke</button></form>{{end}}</td>
-</tr>
-{{end}}
-</table>
-{{else}}<div class="tag off">no clients yet</div>{{end}}
-</div>
+<form class="stack" method="post" action="/clients/move">
+<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="id" value="{{$c.ID}}">
+<label>Move to group<select name="group_id">{{range .Groups}}<option value="{{.ID}}" {{if eq .ID $c.GroupID}}selected{{end}}>{{.Name}}</option>{{end}}</select></label>
+<span class="sub">Changing groups assigns a new VPN address. Import the config again.</span>
+<button class="quiet">Move client</button>
+</form>
+<form method="post" action="/clients/revoke" onsubmit="return confirm('Revoke access for this client?')">
+<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="id" value="{{$c.ID}}">
+<button class="warn">Revoke access</button></form>
+</details>
 {{end}}`
 
 const importTmpl = `{{define "content"}}
 <h1>Import string — {{.Client.Name}}</h1>
 <div class="card"><h2>btawg:// client bootstrap</h2>
 <p>This string is a <b>secret</b>: it carries the client's private key. Run on any PC:</p>
-<pre class="mono">btawg-client '{{.Import}}'</pre>
+<pre class="mono" id="import-command">btawg-client '{{.Import}}'</pre>
+<p><button type="button" class="quiet" data-copy="import-command">Copy command</button> <span class="sub" data-copy-status role="status"></span></p>
 <p class="note">Copy it over a trusted channel. New imports connect directly. Select a carrier with <code>-transport</code> and use <code>-dht</code> when you want carrier discovery instead.</p>
 </div>
 <div class="card"><h2>Native config export</h2>
@@ -235,7 +216,8 @@ const nativeTmpl = `{{define "content"}}
 
 const groupsTmpl = `{{define "content"}}
 <h1>Groups</h1>
-<div class="card"><a href="/groups/edit"><button>Create group</button></a></div>
+<p class="intro">Organize clients into VPN subnets and set their default access.</p>
+<p><a class="button" href="/groups/edit">Add group</a></p>
 <div class="card"><h2>Groups</h2>
 {{if .Groups}}
 <table><tr><th>Name</th><th>Subnet</th><th>Gateway</th><th>Internet</th><th>Visible groups</th><th></th></tr>
@@ -302,13 +284,18 @@ func init() {
 		"deref": func(b *bool) bool {
 			return b != nil && *b
 		},
-		"unset": func(v []string) bool { return v == nil },
+		"unset":         func(v []string) bool { return v == nil },
+		"clientActions": actionsData,
+		"statusLabel":   statusLabel,
+		"seenAt":        seenAt,
+		"byteSize":      byteSize,
+		"sum":           func(a, b uint64) uint64 { return a + b },
 	}
 	for name, body := range map[string]string{
 		"login":      loginTmpl,
-		"dashboard":  dashboardTmpl,
+		"dashboard":  dashboardTmpl + liveTableTmpl + clientActionsTmpl,
 		"server":     serverTmpl,
-		"clients":    clientsTmpl,
+		"clients":    clientsTmpl + liveTableTmpl + clientActionsTmpl,
 		"import":     importTmpl,
 		"native":     nativeTmpl,
 		"groups":     groupsTmpl,

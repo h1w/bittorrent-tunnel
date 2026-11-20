@@ -3,6 +3,7 @@ package server
 import (
 	"net/netip"
 	"sync"
+	"time"
 
 	"bittorrent-tunnel/btawg/internal/store"
 )
@@ -14,6 +15,8 @@ type policySnapshot struct {
 	mu       sync.RWMutex
 	serverIP netip.Addr
 	byIP     map[netip.Addr]store.ClientRecord
+	byAddr   map[netip.Addr]*trafficCounter
+	traffic  map[string]*trafficCounter
 	groups   map[string]store.GroupRecord
 	gateways map[netip.Addr]string
 	prefixes []netip.Prefix
@@ -23,7 +26,8 @@ type policySnapshot struct {
 // newPolicySnapshot creates an empty policy snapshot.
 func newPolicySnapshot() *policySnapshot {
 	return &policySnapshot{
-		byIP: make(map[netip.Addr]store.ClientRecord),
+		byIP:    make(map[netip.Addr]store.ClientRecord),
+		traffic: make(map[string]*trafficCounter),
 	}
 }
 
@@ -31,12 +35,14 @@ func newPolicySnapshot() *policySnapshot {
 func (p *policySnapshot) remove(ip netip.Addr) {
 	p.mu.Lock()
 	delete(p.byIP, ip)
+	delete(p.byAddr, ip)
 	p.mu.Unlock()
 }
 
 func (p *policySnapshot) disableClients() {
 	p.mu.Lock()
 	clear(p.byIP)
+	clear(p.byAddr)
 	p.mu.Unlock()
 }
 
@@ -76,6 +82,16 @@ func (p *policySnapshot) reload(st *store.Store, serverIP netip.Addr) error {
 	}
 
 	p.mu.Lock()
+	byAddr := make(map[netip.Addr]*trafficCounter, len(next))
+	for addr, rec := range next {
+		counter := p.traffic[rec.ID]
+		if counter == nil {
+			counter = new(trafficCounter)
+			p.traffic[rec.ID] = counter
+		}
+		byAddr[addr] = counter
+	}
+	p.byAddr = byAddr
 	p.serverIP = serverIP
 	p.byIP = next
 	p.groups, p.gateways, p.prefixes = groupByID, gateways, prefixes
@@ -117,10 +133,56 @@ func (p *policySnapshot) overlay(ip netip.Addr) bool {
 	return false
 }
 
-// packetAllowed is used only with a source authenticated by an engine's /32.
-func (p *policySnapshot) packetAllowed(src, dst netip.Addr, directInternet bool) bool {
+func (p *policySnapshot) handshake(addr netip.Addr, key string, at time.Time) bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
+	if rec, ok := p.byIP[addr]; !ok || rec.PubKey != key {
+		return false
+	}
+	p.byAddr[addr].observe(at.UnixMilli())
+	return true
+}
+
+// upload validates the engine-authenticated source and accounts only IP bytes
+// accepted by policy.
+func (p *policySnapshot) upload(src, dst netip.Addr, directInternet bool, size int, now time.Time) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.packetAllowed(src, dst, directInternet) {
+		return false
+	}
+	c := p.byAddr[src]
+	c.up.Add(uint64(size))
+	c.observe(now.UnixMilli())
+	return true
+}
+
+// downlink revalidates packets before delivery. A zero size is the queue's
+// early authorization check, not a transfer to the client.
+func (p *policySnapshot) downlink(src, dst netip.Addr, size int) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	c := p.byAddr[dst]
+	if c == nil {
+		return false
+	}
+	if !p.gateway(src) {
+		if _, overlayClient := p.byIP[src]; overlayClient {
+			if !p.packetAllowed(src, dst, false) {
+				return false
+			}
+		} else if !p.packetAllowed(dst, src, true) {
+			return false
+		}
+	}
+	if size != 0 {
+		c.down.Add(uint64(size))
+	}
+	return true
+}
+
+// packetAllowed requires the policy lock.
+func (p *policySnapshot) packetAllowed(src, dst netip.Addr, directInternet bool) bool {
 	a, ok := p.byIP[src]
 	if !ok || !dst.Is4() || dst.IsMulticast() || dst.IsUnspecified() || dst.IsLoopback() || dst.IsLinkLocalUnicast() || dst == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
 		return false

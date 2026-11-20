@@ -73,9 +73,9 @@ ssh -L 8080:127.0.0.1:8080 vps      # panel is loopback-only by design
 ```
 
 Open `http://127.0.0.1:8080`, log in (`admin` + printed password), then
-**Clients → Create** → open the import page → copy the `btawg://…` string.
-It is a secret (contains the client's private key); hand it over the same
-way you would a WireGuard config.
+**Clients → Add client → Create & get config**. Copy the `btawg://…` string
+or the full client command. The import contains the client's private key;
+share it as you would a WireGuard config.
 
 ### 3. Client machine
 
@@ -209,6 +209,25 @@ the default group; existing per-user permissions become explicit. Policy
 edits are live. Changing the hub listener ports or AWG profile requires a
 restart and a fresh import. In `-no-tun` mode the group gateway addresses
 are fixed at startup; use real TUN to change group networks live.
+
+## Live activity and traffic
+
+**Overview** shows recent activity, live upload and download speeds, and
+cumulative VPN traffic. Search by client name, group or VPN IP. **Clients**
+has the same live table plus access, group and revocation controls. The
+visible page refreshes traffic every two seconds without refreshing forms.
+
+**Active** means a verified handshake or an accepted upload in the last
+three minutes. It does not prove that an idle WireGuard peer is still
+online. The arrows show direction from the client's perspective. Counters
+count inner IP bytes, not the BitTorrent/WG overhead on the public link;
+client-to-client traffic counts at both ends. Traffic to the hub and
+Internet traffic also count. Moving a user or switching transports does not
+reset that user's totals.
+
+The hub checkpoints totals to its existing database every 15 seconds and
+on clean shutdown. Tracking starts on upgrade; pre-upgrade traffic cannot
+be recovered. An unclean shutdown may lose traffic since the last checkpoint.
 
 ## Import string
 

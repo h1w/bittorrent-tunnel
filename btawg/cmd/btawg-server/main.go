@@ -67,7 +67,11 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	defer srv.Close()
+	defer func() {
+		if err := srv.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "btawg-server: shutdown: %v\n", err)
+		}
+	}()
 	if *dhtBootstrap != "" {
 		srv.SetDHTBootstrap(strings.Split(*dhtBootstrap, ","))
 	}
@@ -119,7 +123,7 @@ func main() {
 	active := srv.Config()
 	fmt.Printf("btawg-server: modes=ext-tcp,req-tcp,ext-utp,req-utp,awg,wg carrier=:%d awg=:%d/udp wg=:%d/udp socks=%d infohash=%s\n",
 		active.CarrierPort, active.AWGPort, active.WGPort, active.SocksPort, srv.InfoHash())
-	fmt.Println("btawg-server: DHT announce loop started (strictly-DHT discovery)")
+	fmt.Println("btawg-server: optional DHT discovery announce loop started")
 
 	select {
 	case <-ctx.Done():
@@ -127,6 +131,9 @@ func main() {
 	case err := <-errCh:
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "btawg-server: %v\n", err)
+			if closeErr := srv.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "btawg-server: shutdown: %v\n", closeErr)
+			}
 			os.Exit(1)
 		}
 	}

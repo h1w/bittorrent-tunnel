@@ -202,6 +202,24 @@ func (s *Store) ListClients() ([]ClientRecord, error) {
 	return recs, err
 }
 
+// ClientRevocations returns the minimal client roster needed by live telemetry.
+func (s *Store) ClientRevocations() (map[string]bool, error) {
+	out := make(map[string]bool)
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketClients).ForEach(func(key, raw []byte) error {
+			var row struct {
+				Revoked bool `json:"revoked"`
+			}
+			if err := json.Unmarshal(raw, &row); err != nil {
+				return err
+			}
+			out[string(key)] = row.Revoked
+			return nil
+		})
+	})
+	return out, err
+}
+
 // GetClient returns one client record by ID.
 func (s *Store) GetClient(id string) (ClientRecord, error) {
 	var rec ClientRecord

@@ -1,7 +1,7 @@
 package server
 
 import (
-	"context"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -11,20 +11,29 @@ import (
 
 // refreshHandshakeRoutes learns routes for idle peers without trusting carrier
 // headers. The device only publishes a handshake timestamp after authentication.
-func (s *Server) refreshHandshakeRoutes(ctx context.Context) {
+func (s *Server) refreshHandshakeRoutes() {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
+	flush := time.NewTicker(15 * time.Second)
+	defer flush.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-s.closed:
 			return
+		case <-flush.C:
+			if err := s.flushTraffic(); err != nil {
+				log.Printf("btawg-server: save traffic: %v", err)
+			}
 		case <-tick.C:
+			s.applyMu.Lock()
 			for i, d := range []*device.Device{s.dev, s.wg} {
 				state, err := d.IpcGet()
 				if err != nil {
 					continue
 				}
-				for block := range strings.SplitSeq(state, "\npublic_key=") {
+				_, peers, _ := strings.Cut(state, "\npublic_key=")
+				for block := range strings.SplitSeq(peers, "\npublic_key=") {
+					key, _, _ := strings.Cut(block, "\n")
 					var sec, nsec int64
 					var ip string
 					for line := range strings.SplitSeq(block, "\n") {
@@ -39,10 +48,11 @@ func (s *Server) refreshHandshakeRoutes(ctx context.Context) {
 						}
 					}
 					if sec > 0 {
-						s.router.observeHandshake(ip, i, time.Unix(sec, nsec).UnixNano())
+						s.router.observeHandshake(ip, key, i, time.Unix(sec, nsec))
 					}
 				}
 			}
+			s.applyMu.Unlock()
 		}
 	}
 }

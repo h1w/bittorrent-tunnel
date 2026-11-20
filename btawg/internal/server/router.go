@@ -127,9 +127,9 @@ func (r *packetRouter) forget(ip netip.Addr) {
 	r.routesMu.Unlock()
 }
 
-func (r *packetRouter) remember(ip netip.Addr, idx int) {
+func (r *packetRouter) remember(ip netip.Addr, idx int, now time.Time) {
 	r.routesMu.Lock()
-	r.routes[ip] = activeRoute{engine: idx, at: time.Now().UnixNano()}
+	r.routes[ip] = activeRoute{engine: idx, at: now.UnixNano()}
 	r.routesMu.Unlock()
 }
 
@@ -140,11 +140,12 @@ func (r *packetRouter) lookup(ip netip.Addr) (int, bool) {
 	return route.engine, ok
 }
 
-func (r *packetRouter) observeHandshake(raw string, idx int, when int64) {
+func (r *packetRouter) observeHandshake(raw, key string, idx int, at time.Time) {
 	p, err := netip.ParsePrefix(raw)
-	if err != nil || p.Bits() != 32 || !p.Addr().Is4() || !r.policy.isClient(p.Addr()) {
+	if err != nil || p.Bits() != 32 || !p.Addr().Is4() || !r.policy.handshake(p.Addr(), key, at) {
 		return
 	}
+	when := at.UnixNano()
 	r.routesMu.Lock()
 	if when > r.routes[p.Addr()].at {
 		r.routes[p.Addr()] = activeRoute{engine: idx, at: when}
@@ -190,7 +191,7 @@ func (r *packetRouter) dispatchLoop() {
 			if !srcOK || !dstOK {
 				continue
 			}
-			if !r.allowedRead(src, dst) {
+			if !r.policy.downlink(src, dst, 0) {
 				continue
 			}
 			idx, ok := r.lookup(dst)
@@ -211,20 +212,6 @@ func (r *packetRouter) dispatchLoop() {
 			}
 		}
 	}
-}
-
-// allowedRead validates a packet arriving from the inner TUN. Gateway
-// responses are always allowed; internet responses are allowed only when the
-// destination peer is permitted internet access; peer-to-peer and other
-// overlay traffic uses the normal authenticated policy.
-func (r *packetRouter) allowedRead(src, dst netip.Addr) bool {
-	if r.policy.isGateway(src) {
-		return true
-	}
-	if r.policy.isClient(dst) && !r.policy.isClient(src) {
-		return r.policy.packetAllowed(dst, src, true)
-	}
-	return r.policy.packetAllowed(src, dst, false)
 }
 
 // fanoutEvents copies events from the inner TUN to each engine's event
@@ -312,7 +299,7 @@ func (e *engineTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			src, srcOK := ipv4Src(packet)
 			dst, dstOK := ipv4Dst(packet)
 			idx, active := e.router.lookup(dst)
-			if !srcOK || !dstOK || !active || idx != e.index || !e.router.allowedRead(src, dst) {
+			if !srcOK || !dstOK || !active || idx != e.index || !e.router.policy.downlink(src, dst, min(len(packet), len(bufs[0])-offset)) {
 				e.router.pool.Put(p[:cap(p)])
 				continue
 			}
@@ -339,10 +326,11 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 			continue
 		}
 		direct := e.router.isKernel && !e.router.policy.isClient(dst) && !e.router.policy.isGateway(dst)
-		if !e.router.policy.packetAllowed(src, dst, direct) {
+		now := time.Now()
+		if !e.router.policy.upload(src, dst, direct, len(packet), now) {
 			continue
 		}
-		e.router.remember(src, e.index)
+		e.router.remember(src, e.index, now)
 		if e.router.policy.isGateway(dst) || direct {
 			innerBufs = append(innerBufs, b)
 			continue

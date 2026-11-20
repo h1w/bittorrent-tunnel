@@ -29,7 +29,7 @@ type Registry interface {
 	RevokeClient(store.ClientRecord) error
 	ReloadPolicy() error
 	Config() config.ServerConfig
-	ConnectedCount() map[string]int
+	Traffic() map[string]store.Traffic
 	InfoHash() string
 	PubKey() string
 }
@@ -80,9 +80,12 @@ func New(st *store.Store, reg Registry, user, passHash string) *Panel {
 func (p *Panel) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /login", p.loginPage)
+	mux.HandleFunc("GET /assets/panel.css", panelAsset("text/css; charset=utf-8", panelCSS))
+	mux.HandleFunc("GET /assets/panel.js", panelAsset("text/javascript; charset=utf-8", panelJS))
 	mux.HandleFunc("POST /login", p.loginSubmit)
 	mux.HandleFunc("POST /logout", p.auth(p.logout))
 	mux.HandleFunc("GET /{$}", p.auth(p.dashboard))
+	mux.HandleFunc("GET /api/traffic", p.auth(p.liveStats))
 	mux.HandleFunc("GET /server", p.auth(p.serverPage))
 	mux.HandleFunc("POST /server", p.auth(p.serverSubmit))
 	mux.HandleFunc("GET /clients", p.auth(p.clientsPage))
@@ -211,24 +214,7 @@ func (p *Panel) loginSubmit(w http.ResponseWriter, r *http.Request) {
 // ---- dashboard ----
 
 func (p *Panel) dashboard(w http.ResponseWriter, r *http.Request) {
-	cfg, err := p.st.LoadServerConfig()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	clients, _ := p.st.ListClients()
-	groups, _ := p.st.ListGroups()
-	data := map[string]any{
-		"CSRF":      p.session(r).csrf,
-		"Cfg":       cfg,
-		"InfoHash":  p.reg.InfoHash(),
-		"PubKey":    p.reg.PubKey(),
-		"Clients":   clients,
-		"Groups":    groups,
-		"Connected": p.reg.ConnectedCount(),
-		"Active":    "dashboard",
-	}
-	p.render(w, "dashboard", data)
+	p.userPage(w, r, "dashboard")
 }
 
 // ---- server settings ----
@@ -306,6 +292,10 @@ func (p *Panel) serverSubmit(w http.ResponseWriter, r *http.Request) {
 // ---- clients ----
 
 func (p *Panel) clientsPage(w http.ResponseWriter, r *http.Request) {
+	p.userPage(w, r, "clients")
+}
+
+func (p *Panel) userPage(w http.ResponseWriter, r *http.Request, page string) {
 	clients, err := p.st.ListClients()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -316,13 +306,19 @@ func (p *Panel) clientsPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	p.render(w, "clients", map[string]any{
-		"CSRF":      p.session(r).csrf,
-		"Clients":   clients,
-		"Groups":    groups,
-		"DefaultID": store.DefaultGroupID,
-		"Connected": p.reg.ConnectedCount(),
-		"Active":    "clients",
+	traffic := p.reg.Traffic()
+	now := time.Now()
+	live := make(map[string]liveClient, len(clients))
+	for _, c := range clients {
+		live[c.ID] = clientLive(c.Revoked, traffic[c.ID], now)
+	}
+	p.render(w, page, map[string]any{
+		"CSRF":       p.session(r).csrf,
+		"Clients":    clients,
+		"Groups":     groups,
+		"GroupNames": groupNames(groups),
+		"Live":       live,
+		"Active":     page,
 	})
 }
 
