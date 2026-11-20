@@ -27,6 +27,7 @@ func main() {
 	transport := flag.String("transport", "", "transport mode (ext-utp|ext-tcp|req-utp|req-tcp|awg|wg)")
 	dhtOnly := flag.Bool("dht", false, "discover the carrier through DHT instead of using the import endpoint")
 	noTun := flag.Bool("no-tun", false, "userspace netstack mode: no OS interface is created")
+	socksListen := flag.String("socks-listen", "127.0.0.1", "local SOCKS5 listen IPv4 address (0.0.0.0 for all IPv4 interfaces)")
 	tunName := flag.String("tun", "btawg0", "TUN interface name in real-TUN mode")
 	flag.Parse()
 
@@ -48,6 +49,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "btawg-client: %v\n", err)
 		os.Exit(1)
 	}
+	listenIP, err := netip.ParseAddr(*socksListen)
+	if err != nil || !listenIP.Is4() {
+		fmt.Fprintln(os.Stderr, "btawg-client: -socks-listen requires an IPv4 address")
+		os.Exit(1)
+	}
+	cfg.SocksListenIP = listenIP
 	if *transport != "" {
 		cfg.Transport = *transport
 	}

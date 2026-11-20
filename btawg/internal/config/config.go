@@ -111,6 +111,7 @@ type ClientConfig struct {
 	AWGEndpoint     string            `json:"awg_endpoint,omitempty"`     // host:port for native AWG
 	WGEndpoint      string            `json:"wg_endpoint,omitempty"`      // host:port for native WG
 	Routes          []string          `json:"routes,omitempty"`           // managed VPN CIDRs (no default route)
+	SocksListenIP   netip.Addr        `json:"-"`                          // local opt-in; never accepted from an import
 }
 
 // ImportString encodes the config as btawg:// + base64url(JSON).

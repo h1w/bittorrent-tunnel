@@ -1,8 +1,8 @@
 // Package client assembles the btawg client: DHT discovery of the hub (never
 // a direct endpoint), the BitTorrent carrier to the discovered address, the
 // AmneziaWG device holding the client's overlay address, and a no-auth SOCKS5
-// server on loopback that chains every CONNECT and UDP ASSOCIATE to the hub's
-// egress inside the tunnel. Netstack mode runs fully in userspace (tests);
+// server that chains every CONNECT and UDP ASSOCIATE to the hub's egress
+// inside the tunnel. Netstack mode runs fully in userspace (tests);
 // real-TUN mode exposes the overlay as an OS interface without a
 // default-route takeover.
 package client
@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -221,7 +222,11 @@ func (c *Client) OverlayListenTCP(port uint16) (net.Listener, error) {
 // it discovers the hub via DHT and reconnects on failure; in native modes it
 // relies on the direct UDP endpoint configured in the import string.
 func (c *Client) Run(ctx context.Context) error {
-	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", c.cfg.SocksPort))
+	listenIP := c.cfg.SocksListenIP
+	if !listenIP.IsValid() {
+		listenIP = netip.AddrFrom4([4]byte{127, 0, 0, 1})
+	}
+	ln, err := net.Listen("tcp4", net.JoinHostPort(listenIP.String(), strconv.Itoa(c.cfg.SocksPort)))
 	if err != nil {
 		return fmt.Errorf("socks listen: %w", err)
 	}

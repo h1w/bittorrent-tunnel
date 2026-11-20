@@ -86,7 +86,21 @@ sudo ./btawg-client 'btawg://…'      # root = btawg0 interface; without: sudo 
 
 New imports contain the public hub endpoint and connect directly by default.
 For a BitTorrent carrier, `-dht` chooses discovery instead; earlier imports
-without an endpoint continue to use DHT. SOCKS5 listens on `127.0.0.1:1080`.
+without an endpoint continue to use DHT. By default, SOCKS5 listens on `127.0.0.1:1080`.
+
+To share SOCKS5 with other devices on a trusted LAN, put `-socks-listen`
+before the import string:
+
+```sh
+sudo ./btawg-client -socks-listen 192.168.1.10 'btawg://…'  # use this machine's LAN IPv4
+sudo ./btawg-client -socks-listen 0.0.0.0 'btawg://…'       # all IPv4 interfaces
+```
+
+Point the other devices at the client's LAN IP and SOCKS port (default `1080`).
+The flag also works with `-no-tun` and does not require re-importing the config.
+The proxy has no authentication: restrict inbound TCP to trusted LAN devices.
+If you use SOCKS5 UDP ASSOCIATE, allow its dynamically allocated UDP relay
+ports from those devices on the client as well.
 
 ### 4. Verify
 
@@ -172,7 +186,7 @@ or `./btawg-client -config file.txt`. The client then:
 - for a BitTorrent mode, connects to the imported endpoint or discovers it
   through DHT when requested; for `awg` or `wg`, connects directly over UDP
   to the selected native endpoint;
-- serves **no-auth SOCKS5 on 127.0.0.1:1080**: point any app there; traffic
+- serves **no-auth SOCKS5 on 127.0.0.1:1080 by default**. Traffic
   is chained through the tunnel to the hub's egress, which dials the real
   internet (DNS resolves at the hub — no client-side leak);
 - with real TUN, creates `btawg0` with the assigned VPN address and the
