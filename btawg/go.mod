@@ -9,10 +9,13 @@ require (
 	github.com/anacrolix/dht/v2 v2.24.0
 	github.com/anacrolix/go-utp v0.0.0-00010101000000-000000000000
 	github.com/anacrolix/torrent v1.48.1-0.20230103142631-c20f73d53e9f
+	github.com/coreos/go-systemd/v22 v22.5.0
+	github.com/kr/pty v1.1.8
 	go.etcd.io/bbolt v1.5.0
 	golang.org/x/crypto v0.44.0
 	golang.org/x/net v0.47.0
-	golang.org/x/sys v0.45.0
+	golang.org/x/sys v0.50.0
+	golang.org/x/term v0.48.0
 )
 
 require (
@@ -30,6 +33,7 @@ require (
 	github.com/anacrolix/sync v0.4.0 // indirect
 	github.com/benbjohnson/immutable v0.4.1-0.20221220213129-8932b999621d // indirect
 	github.com/bradfitz/iter v0.0.0-20191230175014-e8f45d346db8 // indirect
+	github.com/creack/pty v1.1.7 // indirect
 	github.com/edsrzf/mmap-go v1.1.0 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/huandu/xstrings v1.3.2 // indirect
