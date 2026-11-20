@@ -4,6 +4,7 @@ package socks
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -20,16 +21,26 @@ type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 // raw datagrams to arbitrary destinations and receives raw datagrams back.
 type DialUDPFunc func(ctx context.Context) (net.PacketConn, error)
 
-// Server is a no-auth SOCKS5 server.
+// Server is a SOCKS5 server with optional RFC 1929 authentication.
 type Server struct {
-	dial       DialFunc
-	dialUDP    DialUDPFunc
-	resolveUDP func(context.Context, netip.Addr, string) (netip.Addr, error)
+	dial               DialFunc
+	dialUDP            DialUDPFunc
+	resolveUDP         func(context.Context, netip.Addr, string) (netip.Addr, error)
+	greetingMethod     byte
+	username, password []byte
 }
 
 // NewServer builds a local SOCKS5 server with the given upstream dialers.
 func NewServer(dial DialFunc, dialUDP DialUDPFunc) *Server {
 	return &Server{dial: dial, dialUDP: dialUDP}
+}
+
+// WithCredentials requires username/password authentication on this server.
+// Configure it before accepting connections. Empty credentials fail closed.
+func (s *Server) WithCredentials(username, password string) *Server {
+	s.greetingMethod = 2
+	s.username, s.password = []byte(username), []byte(password)
+	return s
 }
 
 // WithUDPResolver handles both IP literals and domain targets for UDP.
@@ -59,7 +70,7 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 	defer c.Close()
 	stop := context.AfterFunc(ctx, func() { _ = c.Close() })
 	defer stop()
-	if !serveGreeting(c) {
+	if !s.serveGreeting(c) {
 		return
 	}
 	cmd, dst, err := readRequest(c)
@@ -207,27 +218,47 @@ func (s *Server) pumpUDP(ctx context.Context, relay *net.UDPConn, upstream net.P
 	}
 }
 
-// serveGreeting reads the client's method list and accepts no-auth (0x00).
-func serveGreeting(c net.Conn) bool {
+// serveGreeting selects only the configured method, even if a client offers
+// both no authentication and RFC 1929 authentication.
+func (s *Server) serveGreeting(c net.Conn) bool {
 	var hdr [2]byte
-	if _, err := io.ReadFull(c, hdr[:]); err != nil {
+	if _, err := io.ReadFull(c, hdr[:]); err != nil || hdr[0] != socksVersion {
 		return false
 	}
-	if hdr[0] != socksVersion {
+	var methods [255]byte
+	if _, err := io.ReadFull(c, methods[:hdr[1]]); err != nil {
 		return false
 	}
-	methods := make([]byte, hdr[1])
-	if _, err := io.ReadFull(c, methods); err != nil {
-		return false
-	}
-	for _, m := range methods {
-		if m == 0x00 {
-			_, err := c.Write([]byte{socksVersion, 0x00})
-			return err == nil
+	for _, m := range methods[:hdr[1]] {
+		if m == s.greetingMethod {
+			_, err := c.Write([]byte{socksVersion, m})
+			return err == nil && (m == 0 || s.authenticate(c))
 		}
 	}
-	c.Write([]byte{socksVersion, 0xFF})
+	_, _ = c.Write([]byte{socksVersion, 0xff})
 	return false
+}
+
+func (s *Server) authenticate(c net.Conn) bool {
+	var hdr [2]byte
+	var user, pass [255]byte
+	if _, err := io.ReadFull(c, hdr[:]); err != nil || hdr[0] != 1 || hdr[1] == 0 {
+		return false
+	}
+	username := user[:hdr[1]]
+	if _, err := io.ReadFull(c, username); err != nil {
+		return false
+	}
+	if _, err := io.ReadFull(c, hdr[:1]); err != nil || hdr[0] == 0 {
+		return false
+	}
+	password := pass[:hdr[0]]
+	if _, err := io.ReadFull(c, password); err != nil {
+		return false
+	}
+	match := subtle.ConstantTimeCompare(username, s.username) & subtle.ConstantTimeCompare(password, s.password)
+	_, err := c.Write([]byte{1, byte(1 - match)})
+	return err == nil && match == 1
 }
 
 const (
