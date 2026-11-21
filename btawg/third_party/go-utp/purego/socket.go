@@ -198,7 +198,11 @@ func NewSocketFromPacketConn(pc net.PacketConn, opts ...NewSocketOpt) (*Socket, 
 	s.ackTimer.Stop()
 	s.readDeadlineTmr = time.AfterFunc(math.MaxInt64, s.broadcastReaders)
 	s.readDeadlineTmr.Stop()
+	// The callback reads timeoutTimer under mu and can run before AfterFunc
+	// returns if the constructor goroutine is descheduled.
+	s.mu.Lock()
 	s.timeoutTimer = time.AfterFunc(timeoutCheckInterval, s.timeoutTimerFunc)
+	s.mu.Unlock()
 	go s.reader()
 	return s, nil
 }

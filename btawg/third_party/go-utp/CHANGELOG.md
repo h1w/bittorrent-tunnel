@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- btawg vendor patch: synchronize timeout timer initialization with the callback
+  to prevent a race during socket startup.
+
 - Split out of [go-libutp](https://github.com/anacrolix/go-libutp), where these packages were added
   but never released. The `utp` package is now this module's root, so the import path is
   `github.com/anacrolix/go-utp` rather than `github.com/anacrolix/go-libutp/utp`, and the pure Go
