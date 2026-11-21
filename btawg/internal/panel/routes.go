@@ -77,7 +77,7 @@ func (p *Panel) routesPage(w http.ResponseWriter, r *http.Request) {
 	p.render(w, "routes", map[string]any{
 		"Active":      "routes",
 		"CSRF":        sess.csrf,
-		"Revision":   revision,
+		"Revision":    revision,
 		"Routes":      routes,
 		"Devices":     devices,
 		"DeviceNames": deviceNames,

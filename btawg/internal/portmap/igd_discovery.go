@@ -60,7 +60,7 @@ func (r router) igdHTTP() *http.Client {
 			// Do not use the process's proxy settings for local router control.
 			DialContext:            dial.DialContext,
 			DisableCompression:     true,
-			DisableKeepAlives:       true,
+			DisableKeepAlives:      true,
 			MaxResponseHeaderBytes: 16 << 10,
 		},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
@@ -200,7 +200,7 @@ func (r router) readIGD(ctx context.Context, client *http.Client, description *u
 		Device  struct {
 			Type string `xml:"deviceType"`
 			WAN  []struct {
-				Type string `xml:"deviceType"`
+				Type        string `xml:"deviceType"`
 				Connections []struct {
 					Type     string `xml:"deviceType"`
 					Services []struct {

@@ -108,7 +108,7 @@ func TestIGDRenewsAndDeletesOnlyVerifiedOwnedLease(t *testing.T) {
 								testSOAPFault(w, 718)
 								return
 							}
-						ownedPort = a.External
+							ownedPort = a.External
 							mapping[a.External] = a.Description
 							added <- a.External
 							testSOAPReply(w, service, action, "")

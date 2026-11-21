@@ -241,8 +241,8 @@ func TestConnectLearnsPeerSourceWithoutRemoteCandidates(t *testing.T) {
 
 func TestConnectWrongKeyOrRoleCannotAttach(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		keyB [32]byte
+		name  string
+		keyB  [32]byte
 		roleB bool
 	}{{"wrong key", [32]byte{2}, false}, {"reflected role", [32]byte{1}, true}} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -13,8 +13,8 @@ import (
 var (
 	errDestination = errors.New("route proxy: destination is not public IPv4")
 	specialIPv4    = [...]netip.Prefix{
-		netip.MustParsePrefix("192.0.2.0/24"),   // TEST-NET-1
-		netip.MustParsePrefix("192.88.99.0/24"), // deprecated 6to4 relay anycast
+		netip.MustParsePrefix("192.0.2.0/24"),    // TEST-NET-1
+		netip.MustParsePrefix("192.88.99.0/24"),  // deprecated 6to4 relay anycast
 		netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
 		netip.MustParsePrefix("203.0.113.0/24"),  // TEST-NET-3
 	}

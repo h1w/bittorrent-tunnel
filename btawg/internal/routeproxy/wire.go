@@ -18,9 +18,9 @@ const (
 	statusReceived = 2
 	statusProceed  = 3
 
-	maxRouteID  = 256
-	maxGrant    = 8192
-	maxHost     = 255
+	maxRouteID = 256
+	maxGrant   = 8192
+	maxHost    = 255
 	// Leave room for the 10-byte SOCKS header within IPv4's UDP payload limit.
 	maxDatagram = 65507 - 10
 )
@@ -113,9 +113,9 @@ func readCommand(r io.Reader) (command, error) {
 	// These fields share immutable storage for the duration of the request.
 	s := string(b)
 	q := command{
-		req: Request{RouteID: s[:idLen], Grant: s[idLen : idLen+grantLen], Hop: int(hdr[5])},
+		req:  Request{RouteID: s[:idLen], Grant: s[idLen : idLen+grantLen], Hop: int(hdr[5])},
 		mode: hdr[4],
-		dst: destination{host: s[idLen+grantLen:], port: binary.BigEndian.Uint16(hdr[11:13])},
+		dst:  destination{host: s[idLen+grantLen:], port: binary.BigEndian.Uint16(hdr[11:13])},
 	}
 	if !q.valid() {
 		return command{}, errInvalidFrame
