@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,17 +73,36 @@ func (u Unit) Control(action string) error {
 	}
 }
 
-// State returns the unit's ActiveState and whether it is enabled.
+// NotInstalled is returned by State when systemd cannot find the unit.
+const NotInstalled = "not installed"
+
+// State returns the unit's ActiveState (or NotInstalled) and autostart state.
 func (u Unit) State() (string, bool, error) {
-	state, err := unitStatus(u.unitName())
-	if err != nil {
-		return "", false, err
+	return unitStatus(u.unitName())
+}
+
+// Uninstall stops and disables our unit, leaving the launcher and all settings
+// intact so the operator can reinstall without re-enrolling clients.
+func (u Unit) Uninstall() error {
+	if _, err := os.Lstat(u.unitPath()); err != nil {
+		return fmt.Errorf("cannot remove unmanaged unit %s: %w", u.unitName(), err)
 	}
-	enabled, err := unitIsEnabled(u.unitName())
+	state, _, err := u.State()
 	if err != nil {
-		return state, false, err
+		return err
 	}
-	return state, enabled, nil
+	if state != NotInstalled {
+		if err := u.Control("stop"); err != nil {
+			return err
+		}
+	}
+	if err := u.Control("disable"); err != nil {
+		return err
+	}
+	if err := os.Remove(u.unitPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return daemonReload()
 }
 
 func (u Unit) renderUnit(extraArgs []string) string {

@@ -45,31 +45,30 @@ func unitAction(unit, action string) error {
 	return nil
 }
 
-func unitIsEnabled(unit string) (bool, error) {
+func unitStatus(unit string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	out, err := systemctlRunner(ctx, "is-enabled", unit)
-	state := strings.TrimSpace(out)
-	switch state {
-	case "enabled":
-		return true, nil
-	case "disabled", "masked", "not-found":
-		return false, nil
-	default:
-		if err != nil {
-			return false, fmt.Errorf("is-enabled %s: %w: %s", unit, err, state)
+	out, err := systemctlRunner(ctx, "show", "--property=LoadState,ActiveState,UnitFileState", unit)
+	if err != nil {
+		return "", false, fmt.Errorf("status %s: %w: %s", unit, err, strings.TrimSpace(out))
+	}
+	var load, active, file string
+	for line := range strings.SplitSeq(out, "\n") {
+		key, value, _ := strings.Cut(line, "=")
+		switch key {
+		case "LoadState":
+			load = value
+		case "ActiveState":
+			active = value
+		case "UnitFileState":
+			file = value
 		}
-		return false, nil
 	}
-}
-
-func unitStatus(unit string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	out, err := systemctlRunner(ctx, "show", "--property=ActiveState", "--value", unit)
-	state := strings.TrimSpace(out)
-	if err != nil && state == "" {
-		return "", fmt.Errorf("status %s: %w", unit, err)
+	if load == "not-found" {
+		return NotInstalled, false, nil
 	}
-	return state, nil
+	if load != "loaded" || active == "" {
+		return "", false, fmt.Errorf("status %s: unexpected unit state %q (%q)", unit, load, active)
+	}
+	return active, file == "enabled" || file == "enabled-runtime", nil
 }

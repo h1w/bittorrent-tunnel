@@ -31,8 +31,9 @@ const (
 var managedLaunchPath = "/etc/btawg/server.json"
 
 type serverLaunch struct {
-	Store string `json:"store"`
-	NoTUN bool   `json:"no_tun,omitempty"`
+	Store   string `json:"store"`
+	NoTUN   bool   `json:"no_tun,omitempty"`
+	TUNName string `json:"tun_name,omitempty"`
 }
 
 func installCmd(args []string) error {
@@ -47,12 +48,8 @@ func installCmd(args []string) error {
 		return errors.New("install must run as root")
 	}
 
-	launch := serverLaunch{Store: managedStorePath}
-	if data, err := os.ReadFile(managedLaunchPath); err == nil {
-		if err := json.Unmarshal(data, &launch); err != nil {
-			return fmt.Errorf("read server launch settings: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	launch, err := loadServerLaunch()
+	if err != nil {
 		return err
 	}
 	fs.Visit(func(f *flag.Flag) {
@@ -63,42 +60,10 @@ func installCmd(args []string) error {
 			launch.NoTUN = *noTun
 		}
 	})
-	if launch.Store == "" {
-		return errors.New("server store path must not be empty")
-	}
-	path, err := filepath.Abs(launch.Store)
-	if err != nil {
+	if err := installServer(launch); err != nil {
 		return err
 	}
-	launch.Store = path
-	pendingPath := launch.Store + ".pending-admin"
-	if launch.Store == managedStorePath {
-		pendingPath = "/etc/btawg/.admin-password"
-	}
-	state, _, err := service.Server.State()
-	if err != nil {
-		return err
-	}
-	if state != "active" {
-		st, _, _, err := openOrCreateServerStore(launch.Store, pendingPath)
-		if err != nil {
-			return err
-		}
-		if err := st.Close(); err != nil {
-			return err
-		}
-	}
-	data, err := json.MarshalIndent(launch, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := service.WriteFile(managedLaunchPath, data, 0600); err != nil {
-		return err
-	}
-	if err := service.Server.Install(); err != nil {
-		return fmt.Errorf("install unit: %w", err)
-	}
-	pending, err := os.ReadFile(pendingPath)
+	pending, err := os.ReadFile(launch.pendingPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -108,7 +73,75 @@ func installCmd(args []string) error {
 	if _, err := fmt.Printf("btawg-server: panel login admin / %s (shown once)\n", pending); err != nil {
 		return err
 	}
-	return os.Remove(pendingPath)
+	return os.Remove(launch.pendingPath())
+}
+
+func loadServerLaunch() (serverLaunch, error) {
+	launch := serverLaunch{Store: managedStorePath, TUNName: "btawg0"}
+	data, err := os.ReadFile(managedLaunchPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return launch, nil
+	}
+	if err != nil {
+		return launch, err
+	}
+	if err := json.Unmarshal(data, &launch); err != nil {
+		return launch, fmt.Errorf("read server launch settings: %w", err)
+	}
+	return launch, nil
+}
+
+func (s serverLaunch) pendingPath() string {
+	path, err := filepath.Abs(s.Store)
+	if err == nil && path == managedStorePath {
+		return "/etc/btawg/.admin-password"
+	}
+	return s.Store + ".pending-admin"
+}
+
+func (s serverLaunch) save() error {
+	if s.Store == "" {
+		return errors.New("server store path must not be empty")
+	}
+	path, err := filepath.Abs(s.Store)
+	if err != nil {
+		return err
+	}
+	s.Store = path
+	if !s.NoTUN {
+		if err := service.ValidateInterface(s.TUNName, 15); err != nil {
+			return err
+		}
+	}
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return service.WriteFile(managedLaunchPath, data, 0600)
+}
+
+func installServer(launch serverLaunch) error {
+	state, _, err := service.Server.State()
+	if err != nil {
+		return err
+	}
+	switch state {
+	case service.NotInstalled, "inactive", "failed":
+		if launch.Store == "" {
+			return errors.New("server store path must not be empty")
+		}
+		st, _, _, err := openOrCreateServerStore(launch.Store, launch.pendingPath())
+		if err != nil {
+			return err
+		}
+		if err := st.Close(); err != nil {
+			return err
+		}
+	}
+	if err := launch.save(); err != nil {
+		return err
+	}
+	return service.Server.Install()
 }
 
 func runCmd(parent context.Context, args []string) error {
@@ -126,19 +159,15 @@ func runCmd(parent context.Context, args []string) error {
 	}
 
 	if *managed {
-		var launch serverLaunch
-		if data, err := os.ReadFile(managedLaunchPath); err == nil {
-			if err := json.Unmarshal(data, &launch); err != nil {
-				return fmt.Errorf("read server launch settings: %w", err)
-			}
-		} else if !errors.Is(err, os.ErrNotExist) {
+		launch, err := loadServerLaunch()
+		if err != nil {
 			return err
 		}
 		if *storePath == "" {
 			*storePath = launch.Store
-			if *storePath == "" {
-				*storePath = managedStorePath
-			}
+		}
+		if *tunName == "btawg0" && launch.TUNName != "" {
+			*tunName = launch.TUNName
 		}
 		*noTun = *noTun || launch.NoTUN
 	}
@@ -148,10 +177,7 @@ func runCmd(parent context.Context, args []string) error {
 
 	pendingPath := ""
 	if *managed {
-		pendingPath = *storePath + ".pending-admin"
-		if *storePath == managedStorePath {
-			pendingPath = "/etc/btawg/.admin-password"
-		}
+		pendingPath = (serverLaunch{Store: *storePath}).pendingPath()
 	}
 	st, _, pw, err := openOrCreateServerStore(*storePath, pendingPath)
 	if err != nil {
@@ -254,10 +280,6 @@ func runCmd(parent context.Context, args []string) error {
 	case err := <-webErrors:
 		return err
 	}
-}
-
-func tui() error {
-	return service.TUI(service.Server, nil, nil)
 }
 
 // openOrCreateServerStore opens the database, generating server identity and

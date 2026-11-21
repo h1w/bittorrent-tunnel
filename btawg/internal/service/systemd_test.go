@@ -121,11 +121,8 @@ func TestUnitPassesSystemdAnalyze(t *testing.T) {
 func TestStateParsesEnabled(t *testing.T) {
 	oldRunner := systemctlRunner
 	systemctlRunner = func(ctx context.Context, args ...string) (string, error) {
-		switch args[0] {
-		case "show":
-			return "active\n", nil
-		case "is-enabled":
-			return "enabled\n", nil
+		if args[0] == "show" {
+			return "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n", nil
 		}
 		return "", nil
 	}
@@ -140,5 +137,26 @@ func TestStateParsesEnabled(t *testing.T) {
 	}
 	if !enabled {
 		t.Fatal("want enabled")
+	}
+}
+
+func TestStateDistinguishesMissingUnitFromStopped(t *testing.T) {
+	oldRunner := systemctlRunner
+	t.Cleanup(func() { systemctlRunner = oldRunner })
+	for _, tc := range []struct {
+		load, file, want string
+	}{
+		{"not-found", "", "not installed"},
+		{"loaded", "disabled", "inactive"},
+	} {
+		t.Run(tc.load, func(t *testing.T) {
+			systemctlRunner = func(_ context.Context, args ...string) (string, error) {
+				return "LoadState=" + tc.load + "\nActiveState=inactive\nUnitFileState=" + tc.file + "\n", nil
+			}
+			state, enabled, err := Server.State()
+			if err != nil || state != tc.want || enabled {
+				t.Fatalf("state = %q, enabled = %v, err = %v; want %q, false, nil", state, enabled, err, tc.want)
+			}
+		})
 	}
 }

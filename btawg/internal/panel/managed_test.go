@@ -95,7 +95,7 @@ func TestManagedServerSubmitForcesFixedPorts(t *testing.T) {
 	}
 }
 
-func TestImportCommandUsesRun(t *testing.T) {
+func TestPanelCopiesRawClientImport(t *testing.T) {
 	srv, _, _ := newTestPanel(t)
 	c := login(t, srv.URL)
 	csrf := csrfOf(t, c, srv.URL, "/clients")
@@ -111,7 +111,13 @@ func TestImportCommandUsesRun(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	if !strings.Contains(string(body), "btawg-client run '") {
-		t.Fatalf("import command missing explicit run: %s", string(body))
+	_, content, ok := strings.Cut(string(body), `<pre class="mono" id="import-string">`)
+	if !ok {
+		t.Fatal("missing raw import field")
+	}
+	raw, _, _ := strings.Cut(content, "</pre>")
+	cfg, err := config.ParseImportString(raw)
+	if err != nil || cfg.ClientIP == "" {
+		t.Fatal("raw import field does not contain a usable client configuration")
 	}
 }

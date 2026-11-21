@@ -68,30 +68,13 @@ func installMain(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("use -import-file or the hidden terminal prompt")
 	}
-	mc, err := client.LoadManagedConfig(client.ManagedConfigPath)
+	_, err := client.LoadManagedConfig(client.ManagedConfigPath)
 	if errors.Is(err, os.ErrNotExist) {
 		raw, err := readImport(*importFile)
 		if err != nil {
 			return err
 		}
-		cfg, err := config.ParseImportString(raw)
-		if err != nil {
-			return err
-		}
-		mode := config.CanonicalMode(cfg.Transport)
-		if !config.ValidClientMode(mode) {
-			return fmt.Errorf("unsupported import mode %q", mode)
-		}
-		ip, err := netip.ParseAddr(*socksListen)
-		if err != nil || !ip.Is4() {
-			return fmt.Errorf("-socks-listen requires an IPv4 address")
-		}
-		creds, err := client.GenerateCredentials()
-		if err != nil {
-			return err
-		}
-		mc = client.ManagedConfig{Import: raw, Enabled: []string{mode}, ListenIP: ip.String(), Credentials: creds, NoTUN: *noTun, TUNName: *tunName}
-		if err := mc.Save(client.ManagedConfigPath); err != nil {
+		if err := saveClientSettings(nil, raw, *socksListen, *noTun, *tunName); err != nil {
 			return err
 		}
 	} else if err != nil {
@@ -183,7 +166,7 @@ func legacyOrTUI(args []string) error {
 		raw = strings.TrimSpace(string(b))
 	}
 	if raw == "" {
-		return client.RunTUI()
+		return runTUI()
 	}
 	if *transport != "" || *dhtOnly || *socksListen != "127.0.0.1" {
 		return runSingleOpts(raw, *transport, *dhtOnly, *socksListen, *noTun, *tunName)

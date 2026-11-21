@@ -1,193 +1,576 @@
 package service
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
+	"os/exec"
 	"strings"
-	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
-	"golang.org/x/term"
+	tui "github.com/grindlemire/go-tui"
 )
 
-// tuiControl and tuiState are overridable in tests.
-var (
-	tuiControl         = func(u Unit, action string) error { return u.Control(action) }
-	tuiState           = func(u Unit) (string, bool, error) { return u.State() }
-	tuiRefreshInterval = time.Second
-)
-
-// TUI runs an interactive terminal UI for the given unit. The client callback
-// supplies optional content lines (e.g. client proxy modes); the extra callback
-// receives any key that is not handled by the built-in service actions.
-// Built-in keys: arrows navigate, s=start, t=stop, r=restart, b=toggle enable,
-// q or Ctrl-C=quit.
-func TUI(unit Unit, client func() ([]string, error), extra func(key byte, selected int) (message string, err error)) error {
-	return runTUI(os.Stdin, os.Stdout, unit, client, extra)
+// Menu is the operator interface for one managed service. Role-specific actions
+// share the same renderer, navigation, and operation queue as systemd actions.
+type Menu struct {
+	Unit     Unit
+	Subtitle string
+	Setup    func() (*Screen, error)
+	Install  func() (*Screen, error)
+	Actions  func(state string) ([]Action, error)
 }
 
-func runTUI(in io.Reader, out io.Writer, unit Unit, client func() ([]string, error), extra func(key byte, selected int) (string, error)) error {
-	fd, isTerm := in.(*os.File)
-	if isTerm {
-		old, err := term.MakeRaw(int(fd.Fd()))
-		if err != nil {
-			isTerm = false
-		} else {
-			defer term.Restore(int(fd.Fd()), old)
-		}
+type Action struct {
+	Label   string
+	Confirm string
+	Run     func() (*Screen, error)
+}
+
+// Screen is a document (optionally acknowledged) or a setup form. Secret
+// fields are never rendered, including when pasted into the terminal.
+type Screen struct {
+	Title   string
+	Text    string
+	Fields  []Field
+	Submit  string
+	Save    func([]Field) (*Screen, error)
+	Dismiss func() error
+}
+
+type Field struct {
+	Label   string
+	Value   string
+	Secret  bool
+	Toggle  bool
+	Checked bool
+}
+
+func TUI(menu Menu) error {
+	d := &dashboard{menu: menu, root: os.Geteuid() == 0, results: make(chan update, 1)}
+	app, err := tui.NewApp(tui.WithRootComponent(d), tui.WithMouse())
+	if err != nil {
+		return err
 	}
+	defer app.Close()
+	d.refresh()
+	return app.Run()
+}
 
-	var (
-		mu       sync.Mutex
-		selected int
-		message  string
-		lines    []string
-	)
-	refreshLines := func() {
-		if client == nil {
-			lines = nil
-			return
-		}
-		l, err := client()
-		if err != nil {
-			l = []string{fmt.Sprintf("error: %v", err)}
-		}
-		lines = l
+type snapshot struct {
+	state   string
+	enabled bool
+	actions []Action
+	err     error
+}
+
+type update struct {
+	snapshot
+	screen    *Screen
+	err       error
+	operation string
+}
+
+type dashboard struct {
+	menu    Menu
+	root    bool
+	results chan update
+	current snapshot
+	busy    bool
+	working string
+	pending func() (*Screen, error)
+	app     *tui.App
+
+	screen    *Screen
+	confirm   *Action
+	message   string
+	selection int
+	offset    int
+	hits      []hit
+}
+
+type hit struct {
+	element *tui.Element
+	index   int
+}
+
+func (d *dashboard) status() snapshot {
+	var s snapshot
+	s.state, s.enabled, s.err = d.menu.Unit.State()
+	if s.err == nil && d.root && d.menu.Actions != nil {
+		s.actions, s.err = d.menu.Actions(s.state)
 	}
+	return s
+}
 
-	draw := func() {
-		state, enabled, _ := tuiState(unit)
-		if state == "" {
-			state = "unknown"
-		}
-		status := state
-		if enabled {
-			status += " / enabled"
-		} else {
-			status += " / disabled"
-		}
-
-		var b strings.Builder
-		if isTerm {
-			b.WriteString("\033[H\033[2J")
-		}
-		fmt.Fprintf(&b, "btawg-%s  %s\n", unit, status)
-		if message != "" {
-			fmt.Fprintf(&b, "%s\n", message)
-		}
-		refreshLines()
-		for i, line := range lines {
-			if i == selected {
-				fmt.Fprintf(&b, "> %s\n", line)
-			} else {
-				fmt.Fprintf(&b, "  %s\n", line)
-			}
-		}
-		if extra != nil {
-			fmt.Fprintln(&b, "Space:toggle  v:show SOCKS5 login  g:regenerate")
-		}
-		fmt.Fprintln(&b, "s:start t:stop r:restart b:autostart q:quit")
-		out.Write([]byte(b.String()))
+func (d *dashboard) refresh() {
+	if !d.busy && d.screen == nil && d.confirm == nil {
+		d.run("", nil)
 	}
+}
 
-	draw()
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	// Stop the refresh goroutine before returning so it cannot read the UI
-	// hooks after the caller regains control (LIFO: cancel runs before Wait).
-	defer wg.Wait()
-	defer cancel()
-
-	// Refresh state periodically so the UI shows live systemd status.
-	wg.Add(1)
+func (d *dashboard) run(label string, fn func() (*Screen, error)) {
+	if d.busy {
+		if label != "" && d.working == "" {
+			d.working, d.pending = label, fn
+			d.message = ""
+			d.app.MarkDirty()
+		}
+		return
+	}
+	d.busy, d.working = true, label
+	if label != "" {
+		d.message = ""
+		d.app.MarkDirty()
+	}
 	go func() {
-		defer wg.Done()
-		tick := time.NewTicker(tuiRefreshInterval)
-		defer tick.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-tick.C:
-				mu.Lock()
-				draw()
-				mu.Unlock()
-			}
+		r := update{operation: label}
+		if fn != nil {
+			r.screen, r.err = fn()
 		}
+		r.snapshot = d.status()
+		d.results <- r
 	}()
+}
 
-	r := bufio.NewReader(in)
-	for {
-		c, err := r.ReadByte()
-		if err != nil {
-			return err
-		}
-		mu.Lock()
-		switch c {
-		case 3: // Ctrl-C
-			mu.Unlock()
-			return nil
-		case 'q':
-			mu.Unlock()
-			return nil
-		case 's':
-			message = ""
-			if err := tuiControl(unit, "start"); err != nil {
-				message = fmt.Sprintf("error: %v", err)
-			}
-		case 't':
-			message = ""
-			if err := tuiControl(unit, "stop"); err != nil {
-				message = fmt.Sprintf("error: %v", err)
-			}
-		case 'r':
-			message = ""
-			if err := tuiControl(unit, "restart"); err != nil {
-				message = fmt.Sprintf("error: %v", err)
-			}
-		case 'b':
-			message = ""
-			_, enabled, _ := tuiState(unit)
-			if enabled {
-				message = "disabling autostart..."
-				if err := tuiControl(unit, "disable"); err != nil {
-					message = fmt.Sprintf("error: %v", err)
-				}
-			} else {
-				message = "enabling autostart..."
-				if err := tuiControl(unit, "enable"); err != nil {
-					message = fmt.Sprintf("error: %v", err)
-				}
-			}
-		case 27: // ESC sequences (arrows)
-			next, err := r.Peek(2)
-			if err == nil && next[0] == '[' {
-				r.Discard(2)
-				switch next[1] {
-				case 'A': // up
-					if selected > 0 {
-						selected--
-					}
-				case 'B': // down
-					if selected < len(lines)-1 {
-						selected++
-					}
-				}
-			}
-		default:
-			if extra != nil {
-				msg, err := extra(c, selected)
-				if err != nil {
-					message = fmt.Sprintf("error: %v", err)
-				} else {
-					message = msg
-				}
-			}
-		}
-		draw()
-		mu.Unlock()
+func (d *dashboard) Watchers() []tui.Watcher {
+	return []tui.Watcher{
+		tui.Watch(d.results, d.receive),
+		tui.OnTimer(2*time.Second, d.refresh),
 	}
+}
+
+func (d *dashboard) receive(u update) {
+	oldState := d.current.state
+	label := d.working
+	d.current, d.busy, d.working = u.snapshot, false, ""
+	if d.pending != nil {
+		fn := d.pending
+		d.pending = nil
+		d.run(label, fn)
+		return
+	}
+	switch {
+	case u.err != nil:
+		d.message = "Error: " + u.err.Error()
+	case u.screen != nil:
+		d.open(u.screen)
+	case u.operation != "":
+		if d.screen != nil && d.screen.Save != nil {
+			d.open(nil)
+		}
+		d.message = u.operation + ": done"
+	}
+	if d.screen == nil && d.confirm == nil && oldState != d.current.state {
+		d.selection, d.offset = 0, 0
+	}
+	d.app.MarkDirty()
+}
+
+func (d *dashboard) open(s *Screen) {
+	d.screen = s
+	d.selection, d.offset = 0, 0
+}
+
+func perform(fn func() error) func() (*Screen, error) {
+	return func() (*Screen, error) { return nil, fn() }
+}
+
+func (d *dashboard) actions() []Action {
+	u, s := d.menu.Unit, d.current
+	var out []Action
+	if d.root && s.state != "" {
+		if s.state == NotInstalled {
+			out = append(out, Action{Label: "Install service", Run: d.menu.Install})
+		} else {
+			if s.state == "active" || s.state == "activating" || s.state == "reloading" {
+				out = append(out, Action{Label: "Stop service", Run: perform(func() error { return u.Control("stop") })})
+			} else {
+				out = append(out, Action{Label: "Start service", Run: perform(func() error { return u.Control("start") })})
+			}
+			out = append(out, Action{Label: "Restart service", Run: perform(func() error { return u.Control("restart") })})
+			label, cmd := "Enable autostart", "enable"
+			if s.enabled {
+				label, cmd = "Disable autostart", "disable"
+			}
+			out = append(out, Action{Label: label, Run: perform(func() error { return u.Control(cmd) })})
+		}
+		if d.menu.Setup != nil && (s.state == NotInstalled || s.state == "inactive" || s.state == "failed") {
+			out = append(out, Action{Label: "Service settings", Run: d.menu.Setup})
+		}
+		out = append(out, s.actions...)
+		if s.state != NotInstalled {
+			out = append(out,
+				Action{Label: "Reinstall / update service", Confirm: "Copy this binary into place and restart the service? Configuration is kept.", Run: d.menu.Install},
+				Action{Label: "Remove service", Confirm: "Stop and remove the systemd service? Configuration, keys, and the installed launcher are kept.", Run: perform(u.Uninstall)},
+			)
+		}
+	}
+	return append(out, Action{Label: "View service logs", Run: u.logs}, Action{Label: "Quit"})
+}
+
+func (u Unit) logs() (*Screen, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "journalctl", "-u", u.unitName(), "-n", "50", "--no-pager", "-o", "short-iso").CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("journalctl: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return &Screen{Title: "Service logs (last 50 entries)", Text: strings.TrimSpace(string(out))}, nil
+}
+
+func (d *dashboard) activate() {
+	if d.busy && d.working != "" {
+		return
+	}
+	if a := d.confirm; a != nil {
+		d.confirm = nil
+		d.selection = 0
+		if d.offset == 1 {
+			d.offset = 0
+			d.run(a.Label, a.Run)
+		} else {
+			d.offset = 0
+		}
+		return
+	}
+	if s := d.screen; s != nil {
+		if s.Save == nil {
+			if s.Dismiss != nil {
+				if err := s.Dismiss(); err != nil {
+					d.message = "Error: " + err.Error()
+					return
+				}
+			}
+			d.back()
+		} else if d.selection == len(s.Fields) {
+			d.run(s.Submit, func() (*Screen, error) { return s.Save(s.Fields) })
+		} else if f := &s.Fields[d.selection]; f.Toggle {
+			f.Checked = !f.Checked
+		} else {
+			d.move(1)
+		}
+		return
+	}
+	items := d.actions()
+	if d.selection >= len(items) {
+		return
+	}
+	a := items[d.selection]
+	if a.Run == nil {
+		d.app.Stop()
+	} else if a.Confirm != "" {
+		d.confirm = &a
+		d.selection, d.offset = 0, 0
+		d.message = ""
+	} else {
+		d.run(a.Label, a.Run)
+	}
+}
+
+func (d *dashboard) back() {
+	if d.busy && d.working != "" {
+		return
+	}
+	if d.confirm != nil {
+		d.confirm = nil
+		d.selection, d.offset = 0, 0
+		return
+	}
+	if d.screen == nil {
+		d.app.Stop()
+		return
+	}
+	d.open(nil)
+	d.message = ""
+}
+
+func (d *dashboard) move(delta int) {
+	switch {
+	case d.confirm != nil:
+		d.offset = clamp(d.offset+delta, 1)
+	case d.screen != nil && d.screen.Save == nil:
+		d.offset = max(0, d.offset+delta)
+	case d.screen != nil:
+		d.selection = clamp(d.selection+delta, len(d.screen.Fields))
+	default:
+		d.selection = clamp(d.selection+delta, len(d.actions())-1)
+	}
+}
+
+func clamp(n, high int) int { return max(0, min(n, high)) }
+
+func (d *dashboard) KeyMap() tui.KeyMap {
+	return tui.KeyMap{tui.OnStop(tui.AnyKey, d.key)}
+}
+
+func (d *dashboard) key(e tui.KeyEvent) {
+	if e.Key == tui.KeyRune && e.Mod.Has(tui.ModCtrl) && e.Rune == 'c' {
+		if d.working == "" {
+			d.app.Stop()
+		}
+		return
+	}
+	if d.busy && d.working != "" {
+		return
+	}
+	if e.Key == tui.KeyEscape || (d.screen == nil && e.Key == tui.KeyRune && e.Rune == 'q') {
+		d.back()
+	} else {
+		switch e.Key {
+		case tui.KeyUp, tui.KeyTab:
+			if e.Key == tui.KeyTab && !e.Mod.Has(tui.ModShift) {
+				d.move(1)
+			} else {
+				d.move(-1)
+			}
+		case tui.KeyDown:
+			d.move(1)
+		case tui.KeyHome:
+			d.move(-1 << 30)
+		case tui.KeyEnd:
+			d.move(1 << 30)
+		case tui.KeyPageUp:
+			d.move(-8)
+		case tui.KeyPageDown:
+			d.move(8)
+		case tui.KeyEnter:
+			d.activate()
+		case tui.KeyBackspace, tui.KeyRune:
+			if s := d.screen; s != nil && s.Save != nil && d.selection < len(s.Fields) {
+				f := &s.Fields[d.selection]
+				switch {
+				case f.Toggle && e.Rune == ' ':
+					d.activate()
+				case !f.Toggle && e.Key == tui.KeyBackspace && f.Value != "":
+					_, size := utf8.DecodeLastRuneInString(f.Value)
+					f.Value = f.Value[:len(f.Value)-size]
+				case !f.Toggle && e.Rune == 'u' && e.Mod.Has(tui.ModCtrl):
+					f.Value = ""
+				case !f.Toggle && !e.Mod.Has(tui.ModCtrl|tui.ModAlt) && unicode.IsPrint(e.Rune) && len(f.Value) < 16384:
+					f.Value += string(e.Rune)
+				}
+			} else if e.Rune == ' ' && d.screen == nil {
+				d.activate()
+			}
+		}
+	}
+	d.app.MarkDirty()
+}
+
+func (d *dashboard) HandleMouse(e tui.MouseEvent) bool {
+	if d.busy && d.working != "" {
+		return false
+	}
+	if e.Button == tui.MouseWheelDown {
+		d.move(3)
+	} else if e.Button == tui.MouseWheelUp {
+		d.move(-3)
+	} else if e.Button == tui.MouseLeft && e.Action == tui.MousePress {
+		for _, h := range d.hits {
+			if h.element.Rect().Contains(e.X, e.Y) {
+				if d.confirm != nil {
+					d.offset = h.index
+				} else {
+					d.selection = h.index
+				}
+				if d.screen == nil || d.selection >= len(d.screen.Fields) || d.screen.Fields[d.selection].Toggle {
+					d.activate()
+				}
+				d.app.MarkDirty()
+				return true
+			}
+		}
+		return false
+	} else {
+		return false
+	}
+	d.app.MarkDirty()
+	return true
+}
+
+func (d *dashboard) Render(app *tui.App) *tui.Element {
+	d.app = app
+	d.hits = d.hits[:0]
+	width, height := app.Size()
+	root := tui.New(tui.WithDirection(tui.Column), tui.WithPaddingTRBL(0, 1, 0, 1))
+	root.AddChild(line(d.menu.Unit.binaryName()+"  /  "+d.menu.Subtitle, heading))
+	state := d.current.state
+	if state == "" {
+		state = "checking…"
+		if d.current.err != nil {
+			state = "unavailable"
+		}
+	}
+	status := "Service: " + state
+	if d.current.state != "" && state != NotInstalled {
+		status += "   |   Autostart: " + checkbox(d.current.enabled)
+	}
+	style := muted
+	if state == "active" {
+		style = good
+	} else if state == "failed" || state == "unavailable" {
+		style = warning
+	}
+	root.AddChild(line(status, style))
+
+	main := tui.New(tui.WithDirection(tui.Column), tui.WithFlexGrow(1), tui.WithOverflow(tui.OverflowHidden))
+	root.AddChild(main)
+	footer := "↑/↓ Move  •  Enter / Space Select  •  Esc Quit"
+	msg := d.message
+	if msg == "" && d.current.err != nil {
+		msg = d.current.err.Error()
+	}
+	if msg != "" {
+		msg = strings.Join(strings.Fields(msg), " ")
+	}
+	msgLines := len(wrap(msg, max(1, width-2)))
+	if d.working != "" {
+		msg, msgLines = d.working+"…", 1
+	}
+	room := max(1, height-4-min(msgLines, 3))
+
+	switch {
+	case d.confirm != nil:
+		main.AddChild(line(d.confirm.Label, heading), line(d.confirm.Confirm, neutral))
+		choices := tui.New(tui.WithDirection(tui.Row), tui.WithGap(2))
+		main.AddChild(choices)
+		d.addChoice(choices, "Cancel", 0, d.offset == 0)
+		d.addChoice(choices, "Confirm", 1, d.offset == 1)
+		footer = "↑/↓ Choose  •  Enter Confirm  •  Esc Cancel"
+	case d.screen != nil:
+		s := d.screen
+		main.AddChild(line(s.Title, heading))
+		text := wrap(s.Text, max(1, width-2))
+		if s.Save == nil {
+			limit := max(1, room-1)
+			d.offset = clamp(d.offset, len(text)-limit)
+			for _, row := range text[d.offset:min(len(text), d.offset+limit)] {
+				main.AddChild(line(row, neutral))
+			}
+			footer = "↑/↓ Scroll  •  Enter / Esc Back"
+			if s.Dismiss != nil {
+				footer = "↑/↓ Scroll  •  Enter Acknowledge  •  Esc Keep for later"
+			}
+		} else {
+			for _, row := range text[:min(len(text), 2)] {
+				main.AddChild(line(row, muted))
+			}
+			d.renderForm(main, s, width, max(1, room-1-min(len(text), 2)))
+			footer = "Tab / ↑/↓ Move  •  Enter Next / Save  •  Ctrl+U Clear  •  Esc Back"
+		}
+	default:
+		if !d.root {
+			main.AddChild(line("Read-only: reopen with sudo to manage the service.", warning))
+			room--
+		}
+		items := d.actions()
+		d.selection = clamp(d.selection, len(items)-1)
+		from, to := d.window(len(items), max(1, room))
+		for i := from; i < to; i++ {
+			d.addChoice(main, items[i].Label, i, i == d.selection)
+		}
+		if from > 0 || to < len(items) {
+			footer = fmt.Sprintf("%d/%d  •  %s", d.selection+1, len(items), footer)
+		}
+	}
+
+	if msg != "" {
+		rows := wrap(msg, max(1, width-2))
+		style := good
+		if d.working == "" && (strings.HasPrefix(msg, "Error:") || msg == d.message && d.current.err != nil || d.message == "") {
+			style = warning
+		}
+		for _, row := range rows[:min(3, len(rows))] {
+			root.AddChild(line(row, style))
+		}
+	}
+	root.AddChild(line(footer, muted))
+	return root
+}
+
+func (d *dashboard) renderForm(root *tui.Element, s *Screen, width, room int) {
+	from, to := d.window(len(s.Fields)+1, room)
+	for i := from; i < to; i++ {
+		if i == len(s.Fields) {
+			d.addChoice(root, s.Submit, i, i == d.selection)
+			continue
+		}
+		f := s.Fields[i]
+		value := f.Value
+		switch {
+		case f.Toggle:
+			value = checkbox(f.Checked)
+		case f.Secret && value != "":
+			value = fmt.Sprintf("[hidden, %d characters]", len(value))
+		case !f.Secret:
+			runes := []rune(value)
+			if maxLen := max(1, width-len(f.Label)-8); len(runes) > maxLen {
+				value = "…" + string(runes[len(runes)-maxLen:])
+			}
+		}
+		if i == d.selection && !f.Toggle && !f.Secret {
+			value += "▏"
+		}
+		d.addChoice(root, f.Label+": "+value, i, i == d.selection)
+	}
+}
+
+func (d *dashboard) window(count, size int) (int, int) {
+	d.offset = clamp(d.offset, count-size)
+	d.offset = max(d.selection-size+1, min(d.offset, d.selection))
+	return d.offset, min(count, d.offset+size)
+}
+
+var (
+	neutral = tui.NewStyle()
+	heading = neutral.Bold().Foreground(tui.Cyan)
+	chosen  = neutral.Bold().Foreground(tui.Black).Background(tui.Cyan)
+	muted   = neutral.Dim()
+	good    = neutral.Foreground(tui.Green)
+	warning = neutral.Foreground(tui.Yellow)
+)
+
+func line(text string, style tui.Style) *tui.Element {
+	return tui.New(tui.WithText(text), tui.WithTextStyle(style), tui.WithHeight(1), tui.WithFlexShrink(0), tui.WithWrap(false))
+}
+
+func (d *dashboard) addChoice(root *tui.Element, label string, i int, selected bool) {
+	prefix, style := "  ", neutral
+	if selected {
+		prefix, style = "> ", chosen
+	}
+	el := line(prefix+label+" ", style)
+	root.AddChild(el)
+	d.hits = append(d.hits, hit{el, i})
+}
+
+func checkbox(on bool) string {
+	if on {
+		return "[x]"
+	}
+	return "[ ]"
+}
+
+func wrap(text string, width int) []string {
+	if text == "" {
+		return nil
+	}
+	var out []string
+	for raw := range strings.SplitSeq(text, "\n") {
+		runes := []rune(strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return ' '
+			}
+			return r
+		}, raw))
+		for len(runes) > width {
+			out = append(out, string(runes[:width]))
+			runes = runes[width:]
+		}
+		out = append(out, string(runes))
+	}
+	return out
 }

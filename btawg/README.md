@@ -28,28 +28,21 @@ latency win; see the benchmark for why this matters).
 ### 1. Hub on a public-IP VPS
 
 ```sh
-sudo ./btawg-server install
+sudo ./btawg-server
 ```
 
-One command copies the binary to `/usr/local/bin`, writes and enables the
-`btawg-server` systemd unit, and starts it. State lives under `/var/lib/btawg`
-and `/etc/btawg`, surviving upgrades and restarts. Re-running `install` upgrades
-the binary without touching the database, client imports, or the admin password.
+Choose **Install service**. The installer copies the binary to `/usr/local/bin`,
+writes and enables `btawg-server.service`, and starts it. Save the initial
+`admin` password shown in the TUI; press Enter to acknowledge it, or Esc to
+leave it available under **Web panel and initial login**. Do not delete the
+database to recover a password: it contains the hub and client identities.
 
-The first install prints, once:
-
-```
-btawg-server: panel login admin / <password> (shown once)
-```
-
-**Save that password now** — it is shown only once. Do not delete the
-database to recover it; the database also contains the hub and client identities.
-
-Manage the service and see its status from the TUI:
-
-```sh
-sudo btawg-server       # TUI: status, start/stop/restart, autostart
-```
+After installation, `sudo btawg-server` opens the dashboard. Use ↑/↓ and Enter
+or click a menu item. Start, stop, restart, autostart, logs, update, and removal
+are available in the dashboard. To change launch settings, stop the service
+and select **Service settings**. Removing either service keeps its installed
+launcher, `/etc/btawg` settings and keys, and `/var/lib/btawg` server state.
+For unattended installation, `sudo ./btawg-server install` still works.
 
 Open **6881/TCP**, **6881/UDP**, **51821/UDP** (AWG), and **51820/UDP**
 (WG) on the hub. DHT also needs outbound UDP. Real-TUN mode requires `ip`,
@@ -72,32 +65,24 @@ is unaffected. Before enrolling a VPN client, use an SSH port forward.
 ssh -L 8080:127.0.0.1:8080 vps      # or open http://10.77.0.1:8080 over the VPN
 ```
 
-Open `http://127.0.0.1:8080`, log in (`admin` + printed password), then
-**Clients → Add client → Create & get config**. Copy the `btawg://…` string
-or the full client command. The import contains the client's private key;
-share it as you would a WireGuard config.
+Open `http://127.0.0.1:8080`, log in as `admin` with the initial password, then
+choose **Clients → Add client → Create & get config**. Copy the `btawg://…`
+string. It contains the client's private key; treat it as a secret.
 
 ### 3. Client machine
 
 ```sh
-sudo ./btawg-client install -import-file client.txt   # or run without -import-file to paste it
+sudo ./btawg-client
 ```
 
-One command stores the import and generated credentials in `/etc/btawg`, then
-installs, enables, and starts the `btawg-client` systemd service. The mode from
-the import is enabled at first; the rest start reserved-but-off. Re-running
-`install` upgrades the binary without losing config or credentials.
-
-Run `sudo btawg-client` with no arguments for the TUI:
-
-```text
-btawg-client  active / enabled
-[x] 1080  socks5-awg-ext-utp   enabled
-[ ] 1081  socks5-awg-ext-tcp   reserved
-...
-Space: toggle   v: show SOCKS5 login   g: regenerate
-s:start  t:stop  r:restart  b:autostart  q:quit
-```
+Choose **Install service**, paste the import into **VPN import** (hidden), and
+choose **Save and install**. The installer saves the import and generated SOCKS5
+credentials under `/etc/btawg`, then enables and starts `btawg-client.service`.
+The imported mode starts enabled; other modes are reserved but off. Select a
+transport and press Enter or Space to toggle it without restarting the service.
+To edit the import, SOCKS5 listen address or TUN options later, stop the service
+and choose **Service settings**. Leaving the import field blank keeps it.
+For unattended installation, use `sudo ./btawg-client install -import-file client.txt`.
 
 Each connection mode has a **fixed** local SOCKS5 port (1080 = first mode,
 1081 = second, …). Toggling a mode off closes its sessions but keeps its port
@@ -112,10 +97,10 @@ mapping is permanent across toggles and restarts:
 | 1083 | AWG · req-tcp | 1088 | TLS · req-utp |
 | 1084 | AWG · udp | 1089 | TLS · req-tcp |
 
-All inbounds share **one SOCKS5 username/password** (RFC 1929). The TUI shows
-the pair (`v`) and regenerates it (`g`); rotation is immediate across every
-port and closes existing sessions. No-auth is refused. The SOCKS5 protocol
-does not encrypt these credentials — expose the ports only to a trusted LAN.
+All inbounds share **one SOCKS5 username/password** (RFC 1929). Choose **Show
+SOCKS5 credentials** or **Rotate SOCKS5 credentials**; rotation is immediate
+across every port and closes existing sessions. No-auth is refused. SOCKS5
+does not encrypt these credentials. Expose these ports only to a trusted LAN.
 
 For a single foreground connection (no service), the old form still works:
 
@@ -132,8 +117,8 @@ curl http://10.77.0.1:8080/login
 ip route get 10.77.0.1
 ```
 
-Use a port enabled in the TUI and set `SOCKS_LOGIN` to the username shown by
-`v`; curl prompts for the password. SOCKS domain resolution runs at the hub.
+Use an enabled port and set `SOCKS_LOGIN` to the username shown by **Show
+SOCKS5 credentials**. Curl prompts for the password. SOCKS domain resolution runs at the hub.
 The client automatically installs the VPN prefixes from the import and uses
 the lowest-index enabled path for ordinary VPN-IP traffic. SOCKS sockets use
 the tunnel assigned to their port. The host default route is not changed.
@@ -157,7 +142,9 @@ import. Denied peer traffic is silently dropped.
 | Client exits after ~45 s of retries | Hub unreachable (down / carrier port filtered) — check `6881/udp` and `-external-ip` |
 | `curl` fails with IPv6 target | Hub host has no IPv6 — use `curl -4` (documented limit) |
 | `tun setup (root required)` | Run with sudo or `-no-tun` |
-| Password lost | Delete the db and recreate clients (keys live in the import strings) |
+| Service not installed | Open the binary with sudo and choose **Install service**. |
+| Service failed to start | Choose **View service logs** to see the daemon error. |
+| Initial panel password not saved | Check **Web panel and initial login**. Do not delete the database. |
 
 
 ## Run the server (VPS)

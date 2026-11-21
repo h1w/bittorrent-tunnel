@@ -30,6 +30,9 @@ func TestInstallCmdCopiesBinaryAndPrintsPassword(t *testing.T) {
 	var calls []string
 	service.SetSystemctlRunner(func(ctx context.Context, args ...string) (string, error) {
 		calls = append(calls, strings.Join(args, " "))
+		if args[0] == "show" {
+			return "LoadState=not-found\nActiveState=inactive\nUnitFileState=\n", nil
+		}
 		if len(args) > 0 && args[0] == "restart" {
 			st, err := store.Open(db)
 			if err != nil {
@@ -63,7 +66,10 @@ func TestInstallCmdCopiesBinaryAndPrintsPassword(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(tmpUnit, "btawg-server.service")); err != nil {
 		t.Fatalf("unit not written: %v", err)
 	}
-	want := []string{"show --property=ActiveState --value btawg-server.service", "is-enabled btawg-server.service", "daemon-reload", "enable btawg-server.service", "restart btawg-server.service"}
+	want := []string{
+		"show --property=LoadState,ActiveState,UnitFileState btawg-server.service",
+		"daemon-reload", "enable btawg-server.service", "restart btawg-server.service",
+	}
 	if len(calls) != len(want) {
 		t.Fatalf("calls = %v, want %v", calls, want)
 	}
