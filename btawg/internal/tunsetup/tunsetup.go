@@ -27,15 +27,7 @@ func Setup(name string, addr netip.Prefix, route *netip.Prefix, mtu int, ipForwa
 			return err
 		}
 	}
-	if !hasAddr(name, addr) {
-		if err := run("ip", "addr", "add", addr.String(), "dev", name); err != nil {
-			return err
-		}
-	}
-	// The stream carrier can briefly backpressure AWG during congestion or
-	// window refill. Leave room for a burst of GSO packets before Linux drops
-	// them and forces the inner TCP connections to restart congestion control.
-	if err := run("ip", "link", "set", "dev", name, "mtu", fmt.Sprintf("%d", mtu), "txqueuelen", "8192", "up"); err != nil {
+	if err := setupLink(name, addr, mtu); err != nil {
 		return err
 	}
 	if route != nil && route.Masked() != addr.Masked() {
@@ -49,6 +41,16 @@ func Setup(name string, addr netip.Prefix, route *netip.Prefix, mtu int, ipForwa
 		}
 	}
 	return nil
+}
+
+func setupLink(name string, addr netip.Prefix, mtu int) error {
+	if !hasAddr(name, addr) {
+		if err := run("ip", "addr", "add", addr.String(), "dev", name); err != nil {
+			return err
+		}
+	}
+	// A larger queue absorbs bursts while the carrier is backpressured.
+	return run("ip", "link", "set", "dev", name, "mtu", fmt.Sprintf("%d", mtu), "txqueuelen", "8192", "up")
 }
 
 // deviceExists reports whether the named link is present. Best-effort and

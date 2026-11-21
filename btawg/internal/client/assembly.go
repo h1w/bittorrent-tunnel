@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/netip"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
 
 type managedTunnel struct {
@@ -22,8 +24,8 @@ type managedTunnel struct {
 type Managed struct {
 	inbound *managed
 	cfg     config.ClientConfig
-	realTUN bool
-	tunBase string
+	shared  *sharedTUN
+	route   *tunsetup.ProxyRoute
 	mu      sync.Mutex
 	tunnels []*managedTunnel
 	auth    Credentials
@@ -39,7 +41,21 @@ func newManagedAt(ctx context.Context, cfg config.ClientConfig, enabled []string
 	if err != nil {
 		return nil, err
 	}
-	m := &Managed{inbound: inbound, cfg: cfg, realTUN: realTUN, tunBase: tunBase, tunnels: make([]*managedTunnel, len(inbound.slots))}
+	m := &Managed{inbound: inbound, cfg: cfg, tunnels: make([]*managedTunnel, len(inbound.slots))}
+	if realTUN {
+		dev, err := openClientTUN(cfg, tunBase)
+		if err != nil {
+			inbound.Close()
+			return nil, err
+		}
+		m.route, err = tunsetup.NewProxyRoute(tunBase)
+		if err != nil {
+			dev.Close()
+			inbound.Close()
+			return nil, err
+		}
+		m.shared = newSharedTUN(dev, tunBase, config.DefaultMTU)
+	}
 	if err := m.Apply(enabled, auth); err != nil {
 		m.Close()
 		return nil, err
@@ -84,8 +100,11 @@ func (m *Managed) apply(enabled []string, auth Credentials, save func() error) e
 		cfg.Transport = mode
 		var c *Client
 		var err error
-		if m.realTUN {
-			c, err = newManagedTUN(cfg, m.tunBase, i)
+		if m.shared != nil {
+			path := m.shared.newPath()
+			c = &Client{cfg: cfg, path: path}
+			path.proxySockets(c, netip.MustParseAddr(cfg.ClientIP))
+			err = c.start(path)
 		} else {
 			c, err = New(cfg)
 		}
@@ -98,6 +117,20 @@ func (m *Managed) apply(enabled []string, auth Credentials, save func() error) e
 		if err := save(); err != nil {
 			return err
 		}
+	}
+	if m.shared != nil {
+		var primary *tunPath
+		for i, mode := range modes {
+			if slices.Contains(enabled, mode) {
+				if c := pending[i]; c != nil {
+					primary = c.path
+				} else {
+					primary = m.tunnels[i].c.path
+				}
+				break
+			}
+		}
+		m.shared.primary.Store(primary)
 	}
 	rotated := m.auth != auth
 	for i, mode := range modes {
@@ -157,11 +190,17 @@ func (m *Managed) Close() error {
 		return nil
 	}
 	m.closed = true
+	if m.shared != nil {
+		m.shared.primary.Store(nil)
+	}
 	m.inbound.Close()
 	for _, t := range m.tunnels {
 		if t != nil {
 			t.close()
 		}
+	}
+	if m.shared != nil {
+		return errors.Join(m.route.Close(), m.shared.close())
 	}
 	return nil
 }

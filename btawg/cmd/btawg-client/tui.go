@@ -55,7 +55,7 @@ func clientSetup(install bool) (*service.Screen, error) {
 		Fields: []service.Field{
 			{Label: "VPN import", Secret: true},
 			{Label: "SOCKS5 listen IPv4", Value: cfg.ListenIP},
-			{Label: "TUN name prefix", Value: cfg.TUNName},
+			{Label: "TUN interface name", Value: cfg.TUNName},
 			{Label: "Userspace only (no TUN)", Toggle: true, Checked: cfg.NoTUN},
 		},
 		Save: func(fields []service.Field) (*service.Screen, error) {
@@ -90,7 +90,7 @@ func saveClientSettings(previous *client.ManagedConfig, raw, listen string, noTU
 		return errors.New("SOCKS5 listen address must be IPv4")
 	}
 	if !noTUN {
-		if err := service.ValidateInterface(tun, 13); err != nil {
+		if err := service.ValidateInterface(tun, 15); err != nil {
 			return err
 		}
 	}

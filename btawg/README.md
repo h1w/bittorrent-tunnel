@@ -119,9 +119,12 @@ ip route get 10.77.0.1
 
 Use an enabled port and set `SOCKS_LOGIN` to the username shown by **Show
 SOCKS5 credentials**. Curl prompts for the password. SOCKS domain resolution runs at the hub.
-The client automatically installs the VPN prefixes from the import and uses
-the lowest-index enabled path for ordinary VPN-IP traffic. SOCKS sockets use
-the tunnel assigned to their port. The host default route is not changed.
+The managed client owns one Linux TUN (`btawg0` by default) with the imported
+VPN address and routes. Ordinary VPN-IP traffic uses the lowest-index enabled
+transport; each SOCKS5 port uses its assigned transport through the same TUN.
+Toggling modes does not recreate the interface or change the host default route.
+The interface is removed when the service stops. A matching detached persistent
+TUN from an old foreground client is adopted on upgrade.
 
 ### 5. Policy (panel, live)
 

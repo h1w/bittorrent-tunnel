@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
-	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -21,7 +20,6 @@ import (
 	"bittorrent-tunnel/btawg/internal/client"
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/service"
-	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
 
 func main() {
@@ -57,7 +55,7 @@ func installMain(args []string) error {
 	importFile := fs.String("import-file", "", "file containing the btawg:// import string (secret)")
 	socksListen := fs.String("socks-listen", "127.0.0.1", "SOCKS5 listen IPv4 address")
 	noTun := fs.Bool("no-tun", false, "userspace netstack mode: no OS interface")
-	tunName := fs.String("tun", "btawg0", "TUN interface name prefix")
+	tunName := fs.String("tun", "btawg0", "TUN interface name")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -117,7 +115,7 @@ func runMain(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	managed := fs.Bool("managed", false, "run as the managed multi-mode daemon")
 	noTun := fs.Bool("no-tun", false, "userspace netstack mode")
-	tunName := fs.String("tun", "btawg0", "TUN interface name prefix")
+	tunName := fs.String("tun", "btawg0", "TUN interface name")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -207,17 +205,6 @@ func runSingleOpts(raw, transport string, dhtOnly bool, socksListen string, noTu
 	if noTun {
 		c, err = client.New(cfg)
 	} else {
-		subnet, perr := netip.ParsePrefix(cfg.Subnet)
-		if perr != nil || !subnet.Addr().Is4() || subnet.Bits() == 0 {
-			return fmt.Errorf("invalid IPv4 subnet %q", cfg.Subnet)
-		}
-		addr := netip.PrefixFrom(netip.MustParseAddr(cfg.ClientIP), subnet.Bits())
-		if serr := tunsetup.Setup(tunName, addr, &subnet, config.DefaultMTU, false); serr != nil {
-			return fmt.Errorf("tun setup (root required): %w", serr)
-		}
-		if err := addRoutes(tunName, cfg.Routes, subnet); err != nil {
-			return fmt.Errorf("add routes: %w", err)
-		}
 		c, err = client.NewRealTUN(cfg, tunName)
 	}
 	if err != nil {
@@ -229,31 +216,6 @@ func runSingleOpts(raw, transport string, dhtOnly bool, socksListen string, noTu
 	defer stop()
 	if err := c.Run(ctx); err != nil {
 		return err
-	}
-	return nil
-}
-
-// addRoutes installs explicit managed CIDRs on the TUN interface. It skips the
-// subnet itself and any default route, and ignores duplicate additions.
-func addRoutes(tunName string, routes []string, subnet netip.Prefix) error {
-	for _, r := range routes {
-		p, err := netip.ParsePrefix(r)
-		if err != nil {
-			return fmt.Errorf("parse route %q: %w", r, err)
-		}
-		if !p.Addr().Is4() || p.Bits() == 0 {
-			continue
-		}
-		if p.Masked() == subnet.Masked() {
-			continue
-		}
-		cmd := exec.Command("ip", "route", "add", p.Masked().String(), "dev", tunName)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			if strings.Contains(string(out), "File exists") {
-				continue
-			}
-			return fmt.Errorf("ip route add %s: %w: %s", p.Masked().String(), err, strings.TrimSpace(string(out)))
-		}
 	}
 	return nil
 }

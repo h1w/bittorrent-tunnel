@@ -70,6 +70,21 @@ func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath st
 	if err != nil {
 		return err
 	}
+	if m.shared != nil {
+		// A lost kernel device must fail the service rather than leave SOCKS
+		// listeners accepting connections that can never forward traffic.
+		watchCtx, stopWatch := context.WithCancel(ctx)
+		watchDone := make(chan struct{})
+		go func() {
+			defer close(watchDone)
+			select {
+			case <-m.shared.done:
+				ln.Close()
+			case <-watchCtx.Done():
+			}
+		}()
+		defer func() { stopWatch(); <-watchDone }()
+	}
 	defer m.Close()
 	d := &clientControl{m: m, path: cfgPath, cfg: cfg}
 	if err := service.NotifyReady(); err != nil {
@@ -84,6 +99,13 @@ func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath st
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
+			}
+			if m.shared != nil {
+				select {
+				case <-m.shared.done:
+					return fmt.Errorf("read client TUN: %w", m.shared.readErr)
+				default:
+				}
 			}
 			return err
 		}

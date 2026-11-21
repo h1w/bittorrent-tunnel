@@ -38,14 +38,12 @@ type Client struct {
 	ns   *netstack.Net // non-nil in netstack mode
 	ip   *tlsTunnel    // non-nil for TLS carrier modes
 
-	proxyTCP    func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
-	proxyUDP    func(ctx context.Context) (net.PacketConn, error)
-	proxyRoute  *tunsetup.ProxyRoute
-	markedRoute *tunsetup.MarkedRoute
+	proxyTCP   func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
+	proxyUDP   func(ctx context.Context) (net.PacketConn, error)
+	proxyRoute *tunsetup.ProxyRoute
+	path       *tunPath
 
 	disc func(ctx context.Context) ([]netip.AddrPort, error)
-
-	cleanup func() // managed-mode route/rule cleanup
 
 	socksAddr atomic.Value // string, set once the SOCKS5 listener is up
 }
@@ -74,15 +72,13 @@ func New(cfg config.ClientConfig) (*Client, error) {
 	return c, nil
 }
 
-// NewRealTUN builds the client on a real OS network interface (root). The
-// overlay address and subnet route are configured by the caller (main);
-// nothing here takes over the default route.
+// NewRealTUN builds a foreground client on its own kernel TUN (root).
 func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
 	cfg.Transport = config.CanonicalMode(cfg.Transport)
 	c := &Client{cfg: cfg}
-	tunDev, err := tun.CreateTUN(tunName, config.DefaultMTU)
+	tunDev, err := openClientTUN(cfg, tunName)
 	if err != nil {
-		return nil, fmt.Errorf("create tun: %w", err)
+		return nil, err
 	}
 	route, err := tunsetup.NewProxyRoute(tunName)
 	if err != nil {
@@ -115,54 +111,20 @@ func NewRealTUN(cfg config.ClientConfig, tunName string) (*Client, error) {
 	return c, nil
 }
 
-func newManagedTUN(cfg config.ClientConfig, base string, index int) (*Client, error) {
-	clientIP, err := netip.ParseAddr(cfg.ClientIP)
-	if err != nil || !clientIP.Is4() {
-		return nil, fmt.Errorf("invalid client IPv4 address")
+func openClientTUN(cfg config.ClientConfig, name string) (tun.Device, error) {
+	subnet, err := netip.ParsePrefix(cfg.Subnet)
+	if err != nil || !subnet.Addr().Is4() || subnet.Bits() == 0 {
+		return nil, fmt.Errorf("invalid IPv4 subnet %q", cfg.Subnet)
 	}
-	prefixes := make([]netip.Prefix, 0, 1+len(cfg.Routes))
-	seen := make(map[netip.Prefix]bool)
-	for _, raw := range append([]string{cfg.Subnet}, cfg.Routes...) {
-		p, err := netip.ParsePrefix(raw)
-		if err != nil || !p.Addr().Is4() || p.Bits() == 0 {
-			return nil, fmt.Errorf("invalid overlay route %q", raw)
-		}
-		p = p.Masked()
-		if !seen[p] {
-			seen[p] = true
-			prefixes = append(prefixes, p)
-		}
+	ip, err := netip.ParseAddr(cfg.ClientIP)
+	if err != nil || !ip.Is4() || !subnet.Contains(ip) {
+		return nil, fmt.Errorf("invalid client IPv4 address %q for %s", cfg.ClientIP, subnet)
 	}
-	name := base + "-" + strconv.Itoa(index)
-	td, err := tunsetup.CreateExclusiveTUN(name, config.DefaultMTU)
+	dev, err := tunsetup.OpenClientTUN(name, netip.PrefixFrom(ip, subnet.Bits()), cfg.Routes, config.DefaultMTU)
 	if err != nil {
-		return nil, fmt.Errorf("create TUN %s: %w", name, err)
+		return nil, fmt.Errorf("client TUN %s: %w", name, err)
 	}
-	route, err := tunsetup.NewMarkedRoute(name, index, config.DefaultMTU, clientIP, prefixes)
-	if err != nil {
-		td.Close()
-		return nil, err
-	}
-	c := &Client{cfg: cfg, markedRoute: route}
-	if err := c.start(td); err != nil {
-		_ = route.Close()
-		return nil, err
-	}
-	addr := netip.AddrPortFrom(clientIP, 0)
-	dialer := net.Dialer{LocalAddr: net.TCPAddrFromAddrPort(addr), Control: func(network, address string, fd syscall.RawConn) error {
-		if err := route.Control(network, address, fd); err != nil {
-			return err
-		}
-		return tunsetup.OverlayTCP(network, address, fd)
-	}}
-	c.proxyTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		return dialer.DialContext(ctx, "tcp4", dst.String())
-	}
-	listen := net.ListenConfig{Control: route.Control}
-	c.proxyUDP = func(ctx context.Context) (net.PacketConn, error) {
-		return listen.ListenPacket(ctx, "udp4", addr.String())
-	}
-	return c, nil
+	return dev, nil
 }
 
 func (c *Client) start(tunDev tun.Device) error {
@@ -504,9 +466,6 @@ func (c *Client) connectCarrier(ctx context.Context, addr netip.AddrPort) (carri
 
 // Close tears the client down.
 func (c *Client) Close() {
-	if c.markedRoute != nil {
-		_ = c.markedRoute.Close()
-	}
 	if c.proxyRoute != nil {
 		_ = c.proxyRoute.Close()
 	}
