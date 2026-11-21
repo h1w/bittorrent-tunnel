@@ -62,10 +62,11 @@ yourself.
 
 ### 2. Panel → first client
 
-The panel listens on **localhost** and the **hub's VPN address** (e.g.
-`http://10.77.0.1:8080`) — never the public IP. Before any client exists,
-reach it via SSH port-forward; once a client is connected, open it directly
-over the VPN.
+The panel listens on **localhost** and on the **Gateway** set for the
+**Default** group in **Groups** (`http://10.77.0.1:8080` with the shipped
+defaults), never on a wildcard or WAN interface. In real-TUN mode, saving a
+different default-group gateway moves the VPN listener immediately; localhost
+is unaffected. Before enrolling a VPN client, use an SSH port forward.
 
 ```sh
 ssh -L 8080:127.0.0.1:8080 vps      # or open http://10.77.0.1:8080 over the VPN

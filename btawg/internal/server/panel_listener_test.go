@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -46,6 +47,9 @@ func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 	if err := st.SaveGroup(store.GroupRecord{ID: "aaa", Name: "Another group", Subnet: "10.78.0.0/24", ServerIP: "10.78.0.1"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.SaveGroup(store.GroupRecord{ID: store.DefaultGroupID, Name: "Default", Subnet: "10.90.0.0/24", ServerIP: "10.90.0.7"}); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := config.DefaultServerConfig()
 	cfg.CarrierPort = freeTCPPort(t)
@@ -57,29 +61,14 @@ func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 	}
 	t.Cleanup(func() { srv.Close() })
 
-	listeners, err := srv.ListenPanel(context.Background(), 18080)
-	if err != nil {
-		t.Fatalf("ListenPanel: %v", err)
-	}
-	if len(listeners) != 2 {
-		t.Fatalf("listeners = %d, want 2", len(listeners))
-	}
-	for _, ln := range listeners {
-		defer ln.Close()
-	}
-
-	// Serve a simple handler on both listeners.
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "ok")
-	})
-	for _, ln := range listeners {
-		go func(l net.Listener) {
-			_ = http.Serve(l, handler)
-		}(ln)
+	web := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "ok") })}
+	defer web.Close()
+	if _, err := srv.StartPanel(context.Background(), 0, web); err != nil {
+		t.Fatal(err)
 	}
 
 	// Verify loopback is reachable.
-	loopAddr := listeners[0].Addr().String()
+	loopAddr := srv.panel.loopback.Addr().String()
 	resp, err := http.Get("http://" + loopAddr)
 	if err != nil {
 		t.Fatalf("loopback request: %v", err)
@@ -91,10 +80,10 @@ func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 	}
 
 	// Verify gateway listener is on the VPN address, not 0.0.0.0.
-	gatewayAddr := listeners[1].Addr()
+	gatewayAddr := srv.panel.vpn.Addr()
 	ap := gatewayAddr.(*net.TCPAddr).AddrPort()
-	if ap.Addr() != netip.MustParseAddr("10.77.0.1") {
-		t.Fatalf("gateway addr = %s, want 10.77.0.1", ap.Addr())
+	if ap.Addr() != netip.MustParseAddr("10.90.0.7") {
+		t.Fatalf("gateway addr = %s, want 10.90.0.7", ap.Addr())
 	}
 
 	// Reach the gateway listener from inside the overlay netstack.
@@ -114,5 +103,65 @@ func TestListenPanelBindsLoopbackAndGateway(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "ok") {
 		t.Fatalf("gateway body = %q", body)
+	}
+}
+
+func TestPanelFollowsDefaultGroupGatewayOnReload(t *testing.T) {
+	st, err := store.Open(t.TempDir() + "/panel.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	group := store.GroupRecord{ID: store.DefaultGroupID, Name: "Default", Subnet: "127.8.0.0/24", ServerIP: "127.8.0.7"}
+	if err := st.SaveGroup(group); err != nil {
+		t.Fatal(err)
+	}
+	// Linux already routes 127/8 through lo; use real HTTP sockets without
+	// changing host routes or requiring the TUN/NAT setup.
+	srv := &Server{st: st, tunName: "lo", policy: newPolicySnapshot(), closed: make(chan struct{})}
+	defer srv.Close()
+	web := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, "panel") })}
+	defer web.Close()
+	if _, err := srv.StartPanel(context.Background(), 0, web); err != nil {
+		t.Fatal(err)
+	}
+	port := srv.panel.loopback.Addr().(*net.TCPAddr).Port
+	client := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}, Timeout: time.Second}
+	get := func(host string) error {
+		r, err := client.Get("http://" + net.JoinHostPort(host, strconv.Itoa(port)))
+		if err != nil {
+			return err
+		}
+		defer r.Body.Close()
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		if string(body) != "panel" {
+			return fmt.Errorf("unexpected response %q", body)
+		}
+		return nil
+	}
+	for _, host := range []string{"127.0.0.1", group.ServerIP} {
+		if err := get(host); err != nil {
+			t.Fatalf("initial panel on %s: %v", host, err)
+		}
+	}
+	old := group.ServerIP
+	group.ServerIP = "127.8.0.9"
+	if err := st.SaveGroup(group); err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.ReloadPolicy(); err != nil {
+		t.Fatal(err)
+	}
+	if err := get(group.ServerIP); err != nil {
+		t.Fatalf("panel on new gateway: %v", err)
+	}
+	if err := get("127.0.0.1"); err != nil {
+		t.Fatalf("panel on loopback after reload: %v", err)
+	}
+	if err := get(old); err == nil {
+		t.Fatal("panel still accepts connections on the old gateway")
 	}
 }

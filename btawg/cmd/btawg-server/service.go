@@ -7,7 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -222,21 +221,12 @@ func runCmd(parent context.Context, args []string) error {
 		cfg.ExternalIP = *externalIP
 	}
 
-	listeners, err := srv.ListenPanel(ctx, cfg.PanelPort)
+	p := panel.New(st, srv, "admin", cfg.AdminPassHash)
+	web := &http.Server{Handler: p.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	defer web.Close()
+	webErrors, err := srv.StartPanel(ctx, cfg.PanelPort, web)
 	if err != nil {
 		return fmt.Errorf("panel listeners: %w", err)
-	}
-	p := panel.New(st, srv, "admin", cfg.AdminPassHash)
-	handler := p.Handler()
-	web := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
-	defer web.Close()
-	webErrors := make(chan error, len(listeners))
-	for _, ln := range listeners {
-		defer ln.Close()
-		go func(l net.Listener) { webErrors <- web.Serve(l) }(ln)
-	}
-	for _, addr := range listenerAddrs(listeners) {
-		fmt.Printf("btawg-server: panel on http://%s\n", addr)
 	}
 
 	if *managed {
@@ -307,14 +297,6 @@ func openOrCreateServerStore(path string, pendingPath ...string) (*store.Store, 
 		return nil, false, "", fmt.Errorf("save admin hash: %w", err)
 	}
 	return st, true, pw, nil
-}
-
-func listenerAddrs(listeners []net.Listener) []string {
-	out := make([]string, len(listeners))
-	for i, ln := range listeners {
-		out[i] = ln.Addr().String()
-	}
-	return out
 }
 
 var installRequiresRoot = true

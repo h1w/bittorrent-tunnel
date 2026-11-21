@@ -74,6 +74,7 @@ type Server struct {
 	attached     map[string]int // client IP -> carrier count
 
 	policy *policySnapshot
+	panel  *panelListeners
 
 	udpPC  net.PacketConn
 	sock   utp.Socket
@@ -425,10 +426,14 @@ func (s *Server) ReloadPolicy() (err error) {
 	if err != nil {
 		return err
 	}
-	if err = s.policy.reload(s.st, netip.MustParseAddr(group.ServerIP)); err != nil {
+	gateway := netip.MustParseAddr(group.ServerIP)
+	if err = s.policy.reload(s.st, gateway); err != nil {
 		return err
 	}
 	s.gateways = gs
+	if err = s.rebindPanel(gateway); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -809,6 +814,7 @@ func (s *Server) Close() error {
 			}
 		}
 		s.mu.Unlock()
+		s.closePanel()
 		s.trafficWG.Wait()
 		for _, a := range s.anns {
 			a.Close()
