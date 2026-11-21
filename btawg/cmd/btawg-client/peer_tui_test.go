@@ -1,11 +1,14 @@
 package main
 
 import (
+	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 
 	"bittorrent-tunnel/btawg/internal/client"
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/service"
 )
 
 func TestPeerScreensPreserveLatestIndependentSettings(t *testing.T) {
@@ -14,9 +17,13 @@ func TestPeerScreensPreserveLatestIndependentSettings(t *testing.T) {
 		if req.Op == "set-peer" {
 			state = *req.Peer
 		}
-		return client.ControlResponse{OK: true, Peer: state}, false, nil
+		return client.ControlResponse{OK: true, Peer: state, PeerRevision: "test"}, false, nil
 	}
 	screen, err := peerSettingsScreen(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	screen, err = screen.Choices[0].Run()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,5 +85,75 @@ func TestPeerScreensPreserveLatestIndependentSettings(t *testing.T) {
 	}
 	if _, err := screen.Choices[3].Run(); err != nil || state.Relay {
 		t.Fatalf("relay toggle: %+v %v", state, err)
+	}
+}
+
+func TestPeerOverrideScreensEditAndRestoreInheritance(t *testing.T) {
+	ip := netip.MustParseAddr("10.77.0.5")
+	state := client.PeerSettings{Outgoing: "wg", Relay: true, Pools: map[string][]string{"failover": {config.ModeWG}}}
+	request := func(req client.ControlRequest) (client.ControlResponse, bool, error) {
+		if req.Op == "set-peer" {
+			state = *req.Peer
+		}
+		return client.ControlResponse{OK: true, Peer: state, PeerRevision: "test"}, false, nil
+	}
+	open := func(screen *service.Screen, prefix string) *service.Screen {
+		t.Helper()
+		for _, choice := range screen.Choices {
+			if strings.HasPrefix(strings.TrimPrefix(strings.TrimPrefix(choice.Label, "[x] "), "[ ] "), prefix) {
+				next, err := choice.Run()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return next
+			}
+		}
+		t.Fatalf("option %q not available in %q", prefix, screen.Title)
+		return nil
+	}
+	list := func() *service.Screen {
+		t.Helper()
+		screen, err := peerSettingsScreen(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return open(screen, "Per-peer overrides")
+	}
+	add := open(list(), "Add by VPN IP")
+	add.Fields[0].Value = "10.77.0.0/24"
+	if _, err := add.Save(add.Fields); err == nil {
+		t.Fatal("accepted a subnet instead of a peer address")
+	}
+	add.Fields[0].Value = ip.String()
+	if _, err := add.Save(add.Fields); err != nil {
+		t.Fatal(err)
+	}
+	peer := func() *service.Screen { return open(list(), ip.String()) }
+	open(open(peer(), "Connect using"), config.ModeTLSReqTCP)
+	open(open(peer(), "Allow relay"), "Off")
+	pool := func() *service.Screen { return open(open(peer(), "Outgoing pools"), "Failover") }
+	owned := open(pool(), "Customize")
+	for i := range owned.Fields {
+		owned.Fields[i].Checked = false
+	}
+	if _, err := owned.Save(owned.Fields); err != nil {
+		t.Fatal(err)
+	}
+	got := state.ForPeer(ip)
+	if got.SelectedMode() != config.ModeTLSReqTCP || got.Relay || got.Pools["failover"] == nil || len(got.Pools["failover"]) != 0 {
+		t.Fatalf("peer edits not applied independently: %+v", got)
+	}
+	other := state.ForPeer(netip.MustParseAddr("10.77.0.6"))
+	if other.SelectedMode() != config.ModeWG || !other.Relay || !slices.Equal(other.Pools["failover"], []string{config.ModeWG}) {
+		t.Fatalf("peer edits changed global defaults: %+v", other)
+	}
+	open(pool(), "Use global")
+	state.Pools["failover"] = []string{config.ModeAWG}
+	if !slices.Equal(state.ForPeer(ip).Pools["failover"], []string{config.ModeAWG}) {
+		t.Fatal("reset pool did not follow changed globals")
+	}
+	open(open(peer(), "Remove override"), "Remove")
+	if _, exists := state.Overrides[ip]; exists || !state.ForPeer(ip).Relay || state.ForPeer(ip).SelectedMode() != config.ModeWG {
+		t.Fatal("removed peer did not revert to global defaults")
 	}
 }

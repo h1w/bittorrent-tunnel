@@ -27,6 +27,8 @@ const (
 	Path          = "/v1/mesh"
 )
 
+const MaxPeerOverrides = 32
+
 // Node identifies one enrollment independently of its current overlay address.
 type Node struct {
 	ID  string `json:"id"`
@@ -42,15 +44,34 @@ type Candidate struct {
 	Receive  bool           `json:"receive,omitempty"`  // native socket accepts new flows
 }
 
+// PeerModes carries effective directional lists for one counterpart. Empty
+// lists deny that direction; an absent map entry uses the global lists.
+type PeerModes struct {
+	Incoming []string `json:"incoming_modes,omitempty"`
+	Outgoing []string `json:"outgoing_modes,omitempty"`
+}
+
+func ValidPeerOverrideIP(ip netip.Addr) bool {
+	return ip.Is4() && !ip.IsUnspecified() && ip != netip.AddrFrom4([4]byte{255, 255, 255, 255})
+}
+
 type Registration struct {
-	DirectKey       string       `json:"key,omitempty"`
-	Candidates      []Candidate  `json:"candidates,omitempty"`
-	Want            []netip.Addr `json:"want,omitempty"`
-	Egress          bool         `json:"egress,omitempty"`
-	TransportPolicy bool         `json:"transport_policy,omitempty"`
-	IncomingModes   []string     `json:"incoming_modes,omitempty"`
-	OutgoingModes   []string     `json:"outgoing_modes,omitempty"`
-	TLSPin          string       `json:"tls_pin,omitempty"`
+	DirectKey       string                   `json:"key,omitempty"`
+	Candidates      []Candidate              `json:"candidates,omitempty"`
+	Want            []netip.Addr             `json:"want,omitempty"`
+	Egress          bool                     `json:"egress,omitempty"`
+	TransportPolicy bool                     `json:"transport_policy,omitempty"`
+	IncomingModes   []string                 `json:"incoming_modes,omitempty"`
+	OutgoingModes   []string                 `json:"outgoing_modes,omitempty"`
+	TLSPin          string                   `json:"tls_pin,omitempty"`
+	PeerOverrides   map[netip.Addr]PeerModes `json:"peer_overrides,omitempty"`
+}
+
+func (r Registration) ModesForPeer(ip netip.Addr) PeerModes {
+	if modes, ok := r.PeerOverrides[ip]; ok {
+		return modes
+	}
+	return PeerModes{Incoming: r.IncomingModes, Outgoing: r.OutgoingModes}
 }
 
 type Pair struct {

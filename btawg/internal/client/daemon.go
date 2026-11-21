@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,13 +23,14 @@ import (
 )
 
 type ControlRequest struct {
-	Op       string        `json:"op"`
-	Mode     string        `json:"mode,omitempty"`
-	Balancer string        `json:"balancer,omitempty"`
-	Enabled  []string      `json:"enabled,omitempty"`
-	Port     int           `json:"port,omitempty"`
-	RouteID  string        `json:"route_id,omitempty"`
-	Peer     *PeerSettings `json:"peer,omitempty"`
+	Op           string        `json:"op"`
+	Mode         string        `json:"mode,omitempty"`
+	Balancer     string        `json:"balancer,omitempty"`
+	Enabled      []string      `json:"enabled,omitempty"`
+	Port         int           `json:"port,omitempty"`
+	RouteID      string        `json:"route_id,omitempty"`
+	Peer         *PeerSettings `json:"peer,omitempty"`
+	PeerRevision string        `json:"peer_revision,omitempty"`
 }
 
 type ControlResponse struct {
@@ -43,6 +46,7 @@ type ControlResponse struct {
 	PeerPort       uint16              `json:"peer_port,omitempty"`
 	PeerEndpoint   string              `json:"peer_endpoint,omitempty"`
 	Peer           PeerSettings        `json:"peer"`
+	PeerRevision   string              `json:"peer_revision,omitempty"`
 	Error          string              `json:"error,omitempty"`
 }
 
@@ -143,7 +147,7 @@ func (d *clientControl) serve(ctx context.Context, c net.Conn) {
 	defer stop()
 	c.SetDeadline(time.Now().Add(15 * time.Second))
 	var req ControlRequest
-	if json.NewDecoder(io.LimitReader(c, 4096)).Decode(&req) != nil {
+	if json.NewDecoder(io.LimitReader(c, 64<<10)).Decode(&req) != nil {
 		return
 	}
 	_ = json.NewEncoder(c).Encode(d.handle(req))
@@ -195,10 +199,17 @@ func (c *ManagedConfig) update(req ControlRequest, options []RouteOption, runnin
 		if req.Peer == nil {
 			return errors.New("peer settings required")
 		}
-		if err := req.Peer.validate(); err != nil {
+		peer := *req.Peer
+		if req.PeerRevision == "" {
+			// A dashboard still running after an upgrade can only edit defaults.
+			peer.Overrides = c.Peer.Overrides
+		} else if req.PeerRevision != peerRevision(c.Peer) {
+			return errors.New("peer settings changed; reopen the editor and try again")
+		}
+		if err := peer.validate(); err != nil {
 			return err
 		}
-		c.Peer = *req.Peer
+		c.Peer = peer
 	case "apply":
 		for _, m := range req.Enabled {
 			if !slices.Contains(config.ClientModes(), m) {
@@ -274,12 +285,24 @@ func (c *ManagedConfig) update(req ControlRequest, options []RouteOption, runnin
 	return nil
 }
 
+func peerRevision(p PeerSettings) string {
+	data, err := json.Marshal(p)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 func (c ManagedConfig) response(op string) ControlResponse {
 	r := ControlResponse{
 		OK: true, Enabled: c.Enabled, Balancers: c.Balancers, SelectedRoutes: c.Routes,
 		P2P: c.P2P, AutoMap: c.AutoMap, ServeEgress: c.ServeEgress,
 		PeerPort: c.PeerPort, PeerEndpoint: c.PeerEndpoint,
 		Peer: c.Peer,
+	}
+	if op == "status" {
+		r.PeerRevision = peerRevision(c.Peer)
 	}
 	if op == "show" || op == "rotate" {
 		r.Credentials = &c.Credentials

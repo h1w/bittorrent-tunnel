@@ -310,7 +310,7 @@ usable in the original modes; there is no TLS-to-AWG fallback.
 Dial another client's VPN IPv4 address for peer services. The hub must allow
 communication in both directions. On managed Linux-TUN clients, enable
 **Allow direct peer connections (P2P)** in **Service settings** and save, then
-open **Peer connections** in the client dashboard:
+open **Peer connections → Global defaults** in the client dashboard:
 
 - **Accept incoming** controls which of the ten transports a peer can use to
   initiate its own traffic to this device. An empty list accepts none.
@@ -321,6 +321,19 @@ open **Peer connections** in the client dashboard:
 - **Allow relay via central server** is off by default. With P2P enabled,
   peer traffic without a direct path is blocked unless relay is enabled on
   both ends. Hub gateway traffic and SOCKS5 Internet exits are separate.
+
+To change these settings for one peer, open **Peer connections → Per-peer
+overrides → Add by VPN IP**, enter its VPN IPv4 address (for example
+`10.77.0.5`), and select the fields to override. Incoming transports, the
+outgoing transport or policy, each of the three pools, and relay inherit
+independently. **Use global** restores inheritance for that field;
+**Remove override** restores it for the whole peer. An empty custom list is
+not the same as inheriting: it allows no direct transport for that list.
+Up to 32 peers can have overrides. Changes take effect without restarting
+the client; direct paths are renegotiated through the hub. A directional
+path still requires an outgoing mode that the other peer accepts, and
+relay still requires permission at both endpoints. Update the client and
+hub to use per-peer transport overrides.
 
 Existing P2P configurations default to AWG `ext-utp` for incoming and outgoing
 connections. Update both clients and the hub to negotiate transport selection.

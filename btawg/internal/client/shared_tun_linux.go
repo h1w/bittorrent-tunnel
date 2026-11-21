@@ -45,10 +45,7 @@ type sharedTUN struct {
 	directGateways map[netip.Addr]bool
 	directOwn      netip.Addr
 	directWanted   chan netip.Addr
-	peerModes      []string
-	peerIncoming   []string
-	peerUse        string
-	peerRelay      bool
+	peerPolicies   *peerPolicies
 	peerFlows      map[peerTuple]peerFlow
 	peerRequests   map[netip.Addr]time.Time
 	peerEnabled    atomic.Bool
@@ -265,7 +262,7 @@ func (p *tunPath) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 		if p.shared.peerEnabled.Load() && len(packet) >= 20 {
 			dst := netip.AddrFrom4([4]byte(packet[16:20]))
 			p.shared.mu.RLock()
-			allowed := !p.shared.shouldRoutePeerLocked(dst) || p.shared.peerPathAllowedLocked(p)
+			allowed := !p.shared.shouldRoutePeerLocked(dst) || p.shared.peerPathAllowedLocked(dst, p)
 			p.shared.mu.RUnlock()
 			if !allowed {
 				p.shared.pool.Put(b)

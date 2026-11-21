@@ -66,7 +66,6 @@ func newManagedWithPeer(ctx context.Context, cfg config.ClientConfig, enabled []
 	m := &Managed{inbound: inbound, cfg: cfg, tunnels: make([]*managedTunnel, len(config.ClientModes()))}
 	m.network.owner, m.network.ctx = m, inbound.ctx
 	m.applyRoutes(routes)
-	m.network.peer.Store(&peer)
 	for i, policy := range balancerPolicies {
 		m.balance[i].policy = policy
 	}
@@ -83,10 +82,10 @@ func newManagedWithPeer(ctx context.Context, cfg config.ClientConfig, enabled []
 			return nil, err
 		}
 		m.shared = newSharedTUN(dev, tunBase, config.DefaultMTU)
-		if p2p {
-			m.shared.enableDirect(cfg)
-			m.shared.configurePeer(peer)
-		}
+	}
+	m.applyPeerSettings(peer)
+	if m.shared != nil && p2p {
+		m.shared.enableDirect(cfg)
 	}
 	if err := m.apply(enabled, auth, pools, nil); err != nil {
 		m.Close()

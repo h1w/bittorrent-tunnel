@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"slices"
@@ -32,10 +33,42 @@ type RouteOption struct {
 
 // PeerSettings controls directional peer transports independently of SOCKS5.
 type PeerSettings struct {
+	Incoming  []string                    `json:"incoming"`
+	Outgoing  string                      `json:"outgoing"`
+	Pools     map[string][]string         `json:"pools"`
+	Relay     bool                        `json:"relay"`
+	Overrides map[netip.Addr]PeerOverride `json:"overrides,omitempty"`
+}
+
+// PeerOverride inherits absent fields and absent pool entries from PeerSettings.
+// An empty array or a non-nil false relay value is an explicit override.
+type PeerOverride struct {
 	Incoming []string            `json:"incoming"`
-	Outgoing string              `json:"outgoing"`
-	Pools    map[string][]string `json:"pools"`
-	Relay    bool                `json:"relay"`
+	Outgoing string              `json:"outgoing,omitempty"`
+	Pools    map[string][]string `json:"pools,omitempty"`
+	Relay    *bool               `json:"relay,omitempty"`
+}
+
+// ForPeer returns effective settings for one VPN address without mutating defaults.
+func (p PeerSettings) ForPeer(ip netip.Addr) PeerSettings {
+	o := p.Overrides[ip]
+	p.Overrides = nil
+	if o.Incoming != nil {
+		p.Incoming = o.Incoming
+	}
+	if o.Outgoing != "" {
+		p.Outgoing = o.Outgoing
+	}
+	if len(o.Pools) != 0 {
+		pools := make(map[string][]string, len(p.Pools)+len(o.Pools))
+		maps.Copy(pools, p.Pools)
+		maps.Copy(pools, o.Pools)
+		p.Pools = pools
+	}
+	if o.Relay != nil {
+		p.Relay = *o.Relay
+	}
+	return p
 }
 
 // SelectedMode returns the canonical transport or pool selected for outgoing flows.
@@ -76,6 +109,24 @@ func (p PeerSettings) OutgoingModes() []string {
 }
 
 func (p PeerSettings) validate() error {
+	if err := p.validateTransports(); err != nil {
+		return err
+	}
+	if len(p.Overrides) > mesh.MaxPeerOverrides {
+		return fmt.Errorf("at most %d peer overrides are supported", mesh.MaxPeerOverrides)
+	}
+	for ip, o := range p.Overrides {
+		if !mesh.ValidPeerOverrideIP(ip) {
+			return fmt.Errorf("invalid peer VPN IPv4 address %q", ip)
+		}
+		if err := (PeerSettings{Incoming: o.Incoming, Outgoing: o.Outgoing, Pools: o.Pools}).validateTransports(); err != nil {
+			return fmt.Errorf("peer %s: %w", ip, err)
+		}
+	}
+	return nil
+}
+
+func (p PeerSettings) validateTransports() error {
 	validateModes := func(modes []string) error {
 		seen := make(map[string]bool, len(modes))
 		for _, mode := range modes {

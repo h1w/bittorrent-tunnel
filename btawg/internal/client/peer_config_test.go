@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/mesh"
 )
 
 func TestPeerSettingsDefaultsAndExplicitEmpty(t *testing.T) {
@@ -74,6 +76,62 @@ func TestPeerSettingsValidationAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestPeerOverridePersistsEmptyListsAndRelayOff(t *testing.T) {
+	const data = `{"peer":{"incoming":["wg"],"outgoing":"failover","relay":true,"pools":{"failover":["wg"],"adaptive":["ext-tcp"]},"overrides":{"10.77.0.5":{"incoming":[],"pools":{"failover":[]},"relay":false}}}}`
+	var cfg ManagedConfig
+	if err := json.Unmarshal([]byte(data), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "client.json")
+	if err := cfg.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := LoadManagedConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := saved.Peer.ForPeer(netip.MustParseAddr("10.77.0.5"))
+	if peer.Relay || peer.SelectedMode() != "failover" || peer.IncomingModes() == nil || len(peer.IncomingModes()) != 0 || peer.OutgoingModes() == nil || len(peer.OutgoingModes()) != 0 || !slices.Equal(peer.Pools["adaptive"], []string{"ext-tcp"}) {
+		t.Fatalf("explicit override and inherited defaults after restart: %+v", peer)
+	}
+	other := saved.Peer.ForPeer(netip.MustParseAddr("10.77.0.6"))
+	if !other.Relay || !slices.Equal(other.OutgoingModes(), []string{config.ModeWG}) || !slices.Equal(other.IncomingModes(), []string{config.ModeWG}) {
+		t.Fatalf("unconfigured peer lost defaults: %+v", other)
+	}
+}
+
+func TestLegacyPeerSaveKeepsOverrides(t *testing.T) {
+	ip := netip.MustParseAddr("10.77.0.5")
+	cfg := ManagedConfig{Peer: PeerSettings{Overrides: map[netip.Addr]PeerOverride{ip: {Outgoing: "wg"}}}}
+	wanted := PeerSettings{Relay: true}
+	if err := cfg.update(ControlRequest{Op: "set-peer", Peer: &wanted}, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Peer.Relay || cfg.Peer.ForPeer(ip).SelectedMode() != config.ModeWG {
+		t.Fatalf("global save erased a peer override: %+v", cfg.Peer)
+	}
+}
+
+func TestPeerOverrideAcceptsLinkLocalOverlay(t *testing.T) {
+	ip := netip.MustParseAddr("169.254.77.5")
+	cfg := ManagedConfig{Peer: PeerSettings{Overrides: map[netip.Addr]PeerOverride{ip: {Outgoing: "wg"}}}}
+	if err := cfg.Save(filepath.Join(t.TempDir(), "client.json")); err != nil {
+		t.Fatalf("valid link-local VPN peer could not be saved: %v", err)
+	}
+}
+
+func TestStalePeerSaveCannotOverwriteLatestRules(t *testing.T) {
+	ip := netip.MustParseAddr("10.77.0.5")
+	cfg := ManagedConfig{Peer: PeerSettings{Overrides: map[netip.Addr]PeerOverride{ip: {Outgoing: "wg"}}}}
+	var stale ControlRequest
+	if err := json.Unmarshal([]byte(`{"op":"set-peer","peer_revision":"stale","peer":{"relay":true}}`), &stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.update(stale, nil, false); err == nil || cfg.Peer.Relay || cfg.Peer.ForPeer(ip).SelectedMode() != config.ModeWG {
+		t.Fatalf("stale edit overwrote current rules: %+v, %v", cfg.Peer, err)
+	}
+}
+
 func TestSetPeerValidatesWithoutMutatingOnError(t *testing.T) {
 	cfg := ManagedConfig{Peer: PeerSettings{Relay: true}}
 	invalid := PeerSettings{Outgoing: "bad"}
@@ -123,13 +181,31 @@ func TestDaemonPeerUpdatePersistsBeforeApplying(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	peer := PeerSettings{Incoming: []string{}, Outgoing: "adaptive", Pools: map[string][]string{"adaptive": {config.ModeWG, config.ModeAWG}}, Relay: true}
-	got, err := request(socket, ControlRequest{Op: "set-peer", Peer: &peer})
+	peer.Overrides = make(map[netip.Addr]PeerOverride, mesh.MaxPeerOverrides)
+	for i := 0; i < mesh.MaxPeerOverrides; i++ {
+		ip := netip.AddrFrom4([4]byte{10, 77, 0, byte(i + 16)})
+		peer.Overrides[ip] = PeerOverride{
+			Incoming: config.ClientModes(), Outgoing: "adaptive", Pools: map[string][]string{"adaptive": config.ClientModes()},
+		}
+	}
+	before, err := request(socket, ControlRequest{Op: "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := request(socket, ControlRequest{Op: "set-peer", Peer: &peer, PeerRevision: before.PeerRevision})
 	if err != nil || !reflect.DeepEqual(got.Peer, peer) {
 		t.Fatalf("set-peer: %+v %v", got, err)
 	}
 	saved, err := LoadManagedConfig(path)
 	if err != nil || !reflect.DeepEqual(saved.Peer, peer) {
 		t.Fatalf("saved peer: %+v %v", saved.Peer, err)
+	}
+	if _, err := request(socket, ControlRequest{Op: "set-peer", Peer: &before.Peer, PeerRevision: before.PeerRevision}); err == nil {
+		t.Fatal("an old dashboard snapshot overwrote the saved rules")
+	}
+	current, err := request(socket, ControlRequest{Op: "status"})
+	if err != nil {
+		t.Fatal(err)
 	}
 	if err := os.Rename(filepath.Dir(path), filepath.Join(dir, "backup")); err != nil {
 		t.Fatal(err)
@@ -138,7 +214,7 @@ func TestDaemonPeerUpdatePersistsBeforeApplying(t *testing.T) {
 		t.Fatal(err)
 	}
 	changed := PeerSettings{Outgoing: config.ModeWG}
-	if _, err := request(socket, ControlRequest{Op: "set-peer", Peer: &changed}); err == nil {
+	if _, err := request(socket, ControlRequest{Op: "set-peer", Peer: &changed, PeerRevision: current.PeerRevision}); err == nil {
 		t.Fatal("peer update accepted without persistence")
 	}
 	got, err = request(socket, ControlRequest{Op: "status"})

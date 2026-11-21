@@ -60,6 +60,7 @@ type peerFlow struct {
 
 type peerPathGroup struct {
 	constSize [10]*tunPath
+	selected  [10]*managedTunnel
 	policy    balancer
 }
 
@@ -113,7 +114,7 @@ func (s *sharedTUN) choosePeerPacket(p []byte, h int, dst netip.Addr) (*tunPath,
 		return nil, true
 	}
 	if flow, ok := s.peerFlows[key]; ok && now.Before(flow.until) {
-		if s.peerPathAllowedLocked(flow.path) && !(flow.awaiting && s.readyPeerLocked(dst)) {
+		if s.peerPathAllowedLocked(dst, flow.path) && !(flow.awaiting && s.readyPeerLocked(dst)) {
 			if flow.path.directLife != nil && flow.path.peerOutbound {
 				s.requestPeerLocked(dst, now)
 			}
@@ -135,7 +136,7 @@ func (s *sharedTUN) choosePeerPacket(p []byte, h int, dst netip.Addr) (*tunPath,
 		s.peerFlows[key] = peerFlow{path: path, until: now.Add(peerFlowTTL)}
 		return path, true
 	}
-	if !s.peerRelay || len(s.peerFlows) >= peerFlowLimit {
+	if !s.peerPolicies.forPeer(dst).relay || len(s.peerFlows) >= peerFlowLimit {
 		return nil, true
 	}
 	path = s.primary.Load()
@@ -146,6 +147,9 @@ func (s *sharedTUN) choosePeerPacket(p []byte, h int, dst netip.Addr) (*tunPath,
 }
 
 func (s *sharedTUN) requestPeerLocked(dst netip.Addr, now time.Time) {
+	if len(s.peerPolicies.forPeer(dst).Outgoing) == 0 {
+		return
+	}
 	if last := s.peerRequests[dst]; !last.IsZero() && now.Sub(last) < time.Second {
 		return
 	}
@@ -165,7 +169,7 @@ func (s *sharedTUN) requestPeerLocked(dst netip.Addr, now time.Time) {
 func (s *sharedTUN) acceptPeerPacket(path *tunPath, p []byte, h int) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.peerPathAllowedLocked(path) {
+	if !s.peerPathAllowedLocked(netip.AddrFrom4([4]byte(p[12:16])), path) {
 		return false
 	}
 	now := time.Now()
@@ -220,7 +224,7 @@ func (s *sharedTUN) acceptHubPacket(path *tunPath, p []byte) bool {
 	if !s.shouldRoutePeerLocked(src) {
 		return true
 	}
-	if !s.peerRelay {
+	if !s.peerPolicies.forPeer(src).relay {
 		return false
 	}
 	now := time.Now()
@@ -240,7 +244,7 @@ func (s *sharedTUN) acceptHubPacket(path *tunPath, p []byte) bool {
 	}
 	k = k.reverse()
 	old, exists := s.peerFlows[k]
-	if exists && now.Before(old.until) && old.path != path && s.peerPathAllowedLocked(old.path) {
+	if exists && now.Before(old.until) && old.path != path && s.peerPathAllowedLocked(src, old.path) {
 		return false
 	}
 	if !exists && len(s.peerFlows) >= peerFlowLimit {

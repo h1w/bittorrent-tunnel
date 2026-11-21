@@ -35,7 +35,7 @@ type meshNode struct {
 	catalogue atomic.Pointer[catalogue]
 	paths     atomic.Pointer[[]*managedTunnel]
 	selected  atomic.Pointer[map[int]string]
-	peer      atomic.Pointer[PeerSettings]
+	peer      atomic.Pointer[peerPolicies]
 }
 
 func (m *Managed) RouteOptions() []RouteOption {
@@ -56,10 +56,11 @@ func (m *Managed) applyRoutes(routes map[int]string) {
 }
 
 func (m *Managed) applyPeerSettings(cfg PeerSettings) {
+	policies := compilePeerPolicies(cfg)
 	if m.shared != nil {
-		m.shared.configurePeer(cfg)
+		m.shared.applyPeerPolicies(policies)
 	}
-	m.network.peer.Store(&cfg)
+	m.network.peer.Store(policies)
 }
 
 func (m *Managed) startNetwork(p2p, autoMap, allowPermanentUPnP, serve bool, port uint16, endpoint, tcpEndpoint string) {

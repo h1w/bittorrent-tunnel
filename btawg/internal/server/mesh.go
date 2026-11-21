@@ -138,6 +138,14 @@ func (s *Server) meshRegister(rec store.ClientRecord, ip netip.Addr, req mesh.Re
 	if len(req.Want) > mesh.MaxPeers || len(req.Candidates) > 64 || !validMeshModes(req.IncomingModes) || !validMeshModes(req.OutgoingModes) {
 		return reply, errors.New("invalid peer candidates or transport modes")
 	}
+	if len(req.PeerOverrides) > mesh.MaxPeerOverrides || len(req.PeerOverrides) != 0 && (!req.TransportPolicy || req.DirectKey == "") {
+		return reply, errors.New("invalid peer transport overrides")
+	}
+	for target, modes := range req.PeerOverrides {
+		if !mesh.ValidPeerOverrideIP(target) || !validMeshModes(modes.Incoming) || !validMeshModes(modes.Outgoing) {
+			return reply, errors.New("invalid peer transport override")
+		}
+	}
 	if req.DirectKey != "" {
 		key, err := hex.DecodeString(req.DirectKey)
 		if err != nil || len(key) != 32 || req.DirectKey == rec.PubKey {
@@ -271,16 +279,17 @@ func (s *Server) appendPair(reply *mesh.Reply, rec store.ClientRecord, self mesh
 		}
 		return
 	}
+	selfModes, peerModes := self.ModesForPeer(peer.ip), peer.ModesForPeer(self.ip)
 	if slices.Contains(self.Want, peer.ip) {
-		for _, mode := range self.OutgoingModes {
-			if slices.Contains(peer.IncomingModes, mode) {
+		for _, mode := range selfModes.Outgoing {
+			if slices.Contains(peerModes.Incoming, mode) {
 				s.appendPairMode(reply, self, peer, self, peer, rec.ID, id, mode, true)
 			}
 		}
 	}
 	if slices.Contains(peer.Want, self.ip) {
-		for _, mode := range peer.OutgoingModes {
-			if slices.Contains(self.IncomingModes, mode) {
+		for _, mode := range peerModes.Outgoing {
+			if slices.Contains(selfModes.Incoming, mode) {
 				s.appendPairMode(reply, self, peer, peer, self, id, rec.ID, mode, false)
 			}
 		}

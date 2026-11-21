@@ -63,9 +63,6 @@ func (n *meshNode) run(p2p, autoMap, allowPermanentUPnP bool, port uint16, endpo
 	if p2p && n.owner.shared != nil {
 		var err error
 		n.owner.shared.enableDirect(n.owner.cfg)
-		if p := n.peer.Load(); p != nil {
-			n.owner.shared.configurePeer(*p)
-		}
 		identity, err = newDirectIdentity()
 		if err == nil {
 			sockets, err = openPeerSockets(n.ctx, port, autoMap, allowPermanentUPnP)
@@ -93,17 +90,18 @@ func (n *meshNode) run(p2p, autoMap, allowPermanentUPnP bool, port uint16, endpo
 		if sockets != nil {
 			p := n.peer.Load()
 			reg.DirectKey, reg.TLSPin, reg.TransportPolicy = identity.public, identity.tls.Pin(), true
-			reg.IncomingModes, reg.OutgoingModes = p.IncomingModes(), p.OutgoingModes()
+			reg.IncomingModes, reg.OutgoingModes = p.defaults.Incoming, p.defaults.Outgoing
+			reg.PeerOverrides = p.meshOverrides
 			now := time.Now()
 			for ip, until := range requested {
-				if !now.Before(until) {
+				if !now.Before(until) || len(p.forPeer(ip).Outgoing) == 0 {
 					delete(requested, ip)
 				}
 			}
 			for range cap(n.owner.shared.directWanted) {
 				select {
 				case ip := <-n.owner.shared.directWanted:
-					if len(requested) < mesh.MaxPeers || !requested[ip].IsZero() {
+					if len(p.forPeer(ip).Outgoing) != 0 && (len(requested) < mesh.MaxPeers || !requested[ip].IsZero()) {
 						requested[ip] = now.Add(mesh.Lease * 2)
 					}
 				default:
@@ -124,10 +122,7 @@ func (n *meshNode) run(p2p, autoMap, allowPermanentUPnP bool, port uint16, endpo
 				}
 				refresh = time.Now().Add(8 * time.Second)
 			}
-			reg.Candidates = sockets.candidates(endpoint, tcpEndpoint, reg.IncomingModes, reg.OutgoingModes)
-			if len(reg.Candidates) > 64 {
-				reg.Candidates = reg.Candidates[:64]
-			}
+			reg.Candidates = sockets.candidates(endpoint, tcpEndpoint, p.nativeIncoming, p.nativeOutgoing)
 		}
 		reply, err := n.register(reg)
 		if p2p && n.owner.shared != nil && err == nil {
@@ -135,14 +130,16 @@ func (n *meshNode) run(p2p, autoMap, allowPermanentUPnP bool, port uint16, endpo
 		}
 		if sockets != nil && (err == nil || err == errMeshDenied) {
 			local := netip.MustParseAddr(n.owner.cfg.ClientIP)
+			policies := n.peer.Load()
 			offers := make(map[peerOfferKey]mesh.Pair, len(reply.Pairs))
 			for _, offer := range reply.Pairs {
 				if !offer.IP.Is4() || offer.IP == local || offer.Mode == "" || !offer.Origin.IsValid() || (offer.Origin != local && offer.Origin != offer.IP) || (offer.Origin == local) != offer.Initiator {
 					continue
 				}
-				modes := reg.IncomingModes
+				policy := policies.forPeer(offer.IP)
+				modes := policy.Incoming
 				if offer.Origin == local {
-					modes = reg.OutgoingModes
+					modes = policy.Outgoing
 				}
 				if slices.Contains(modes, offer.Mode) {
 					offers[offerKey(offer)] = offer

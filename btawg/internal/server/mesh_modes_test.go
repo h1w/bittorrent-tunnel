@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"net/netip"
 	"testing"
 	"time"
@@ -34,6 +35,17 @@ func TestPeerOffersRespectRecipientAndDirection(t *testing.T) {
 	}
 	if toA.Mode != config.ModeTLSReqTCP || toA.Initiator || toA.Origin != b || toA.Key != "tls-two" || toA.Secret != second.Pairs[0].Secret || toA.Secret == fromA.Secret || !toA.Expires.Equal(rb.until) {
 		t.Fatal("wrong B -> A grant")
+	}
+	if err := json.Unmarshal([]byte(`{"peer_overrides":{"10.77.0.3":{"incoming_modes":[],"outgoing_modes":["socks5-wg-udp"]}}}`), &ra.Registration); err != nil {
+		t.Fatal(err)
+	}
+	rb.IncomingModes = []string{config.ModeExtUTP, config.ModeWG}
+	s.mesh.clients[one.ID], s.mesh.clients[two.ID] = ra, rb
+	first, second = mesh.Reply{}, mesh.Reply{}
+	s.appendPair(&first, one, ra, two.ID, now)
+	s.appendPair(&second, two, rb, one.ID, now)
+	if len(first.Pairs) != 1 || len(second.Pairs) != 1 || first.Pairs[0].Mode != config.ModeWG || first.Pairs[0].Origin != a || !first.Pairs[0].Initiator || second.Pairs[0].Initiator || first.Pairs[0].Secret != second.Pairs[0].Secret {
+		t.Fatalf("override did not restrict both directions: %v / %v", first.Pairs, second.Pairs)
 	}
 	two.VisiblePeers = []string{}
 	policy.byIP[b] = two

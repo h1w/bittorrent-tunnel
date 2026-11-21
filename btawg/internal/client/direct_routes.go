@@ -34,20 +34,17 @@ func (s *sharedTUN) enableDirect(cfg config.ClientConfig) {
 	s.peerEnabled.Store(true)
 }
 
-func (s *sharedTUN) configurePeer(settings PeerSettings) {
+func (s *sharedTUN) applyPeerPolicies(policies *peerPolicies) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.peerModes = settings.OutgoingModes()
-	s.peerIncoming = settings.IncomingModes()
-	s.peerUse = settings.SelectedMode()
-	s.peerRelay = settings.Relay
+	s.peerPolicies = policies
 	for k, f := range s.peerFlows {
-		if !s.peerPathAllowedLocked(f.path) {
+		if !s.peerPathAllowedLocked(netip.AddrFrom4(k.dst), f.path) {
 			delete(s.peerFlows, k)
 		}
 	}
-	for _, g := range s.direct {
-		s.updatePeerPoolLocked(g)
+	for ip, g := range s.direct {
+		s.updatePeerPoolLocked(ip, g)
 	}
 }
 
@@ -70,7 +67,7 @@ func (s *sharedTUN) directPath(ip netip.Addr) *tunPath {
 func (s *sharedTUN) wantDirect(ip netip.Addr) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.directWanted == nil {
+	if s.directWanted == nil || len(s.peerPolicies.forPeer(ip).Outgoing) == 0 {
 		return
 	}
 	select {
@@ -95,7 +92,7 @@ func (s *sharedTUN) setDirect(ip netip.Addr, p *tunPath) {
 		s.direct[ip] = g
 	}
 	g.constSize[i] = p
-	s.updatePeerPoolLocked(g)
+	s.updatePeerPoolLocked(ip, g)
 }
 
 func (s *sharedTUN) removeDirect(ip netip.Addr, p *tunPath) {
@@ -104,7 +101,7 @@ func (s *sharedTUN) removeDirect(ip netip.Addr, p *tunPath) {
 	g := s.direct[ip]
 	if i := peerModeIndex(p.peerMode); g != nil && i >= 0 && g.constSize[i] == p {
 		g.constSize[i] = nil
-		s.updatePeerPoolLocked(g)
+		s.updatePeerPoolLocked(ip, g)
 		if len(g.policy.paths) == 0 {
 			empty := true
 			for _, v := range g.constSize {
@@ -129,8 +126,9 @@ func peerModeIndex(mode string) int {
 	return -1
 }
 
-func (s *sharedTUN) updatePeerPoolLocked(g *peerPathGroup) {
-	policy := s.peerUse
+func (s *sharedTUN) updatePeerPoolLocked(ip netip.Addr, g *peerPathGroup) {
+	settings := s.peerPolicies.forPeer(ip)
+	policy := settings.selection
 	if peerModeIndex(policy) >= 0 {
 		policy = failoverPolicy
 	}
@@ -139,13 +137,24 @@ func (s *sharedTUN) updatePeerPoolLocked(g *peerPathGroup) {
 		g.policy.current, g.policy.challenger = adaptivePath{}, adaptivePath{}
 		g.policy.next = 0
 	}
-	paths := make([]*managedTunnel, 0, len(s.peerModes))
-	for _, mode := range s.peerModes {
+	var paths [len(g.constSize)]*managedTunnel
+	selected := paths[:0]
+	for _, mode := range settings.Outgoing {
 		if i := peerModeIndex(mode); i >= 0 && g.constSize[i] != nil {
-			paths = append(paths, g.constSize[i].peerHealth)
+			selected = append(selected, g.constSize[i].peerHealth)
 		}
 	}
-	g.policy.replace(paths)
+	if slices.Equal(g.policy.paths, selected) {
+		return
+	}
+	clear(g.selected[len(selected):])
+	copy(g.selected[:], selected)
+	// Both peer pool replacement and selection are serialized by s.mu.
+	g.policy.paths = g.selected[:len(selected)]
+	g.policy.current, g.policy.challenger = adaptivePath{}, adaptivePath{}
+	if g.policy.next >= len(selected) {
+		g.policy.next = 0
+	}
 }
 
 func (s *sharedTUN) pickPeerLocked(ip netip.Addr) *tunPath {
@@ -188,17 +197,18 @@ func (p *tunPath) validDirect() bool {
 	return p.directLife == nil || (p.directLife.Err() == nil && time.Now().UnixNano() < p.directUntil.Load())
 }
 
-func (s *sharedTUN) peerPathAllowedLocked(p *tunPath) bool {
+func (s *sharedTUN) peerPathAllowedLocked(ip netip.Addr, p *tunPath) bool {
 	if !p.validDirect() {
 		return false
 	}
+	settings := s.peerPolicies.forPeer(ip)
 	if p.directLife == nil {
-		return s.peerRelay
+		return settings.relay
 	}
 	if p.peerOutbound {
-		return slices.Contains(s.peerModes, p.peerMode)
+		return slices.Contains(settings.Outgoing, p.peerMode)
 	}
-	return slices.Contains(s.peerIncoming, p.peerMode)
+	return slices.Contains(settings.Incoming, p.peerMode)
 }
 
 func (s *sharedTUN) enqueuePacket(path *tunPath, storage *[]byte, buf, packet []byte) bool {
@@ -208,7 +218,7 @@ func (s *sharedTUN) enqueuePacket(path *tunPath, storage *[]byte, buf, packet []
 	dst := netip.AddrFrom4([4]byte(packet[16:20]))
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.shouldRoutePeerLocked(dst) && !s.peerPathAllowedLocked(path) {
+	if s.shouldRoutePeerLocked(dst) && !s.peerPathAllowedLocked(dst, path) {
 		return false
 	}
 	return path.enqueue(storage, buf)

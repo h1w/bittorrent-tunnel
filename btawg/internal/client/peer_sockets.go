@@ -144,9 +144,22 @@ func (s *peerSockets) candidates(endpoint, tcpEndpoint string, incoming, outgoin
 	if ep, err := netip.ParseAddrPort(tcpEndpoint); err == nil && s.stream.TCPPort() != 0 {
 		result = append(result, mesh.Candidate{Addr: ep, Kind: candidateKind(ep.Addr()), Protocol: "tcp"})
 	}
+	// Reserve slots for stream UDP, stream TCP, and both directions of
+	// each native mode within the hub's 64-candidate registration limit.
+	const perDirection = 10
 	for _, entry := range s.all {
 		if entry.mode != "" && (entry.receive && !slices.Contains(incoming, entry.mode) || !entry.receive && !slices.Contains(outgoing, entry.mode)) {
 			continue
+		}
+		var counts [2]int
+		if entry.mode == "" {
+			for _, c := range result {
+				if c.Protocol == "tcp" {
+					counts[1]++
+				} else {
+					counts[0]++
+				}
+			}
 		}
 		local := entry.local()
 		s.mu.Lock()
@@ -160,10 +173,15 @@ func (s *peerSockets) candidates(endpoint, tcpEndpoint string, incoming, outgoin
 		s.mu.Unlock()
 		for _, c := range append(found, local...) {
 			c.Mode, c.Receive = entry.mode, entry.receive
-			if slices.Contains(result, c) {
+			group := 0
+			if c.Protocol == "tcp" {
+				group = 1
+			}
+			if counts[group] >= perDirection || slices.Contains(result, c) {
 				continue
 			}
 			result = append(result, c)
+			counts[group]++
 		}
 	}
 	return result

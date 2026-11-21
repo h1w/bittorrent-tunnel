@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"net/netip"
 	"sync/atomic"
 	"testing"
@@ -37,7 +38,7 @@ func TestPeerFlowUsesOnlyApprovedDirectionAndPinsReplies(t *testing.T) {
 	s := &sharedTUN{}
 	s.primary.Store(&tunPath{})
 	s.enableDirect(cfg)
-	s.configurePeer(PeerSettings{Incoming: []string{config.ModeTLSReqTCP}, Outgoing: roundRobinPolicy, Pools: map[string][]string{roundRobinPolicy: {config.ModeWG, config.ModeExtUTP}}})
+	s.applyPeerPolicies(compilePeerPolicies(PeerSettings{Incoming: []string{config.ModeTLSReqTCP}, Outgoing: roundRobinPolicy, Pools: map[string][]string{roundRobinPolicy: {config.ModeWG, config.ModeExtUTP}}}))
 	if p := s.packetPath(peerTCP(a, b, 100, 22, 2), 20); p != nil {
 		t.Fatal("default leaked a SYN into the hub")
 	}
@@ -66,15 +67,75 @@ func TestPeerFlowUsesOnlyApprovedDirectionAndPinsReplies(t *testing.T) {
 	if !s.acceptPeerPacket(tls, peerTCP(b, a, 301, 22, 2), 20) || s.packetPath(peerTCP(a, b, 22, 301, 0x12), 20) != tls {
 		t.Fatal("incoming TLS stream did not send its reply over the same link")
 	}
-	s.configurePeer(PeerSettings{Incoming: []string{}, Outgoing: config.ModeReqTCP, Relay: true})
+	s.applyPeerPolicies(compilePeerPolicies(PeerSettings{Incoming: []string{}, Outgoing: config.ModeReqTCP, Relay: true}))
 	if s.acceptPeerPacket(tls, peerTCP(b, a, 302, 22, 2), 20) {
 		t.Fatal("revoked inbound mode still accepts new connections")
 	}
 	if p := s.packetPath(peerTCP(a, b, 400, 22, 2), 20); p != s.primary.Load() {
 		t.Fatal("explicit relay unavailable")
 	}
-	s.configurePeer(PeerSettings{Incoming: []string{}, Outgoing: config.ModeReqTCP})
+	s.applyPeerPolicies(compilePeerPolicies(PeerSettings{Incoming: []string{}, Outgoing: config.ModeReqTCP}))
 	if p := s.packetPath(peerTCP(a, b, 400, 22, 2), 20); p != nil {
 		t.Fatal("old relay pin survived turning relay off")
+	}
+}
+
+func TestPeerOverridesIsolateTransportAndRelay(t *testing.T) {
+	a, b, c := netip.MustParseAddr("10.77.0.2"), netip.MustParseAddr("10.77.0.5"), netip.MustParseAddr("10.77.0.6")
+	s := &sharedTUN{}
+	hub := &tunPath{}
+	s.primary.Store(hub)
+	s.enableDirect(config.ClientConfig{ClientIP: a.String(), ServerIP: "10.77.0.1", Subnet: "10.77.0.0/24"})
+	var defaults, settings PeerSettings
+	if err := json.Unmarshal([]byte(`{"relay":true}`), &defaults); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"relay":true,"overrides":{"10.77.0.5":{"incoming":[],"outgoing":"wg","relay":false}}}`), &settings); err != nil {
+		t.Fatal(err)
+	}
+	s.applyPeerPolicies(compilePeerPolicies(defaults))
+	if s.packetPath(peerTCP(a, b, 100, 22, 2), 20) != hub || s.packetPath(peerTCP(a, c, 100, 22, 2), 20) != hub {
+		t.Fatal("test requires both peers to have an existing relay pin")
+	}
+	s.applyPeerPolicies(compilePeerPolicies(settings))
+	if s.packetPath(peerTCP(a, b, 100, 22, 0x10), 20) != nil || s.acceptHubPacket(hub, peerTCP(b, a, 22, 100, 0x12)) {
+		t.Fatal("revoked relay pin survived the override")
+	}
+	if s.packetPath(peerTCP(a, c, 100, 22, 0x10), 20) != hub || !s.acceptHubPacket(hub, peerTCP(c, a, 22, 100, 0x12)) {
+		t.Fatal("the other peer lost its relay pin")
+	}
+	wg := directFlowPath(t, config.ModeWG, true)
+	s.setDirect(b, wg)
+	s.setDirect(c, directFlowPath(t, config.ModeWG, true))
+	if s.packetPath(peerTCP(a, b, 101, 22, 2), 20) != wg || s.packetPath(peerTCP(a, c, 101, 22, 2), 20) != hub {
+		t.Fatal("outgoing WG override was ignored or leaked to another peer")
+	}
+	if s.acceptPeerPacket(directFlowPath(t, config.ModeExtUTP, false), peerTCP(b, a, 200, 22, 2), 20) || !s.acceptPeerPacket(directFlowPath(t, config.ModeExtUTP, false), peerTCP(c, a, 200, 22, 2), 20) {
+		t.Fatal("empty inbound override was ignored or leaked to another peer")
+	}
+}
+
+func TestDisabledPeerDoesNotRequestDirectDiscovery(t *testing.T) {
+	a, b, c := netip.MustParseAddr("10.77.0.2"), netip.MustParseAddr("10.77.0.5"), netip.MustParseAddr("10.77.0.6")
+	s := &sharedTUN{}
+	s.enableDirect(config.ClientConfig{ClientIP: a.String(), ServerIP: "10.77.0.1", Subnet: "10.77.0.0/24"})
+	s.applyPeerPolicies(compilePeerPolicies(PeerSettings{Overrides: map[netip.Addr]PeerOverride{
+		b: {Outgoing: failoverPolicy, Pools: map[string][]string{failoverPolicy: {}}},
+	}}))
+	s.packetPath(peerTCP(a, b, 100, 22, 2), 20)
+	s.wantDirect(b)
+	s.packetPath(peerTCP(a, c, 100, 22, 2), 20)
+	select {
+	case got := <-s.directWanted:
+		if got != c {
+			t.Fatalf("direct discovery scheduled for disabled peer %s", got)
+		}
+	default:
+		t.Fatal("eligible peer did not get a discovery request")
+	}
+	select {
+	case got := <-s.directWanted:
+		t.Fatalf("unexpected discovery request for %s", got)
+	default:
 	}
 }

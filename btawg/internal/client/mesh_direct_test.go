@@ -117,7 +117,8 @@ func TestManagedDirectTUNWithHubRevocation(t *testing.T) {
 			c.Close()
 			t.Fatal("direct refusal leaked to the hub with relay disabled")
 		}
-		client.applyPeerSettings(PeerSettings{Outgoing: mode, Relay: true})
+		relay := true
+		client.applyPeerSettings(PeerSettings{Overrides: map[netip.Addr]PeerOverride{peerIP: {Outgoing: mode, Relay: &relay}}})
 		waitMesh(t, func() bool {
 			c, err := dial()
 			if c != nil {
@@ -177,11 +178,16 @@ func TestManagedDirectTUNWithHubRevocation(t *testing.T) {
 func newDirectFixture(t *testing.T, cfg config.ClientConfig, name string) *Managed {
 	t.Helper()
 	mode := selectedTestPeerMode()
-	peer := PeerSettings{Incoming: []string{mode}, Outgoing: mode}
-	if name == "direct-b" && os.Getenv("BTAWG_PEER_DENY") == "1" {
-		peer.Incoming = []string{}
-		peer.Relay = true
+	remote := netip.MustParseAddr("10.77.0.3")
+	if name == "direct-b" {
+		remote = netip.MustParseAddr("10.77.0.2")
 	}
+	override := PeerOverride{Incoming: []string{mode}, Outgoing: mode}
+	if name == "direct-b" && os.Getenv("BTAWG_PEER_DENY") == "1" {
+		relay := true
+		override.Incoming, override.Relay = []string{}, &relay
+	}
+	peer := PeerSettings{Incoming: []string{}, Outgoing: failoverPolicy, Pools: map[string][]string{failoverPolicy: {}}, Overrides: map[netip.Addr]PeerOverride{remote: override}}
 	m, err := newManagedWithPeer(t.Context(), cfg, []string{config.ModeWG}, netip.MustParseAddr("127.0.0.1"), Credentials{Username: "direct", Password: "test"}, true, name, 0, nil, nil, true, peer)
 	if err != nil {
 		t.Fatal(err)
