@@ -22,8 +22,11 @@ jobs:
         run: go test ./... -count=1 -timeout 300s
       - name: build
         run: |
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/btawg-server ./cmd/btawg-server
-          CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dist/btawg-client ./cmd/btawg-client
+          version_flags="-s -w -X bittorrent-tunnel/btawg/internal/service.Version=${GITHUB_REF_NAME}"
+          CGO_ENABLED=0 go build -trimpath -ldflags "$version_flags" -o dist/btawg-server ./cmd/btawg-server
+          CGO_ENABLED=0 go build -trimpath -ldflags "$version_flags" -o dist/btawg-client ./cmd/btawg-client
+          test "$(dist/btawg-server --version)" = "$GITHUB_REF_NAME"
+          test "$(dist/btawg-client --version)" = "$GITHUB_REF_NAME"
           sha256sum dist/btawg-server dist/btawg-client > dist/SHA256SUMS
       - name: release
         uses: softprops/action-gh-release@v2

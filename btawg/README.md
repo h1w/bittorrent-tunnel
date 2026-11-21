@@ -109,6 +109,28 @@ sudo ./btawg-client 'btawg://…'      # one mode, btawg0 interface
 ./btawg-client -no-tun 'btawg://…'   # no interface, SOCKS5-only mode
 ```
 
+### Update an installed service
+
+In either dashboard (`sudo btawg-server` or `sudo btawg-client`), choose
+**Update from GitHub**. The updater uses the host's regular Internet
+connection, without SOCKS5 or proxy environment variables. It checks the
+latest stable release in [GitHub Releases](https://github.com/h1w/bittorrent-tunnel/releases/latest)
+and installs only a newer version after verifying its SHA-256. It keeps
+settings, keys, and the systemd unit unchanged. A running service is restarted;
+a stopped service stays stopped. If the new service fails to start, the
+updater restores the previous executable and tries to restart it.
+
+The client dashboard checks release availability in the background when it
+opens and shows a notice under the service status if a newer stable version
+is available. The check does not download or install an update.
+
+If your installed release has no **Update from GitHub** action, download the
+matching Linux amd64 executable and `SHA256SUMS` from the releases page, verify
+the corresponding checksum, make the binary executable, and run
+`sudo ./btawg-server install` or `sudo ./btawg-client install` as appropriate.
+This one-time install adds the updater. Both release binaries report their
+version with `--version`.
+
 ### 4. Verify
 
 ```sh

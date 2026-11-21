@@ -25,6 +25,9 @@ import (
 func main() {
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
+		case "--version":
+			fmt.Println(service.Version)
+			return
 		case "install":
 			if err := installMain(os.Args[2:]); err != nil {
 				fatal(err)

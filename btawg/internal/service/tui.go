@@ -48,13 +48,29 @@ type Field struct {
 	Checked bool
 }
 
+const updateActionLabel = "Update from GitHub"
+
 func TUI(menu Menu) error {
 	d := &dashboard{menu: menu, root: os.Geteuid() == 0, results: make(chan update, 1)}
+	var notices chan string
+	if menu.Unit == Client && releaseSupported() {
+		notices = make(chan string, 1)
+		d.releaseNotices = notices
+	}
 	app, err := tui.NewApp(tui.WithRootComponent(d), tui.WithMouse())
 	if err != nil {
 		return err
 	}
 	defer app.Close()
+	if notices != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		go func() {
+			client := directUpdateClient()
+			defer client.CloseIdleConnections()
+			notices <- menu.Unit.availableRelease(ctx, client)
+		}()
+	}
 	d.refresh()
 	return app.Run()
 }
@@ -82,6 +98,9 @@ type dashboard struct {
 	working string
 	pending func() (*Screen, error)
 	app     *tui.App
+
+	releaseNotices <-chan string
+	newRelease     string
 
 	screen    *Screen
 	confirm   *Action
@@ -136,9 +155,20 @@ func (d *dashboard) run(label string, fn func() (*Screen, error)) {
 }
 
 func (d *dashboard) Watchers() []tui.Watcher {
-	return []tui.Watcher{
+	watchers := []tui.Watcher{
 		tui.Watch(d.results, d.receive),
 		tui.OnTimer(2*time.Second, d.refresh),
+	}
+	if d.releaseNotices != nil {
+		watchers = append(watchers, tui.Watch(d.releaseNotices, d.receiveReleaseNotice))
+	}
+	return watchers
+}
+
+func (d *dashboard) receiveReleaseNotice(version string) {
+	if d.releaseNotices != nil {
+		d.newRelease = version
+		d.app.MarkDirty()
 	}
 }
 
@@ -146,6 +176,10 @@ func (d *dashboard) receive(u update) {
 	oldState := d.current.state
 	label := d.working
 	d.current, d.busy, d.working = u.snapshot, false, ""
+	if u.err == nil && u.operation == updateActionLabel {
+		// Ignore any startup result that arrives after the manual check.
+		d.releaseNotices, d.newRelease = nil, ""
+	}
 	if d.pending != nil {
 		fn := d.pending
 		d.pending = nil
@@ -203,7 +237,7 @@ func (d *dashboard) actions() []Action {
 		out = append(out, s.actions...)
 		if s.state != NotInstalled {
 			out = append(out,
-				Action{Label: "Reinstall / update service", Confirm: "Copy this binary into place and restart the service? Configuration is kept.", Run: d.menu.Install},
+				Action{Label: updateActionLabel, Confirm: "Download the latest release directly? A running service will restart.", Run: u.updateScreen},
 				Action{Label: "Remove service", Confirm: "Stop and remove the systemd service? Configuration, keys, and the installed launcher are kept.", Run: perform(u.Uninstall)},
 			)
 		}
@@ -415,6 +449,10 @@ func (d *dashboard) Render(app *tui.App) *tui.Element {
 		style = warning
 	}
 	root.AddChild(line(status, style))
+	showRelease := d.newRelease != "" && state != NotInstalled && d.screen == nil && d.confirm == nil
+	if showRelease {
+		root.AddChild(line("Update available: "+d.newRelease+" — use "+updateActionLabel, warning))
+	}
 
 	main := tui.New(tui.WithDirection(tui.Column), tui.WithFlexGrow(1), tui.WithOverflow(tui.OverflowHidden))
 	root.AddChild(main)
@@ -431,6 +469,9 @@ func (d *dashboard) Render(app *tui.App) *tui.Element {
 		msg, msgLines = d.working+"…", 1
 	}
 	room := max(1, height-4-min(msgLines, 3))
+	if showRelease {
+		room = max(1, room-1)
+	}
 
 	switch {
 	case d.confirm != nil:

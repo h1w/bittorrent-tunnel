@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+
+	"bittorrent-tunnel/btawg/internal/service"
 )
 
 func main() {
@@ -19,6 +21,10 @@ func main() {
 	}
 
 	cmd := os.Args[1]
+	if cmd == "--version" {
+		fmt.Println(service.Version)
+		return
+	}
 	// Legacy foreground invocation with flags (e.g. -store, -no-tun) still works.
 	if strings.HasPrefix(cmd, "-") {
 		if err := runCmd(context.Background(), os.Args[1:]); err != nil {
@@ -52,6 +58,7 @@ const usage = `Usage: btawg-server [install|run|tui] [flags]
 Commands:
   install          copy binary, install/enable/start systemd unit
   run              run the hub in the foreground
+  --version        print the executable version
   (no command)     open the interactive TUI
 
 Legacy flags are accepted on the bare command or on run:
