@@ -27,6 +27,8 @@ type ManagedConfig struct {
 	Credentials Credentials `json:"credentials"`
 	NoTUN       bool        `json:"no_tun,omitempty"`
 	TUNName     string      `json:"tun_name,omitempty"`
+	// A missing balancer pool follows Enabled; an empty list routes nothing.
+	Balancers map[string][]string `json:"balancers,omitempty"`
 }
 
 // LoadManagedConfig reads the client configuration from path.

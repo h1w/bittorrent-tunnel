@@ -130,7 +130,8 @@ func clientActions(_ string) ([]service.Action, error) {
 		return nil, err
 	}
 	modes := config.ClientModes()
-	actions := make([]service.Action, 0, len(modes)+2)
+	policies := client.BalancerPorts()
+	actions := make([]service.Action, 0, len(modes)+len(policies)+2)
 	for i, mode := range modes {
 		checked, state := "[ ]", "off"
 		if running {
@@ -150,10 +151,69 @@ func clientActions(_ string) ([]service.Action, error) {
 			},
 		})
 	}
+	labels := [...]string{"Failover", "Round-robin", "Adaptive"}
+	for i, policy := range policies {
+		port, label := client.ManagedPortBase+len(modes)+i, labels[i]
+		pool, custom := status.Balancers[policy]
+		if !custom {
+			pool = status.Enabled
+		}
+		actions = append(actions, service.Action{
+			Label: fmt.Sprintf("    %d  %-22s %d/%d tunnels", port, label, len(pool), len(modes)),
+			Run:   func() (*service.Screen, error) { return balancerSettings(port, label, policy) },
+		})
+	}
 	return append(actions,
 		service.Action{Label: "Show SOCKS5 credentials", Run: func() (*service.Screen, error) { return socksCredentials("show") }},
 		service.Action{Label: "Rotate SOCKS5 credentials", Confirm: "Replace the login and password for all ports? Existing SOCKS5 sessions will close.", Run: func() (*service.Screen, error) { return socksCredentials("rotate") }},
 	), nil
+}
+
+func balancerSettings(port int, label, policy string) (*service.Screen, error) {
+	status, _, err := client.RequestControl(client.ControlRequest{Op: "status"})
+	if err != nil {
+		return nil, err
+	}
+	pool, custom := status.Balancers[policy]
+	if !custom {
+		pool = status.Enabled
+	}
+	modes := config.ClientModes()
+	reorder := policy == "failover"
+	fields := make([]service.Field, 0, len(modes))
+	text := "Choose tunnels for this port only. An empty list disables forwarding."
+	if reorder {
+		text = "First checked working tunnel wins. Use -/+ to move a row up/down."
+		if custom {
+			for _, mode := range pool {
+				fields = append(fields, service.Field{Label: mode, Toggle: true, Checked: true})
+			}
+		}
+	}
+	for _, mode := range modes {
+		checked := slices.Contains(pool, mode)
+		if reorder && custom && checked {
+			continue
+		}
+		fields = append(fields, service.Field{Label: mode, Toggle: true, Checked: checked})
+	}
+	return &service.Screen{
+		Title:   fmt.Sprintf("SOCKS5 %d — %s", port, label),
+		Text:    text,
+		Submit:  "Save tunnel selection",
+		Fields:  fields,
+		Reorder: reorder,
+		Save: func(fields []service.Field) (*service.Screen, error) {
+			selected := make([]string, 0, len(fields))
+			for _, field := range fields {
+				if field.Checked {
+					selected = append(selected, field.Label)
+				}
+			}
+			_, _, err := client.RequestControl(client.ControlRequest{Op: "set-balancer", Balancer: policy, Enabled: selected})
+			return nil, err
+		},
+	}, nil
 }
 
 func socksCredentials(op string) (*service.Screen, error) {

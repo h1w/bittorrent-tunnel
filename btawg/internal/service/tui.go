@@ -38,6 +38,7 @@ type Screen struct {
 	Submit  string
 	Save    func([]Field) (*Screen, error)
 	Dismiss func() error
+	Reorder bool // -/+ move the highlighted form field up/down
 }
 
 type Field struct {
@@ -378,6 +379,15 @@ func (d *dashboard) key(e tui.KeyEvent) {
 				switch {
 				case f.Toggle && e.Rune == ' ':
 					d.activate()
+				case s.Reorder && (e.Rune == '-' || e.Rune == '+'):
+					to := d.selection + 1
+					if e.Rune == '-' {
+						to = d.selection - 1
+					}
+					if to >= 0 && to < len(s.Fields) {
+						s.Fields[d.selection], s.Fields[to] = s.Fields[to], s.Fields[d.selection]
+						d.selection = to
+					}
 				case !f.Toggle && e.Key == tui.KeyBackspace && f.Value != "":
 					_, size := utf8.DecodeLastRuneInString(f.Value)
 					f.Value = f.Value[:len(f.Value)-size]
@@ -501,6 +511,9 @@ func (d *dashboard) Render(app *tui.App) *tui.Element {
 			}
 			d.renderForm(main, s, width, max(1, room-1-min(len(text), 2)))
 			footer = "Tab / ↑/↓ Move  •  Enter Next / Save  •  Ctrl+U Clear  •  Esc Back"
+			if s.Reorder {
+				footer = "↑/↓ Select  •  Space Toggle  •  -/+ Reorder  •  Enter Toggle / Save  •  Esc Back"
+			}
 		}
 	default:
 		if !d.root {

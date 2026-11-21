@@ -57,6 +57,19 @@ func TestDaemonControlToggleRotatePersist(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	send(ControlRequest{Op: "apply", Enabled: []string{config.ModeAWG}})
+	// The three inbounds have independent settings; [] is not the default pool.
+	send(ControlRequest{Op: "set-balancer", Balancer: "failover", Enabled: []string{config.ModeWG, config.ModeAWG, config.ModeWG}})
+	send(ControlRequest{Op: "set-balancer", Balancer: "round-robin"})
+	if _, err := request(socket, ControlRequest{Op: "set-balancer", Balancer: "adaptive", Enabled: []string{"invalid"}}); err == nil {
+		t.Fatal("unsupported mode accepted into a balancer pool")
+	}
+	checkPools := func(pools map[string][]string) {
+		t.Helper()
+		if !slices.Equal(pools["failover"], []string{config.ModeWG, config.ModeAWG}) || pools["round-robin"] == nil || len(pools["round-robin"]) != 0 || len(pools) != 2 {
+			t.Fatalf("wrong balancer pools: %#v", pools)
+		}
+	}
+	checkPools(send(ControlRequest{Op: "status"}).Balancers)
 	if err := os.Rename(filepath.Dir(cfgPath), filepath.Join(dir, "backup")); err != nil {
 		t.Fatal(err)
 	}
@@ -86,6 +99,7 @@ func TestDaemonControlToggleRotatePersist(t *testing.T) {
 	if loaded.Credentials != *r.Credentials || !slices.Equal(loaded.Enabled, []string{config.ModeAWG}) {
 		t.Fatal("rotation or toggle was not persisted")
 	}
+	checkPools(loaded.Balancers)
 	shown := send(ControlRequest{Op: "show"}).Credentials
 	if shown == nil || *shown != loaded.Credentials {
 		t.Fatal("show did not return current credentials")

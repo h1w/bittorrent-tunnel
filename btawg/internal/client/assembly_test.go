@@ -58,7 +58,7 @@ func TestManagedTunnelsFollowEnabledSet(t *testing.T) {
 	cfg := managedCfg(t)
 	m, err := newManagedAt(context.Background(), cfg,
 		[]string{config.ModeWG, config.ModeAWG}, netip.MustParseAddr("127.0.0.1"),
-		Credentials{Username: "op", Password: "pw"}, false, "btawg", 0)
+		Credentials{Username: "op", Password: "pw"}, false, "btawg", 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestManagedSingleTUN(t *testing.T) {
 	}
 	modes := []string{config.ModeAWG, config.ModeWG}
 	auth := Credentials{Username: "op", Password: "pw"}
-	m, err := newManagedAt(context.Background(), managedCfg(t), modes, netip.MustParseAddr("127.0.0.1"), auth, true, name, 0)
+	m, err := newManagedAt(context.Background(), managedCfg(t), modes, netip.MustParseAddr("127.0.0.1"), auth, true, name, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +195,7 @@ func TestManagedRejectsForeignTUNState(t *testing.T) {
 				}
 			}
 			t.Cleanup(func() { _ = exec.Command("ip", "tuntap", "del", "dev", name, "mode", "tun").Run() })
-			m, err := newManagedAt(context.Background(), managedCfg(t), []string{config.ModeWG}, netip.MustParseAddr("127.0.0.1"), Credentials{Username: "op", Password: "pw"}, true, name, 0)
+			m, err := newManagedAt(context.Background(), managedCfg(t), []string{config.ModeWG}, netip.MustParseAddr("127.0.0.1"), Credentials{Username: "op", Password: "pw"}, true, name, 0, nil)
 			if err == nil {
 				m.Close()
 				t.Fatal("took ownership of an interface with foreign state")

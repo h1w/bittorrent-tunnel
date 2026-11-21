@@ -26,6 +26,7 @@ type Server struct {
 	dial               DialFunc
 	dialUDP            DialUDPFunc
 	resolveUDP         func(context.Context, netip.Addr, string) (netip.Addr, error)
+	selectUpstream     func() (*Server, context.Context)
 	greetingMethod     byte
 	username, password []byte
 }
@@ -33,6 +34,12 @@ type Server struct {
 // NewServer builds a local SOCKS5 server with the given upstream dialers.
 func NewServer(dial DialFunc, dialUDP DialUDPFunc) *Server {
 	return &Server{dial: dial, dialUDP: dialUDP}
+}
+
+// NewBalancer admits SOCKS requests using its own credentials, then selects
+// one upstream for the whole TCP connection or UDP association.
+func NewBalancer(selectUpstream func() (*Server, context.Context)) *Server {
+	return &Server{selectUpstream: selectUpstream}
 }
 
 // WithCredentials requires username/password authentication on this server.
@@ -83,6 +90,21 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 	if err != nil {
 		writeReply(c, replyGeneralFailure)
 		return
+	}
+	if s.selectUpstream != nil && (cmd == cmdConnect || cmd == cmdUDPAssociate) {
+		upstream, life := s.selectUpstream()
+		if upstream == nil || life.Err() != nil {
+			writeReply(c, replyHostUnreachable)
+			return
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		stop := context.AfterFunc(life, cancel)
+		defer stop()
+		closeConn := context.AfterFunc(ctx, func() { _ = c.Close() })
+		defer closeConn()
+		s = upstream
 	}
 	switch cmd {
 	case cmdConnect:

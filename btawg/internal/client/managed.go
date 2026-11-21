@@ -44,7 +44,7 @@ type managed struct {
 func newManaged(ctx context.Context, listenIP netip.Addr, portBase int) (*managed, error) {
 	m := &managed{}
 	m.ctx, m.cancel = context.WithCancel(ctx)
-	for i, mode := range config.ClientModes() {
+	for i, mode := range append(config.ClientModes(), balancerPolicies[:]...) {
 		port := portBase + i
 		if portBase == 0 {
 			port = 0

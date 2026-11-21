@@ -97,6 +97,43 @@ mapping is permanent across toggles and restarts:
 | 1083 | AWG · req-tcp | 1088 | TLS · req-utp |
 | 1084 | AWG · udp | 1089 | TLS · req-tcp |
 
+Three additional SOCKS5 ports choose a tunnel for each new TCP connection or
+UDP association. Existing sessions do not switch tunnels mid-stream.
+
+| Port | Balancer | Chooses |
+|---:|---|---|
+| 1090 | Failover | First reachable tunnel in the configured priority order |
+| 1091 | Round-robin | Next reachable tunnel in rotation |
+| 1092 | Adaptive | Keeps the current reachable tunnel unless another is consistently better |
+
+In the client dashboard, open a balancer's row, check any of the ten tunnels,
+and select **Save tunnel selection**. Each pool is saved separately and updated
+without restarting the service. Until customized, a pool follows the enabled
+fixed modes. A custom pool can use a tunnel even if its fixed port is off.
+Uncheck all tunnels to stop forwarding on that balancer; the port remains
+reserved. Only new sessions can use a different tunnel. All three ports use
+the same hub and Internet exit IP and do not balance ordinary TUN traffic.
+
+In **Failover**, highlight a tunnel and press **-** to move it up or **+** to
+move it down. Only checked rows count: the highest working one gets new
+connections. Save to apply the new priority. Until customized, Failover uses
+fixed-port order (1080 first).
+
+**Adaptive** changes a working route only after the same alternative has an
+estimated score (smoothed latency plus recent failure penalty) at least 5 ms
+and 15% better on two consecutive probes. An unavailable route is replaced
+without this wait. A closed BitTorrent carrier is excluded immediately, and
+its replacement needs a fresh successful probe. Native AWG/WG still relies
+on background probes to detect loss of reachability. SOCKS5 requests do not
+run or wait for additional checks.
+
+Balancers test each candidate over the tunnel against the hub's overlay DNS
+TCP port (1053); no external website or DNS lookup is used. If no selected path
+answers, new SOCKS5 requests fail rather than using the host connection.
+The hub still learns a return path for unsolicited VPN traffic from authenticated
+tunnel activity, so a newly connected path can receive new peer-initiated flows.
+Replies to established SOCKS flows stay pinned to their original path.
+
 All inbounds share **one SOCKS5 username/password** (RFC 1929). Choose **Show
 SOCKS5 credentials** or **Rotate SOCKS5 credentials**; rotation is immediate
 across every port and closes existing sessions. No-auth is refused. SOCKS5
@@ -143,7 +180,8 @@ Use an enabled port and set `SOCKS_LOGIN` to the username shown by **Show
 SOCKS5 credentials**. Curl prompts for the password. SOCKS domain resolution runs at the hub.
 The managed client owns one Linux TUN (`btawg0` by default) with the imported
 VPN address and routes. Ordinary VPN-IP traffic uses the lowest-index enabled
-transport; each SOCKS5 port uses its assigned transport through the same TUN.
+transport. Fixed SOCKS5 ports use their assigned transport and balancer ports
+choose one per new session, all through the same TUN.
 Toggling modes does not recreate the interface or change the host default route.
 The interface is removed when the service stops. A matching detached persistent
 TUN from an old foreground client is adopted on upgrade.

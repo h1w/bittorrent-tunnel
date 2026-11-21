@@ -14,7 +14,7 @@ func RequestControl(req ControlRequest) (r ControlResponse, running bool, err er
 	if !errors.Is(err, ErrNotRunning) {
 		return r, true, err
 	}
-	if req.Op == "toggle" || req.Op == "rotate" {
+	if req.mutates() {
 		state, _, err := service.Client.State()
 		if err != nil {
 			return r, false, err
@@ -30,7 +30,7 @@ func RequestControl(req ControlRequest) (r ControlResponse, running bool, err er
 	if err := cfg.update(req); err != nil {
 		return r, false, err
 	}
-	if req.Op == "toggle" || req.Op == "rotate" {
+	if req.mutates() {
 		if err := cfg.Save(ManagedConfigPath); err != nil {
 			return r, false, err
 		}

@@ -287,12 +287,12 @@ func (c *Client) Run(ctx context.Context) error {
 	local := c.localProxy()
 	go local.Serve(ctx, ln)
 
-	return c.runTunnel(ctx)
+	return c.runTunnel(ctx, nil)
 }
 
 // runTunnel keeps only the selected network path alive; managed clients
 // separately own all their SOCKS listeners.
-func (c *Client) runTunnel(ctx context.Context) error {
+func (c *Client) runTunnel(ctx context.Context, active *atomic.Pointer[carrierHealth]) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if c.ip != nil {
@@ -347,7 +347,7 @@ func (c *Client) runTunnel(ctx context.Context) error {
 			continue
 		}
 		if c.ip != nil {
-			if err := c.ip.run(ctx, raw, t); err != nil && ctx.Err() == nil {
+			if err := c.ip.run(ctx, raw, t, active); err != nil && ctx.Err() == nil {
 				fmt.Printf("btawg-client: TLS carrier %s: %v; retrying\n", addrs[0], err)
 			}
 			select {
@@ -359,6 +359,9 @@ func (c *Client) runTunnel(ctx context.Context) error {
 		}
 		fmt.Printf("btawg-client: carrier connected to %s\n", addrs[0])
 		c.bind.(*carrierbind.Bind).Attach(serverEp, t)
+		if active != nil {
+			active.Store(&carrierHealth{done: t.Done()})
+		}
 		var key device.NoisePublicKey
 		if key.FromHex(c.cfg.ServerPubKey) == nil {
 			if peer := c.dev.LookupPeer(key); peer != nil {
@@ -367,6 +370,9 @@ func (c *Client) runTunnel(ctx context.Context) error {
 		}
 		select {
 		case <-t.Done():
+			if active != nil {
+				active.Store(nil)
+			}
 			c.bind.(*carrierbind.Bind).Detach(serverEp)
 			select {
 			case <-ctx.Done():
@@ -374,6 +380,9 @@ func (c *Client) runTunnel(ctx context.Context) error {
 			case <-time.After(retryDelay):
 			}
 		case <-ctx.Done():
+			if active != nil {
+				active.Store(nil)
+			}
 			c.bind.(*carrierbind.Bind).Detach(serverEp)
 			return nil
 		}

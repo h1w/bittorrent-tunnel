@@ -10,6 +10,7 @@ import (
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/store"
+	"bittorrent-tunnel/btawg/internal/tunneldns"
 )
 
 func testRouterWithClient(t *testing.T) (*packetRouter, netip.Addr, netip.Addr) {
@@ -103,6 +104,27 @@ func TestRouterFlowPinningPrecedence(t *testing.T) {
 			t.Fatal("engB accepted packet owned by engA")
 		}
 	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestRouterDNSPreservesUnsolicitedReturnPath(t *testing.T) {
+	r, clientIP, gatewayIP := testRouterWithClient(t)
+	primary := r.newEngine(netip.Addr{})
+	probe := r.newEngine(netip.Addr{})
+	now := time.Now()
+	r.remember(clientIP, primary, now.UnixNano())
+	dns := makeTCPPacket(clientIP.String(), gatewayIP.String(), 12345, tunneldns.Port)
+	if _, err := probe.Write([][]byte{dns}, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		srcPort, dstPort uint16
+		want             *engineTun
+	}{{tunneldns.Port, 12345, probe}, {443, 23456, primary}} {
+		packet := makeTCPPacket(gatewayIP.String(), clientIP.String(), tc.srcPort, tc.dstPort)
+		if got := r.lookupDestinationEngine(gatewayIP, clientIP, packet, now); got != tc.want {
+			t.Fatalf("flow %d -> %d returned via the wrong path", tc.srcPort, tc.dstPort)
+		}
 	}
 }
 

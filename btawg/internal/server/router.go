@@ -10,6 +10,8 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"golang.org/x/net/ipv4"
+
+	"bittorrent-tunnel/btawg/internal/tunneldns"
 )
 
 const routerBufSize = 2048
@@ -434,8 +436,9 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 		// Pin the reverse flow so replies return to this engine. This is the
 		// only moment a flow's ownership is established; route changes and
 		// later handshakes cannot steal an active flow.
-		e.pinReverseFlow(packet, now)
-		e.router.remember(src, e, now.UnixNano())
+		if !e.pinReverseFlow(packet, now) || !e.router.policy.isGateway(dst) {
+			e.router.remember(src, e, now.UnixNano())
+		}
 		if e.router.policy.isGateway(dst) || direct {
 			innerBufs = append(innerBufs, b)
 			continue
@@ -460,13 +463,17 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 // pinReverseFlow records that return traffic for packet belongs to this
 // engine. For fragmented packets the IP ID is also pinned so all fragments
 // follow the same path.
-func (e *engineTun) pinReverseFlow(packet []byte, now time.Time) {
+// It reports a DNS flow, which already has a return path and must not make
+// periodic health probes the preferred route for unrelated traffic.
+func (e *engineTun) pinReverseFlow(packet []byte, now time.Time) (dns bool) {
 	if key, ok := flowKeyFromPacket(packet); ok {
 		e.router.flows.pin(key.reverse(), e, now)
+		dns = key.proto == 6 && key.b == tunneldns.Port
 	}
 	if fragKey, ok := fragmentKeyFromPacket(packet); ok {
 		e.router.flows.pinFragment(fragKey, e)
 	}
+	return dns
 }
 
 // lookupClientEngine selects the engine that should receive a

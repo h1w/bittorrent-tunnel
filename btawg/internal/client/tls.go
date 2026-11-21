@@ -62,7 +62,7 @@ func newTLSTunnel(dev tun.Device, cfg config.ClientConfig) (*tlsTunnel, error) {
 	return p, nil
 }
 
-func (p *tlsTunnel) run(ctx context.Context, raw net.Conn, t carrier.Transport) error {
+func (p *tlsTunnel) run(ctx context.Context, raw net.Conn, t carrier.Transport, active *atomic.Pointer[carrierHealth]) error {
 	defer t.Wait()
 	stop := context.AfterFunc(ctx, t.Close)
 	defer stop()
@@ -76,6 +76,10 @@ func (p *tlsTunnel) run(ctx context.Context, raw net.Conn, t carrier.Transport) 
 	s := &tlsSession{conn: conn, t: t}
 	p.active.Store(s)
 	defer p.active.CompareAndSwap(s, nil)
+	if active != nil {
+		active.Store(&carrierHealth{done: t.Done()})
+		defer active.Store(nil)
+	}
 	fmt.Printf("btawg-client: TLS carrier connected to %s\n", raw.RemoteAddr())
 	return iptunnel.ReceivePackets(tunnelWriter{p}, conn)
 }

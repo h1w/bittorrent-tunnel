@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -20,16 +21,18 @@ import (
 )
 
 type ControlRequest struct {
-	Op      string   `json:"op"`
-	Mode    string   `json:"mode,omitempty"`
-	Enabled []string `json:"enabled,omitempty"`
+	Op       string   `json:"op"`
+	Mode     string   `json:"mode,omitempty"`
+	Balancer string   `json:"balancer,omitempty"`
+	Enabled  []string `json:"enabled,omitempty"`
 }
 
 type ControlResponse struct {
-	OK          bool         `json:"ok"`
-	Enabled     []string     `json:"enabled"`
-	Credentials *Credentials `json:"credentials,omitempty"`
-	Error       string       `json:"error,omitempty"`
+	OK          bool                `json:"ok"`
+	Enabled     []string            `json:"enabled"`
+	Balancers   map[string][]string `json:"balancers,omitempty"`
+	Credentials *Credentials        `json:"credentials,omitempty"`
+	Error       string              `json:"error,omitempty"`
 }
 
 type clientControl struct {
@@ -66,7 +69,7 @@ func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath st
 	if err := os.Chmod(socketPath, 0600); err != nil {
 		return err
 	}
-	m, err := newManagedAt(ctx, importCfg, cfg.Enabled, listenIP, cfg.Credentials, realTUN, tunName, portBase)
+	m, err := newManagedAt(ctx, importCfg, cfg.Enabled, listenIP, cfg.Credentials, realTUN, tunName, portBase, cfg.Balancers)
 	if err != nil {
 		return err
 	}
@@ -132,13 +135,21 @@ func (d *clientControl) handle(req ControlRequest) ControlResponse {
 	if err := next.update(req); err != nil {
 		return ControlResponse{Error: err.Error()}
 	}
-	if req.Op == "apply" || req.Op == "toggle" || req.Op == "rotate" {
-		if err := d.m.apply(next.Enabled, next.Credentials, func() error { return next.Save(d.path) }); err != nil {
+	if req.mutates() {
+		if err := d.m.apply(next.Enabled, next.Credentials, next.Balancers, func() error { return next.Save(d.path) }); err != nil {
 			return ControlResponse{Error: err.Error()}
 		}
 		d.cfg = next
 	}
 	return next.response(req.Op)
+}
+
+func (r ControlRequest) mutates() bool {
+	switch r.Op {
+	case "apply", "toggle", "rotate", "set-balancer":
+		return true
+	}
+	return false
 }
 
 func (c *ManagedConfig) update(req ControlRequest) error {
@@ -162,6 +173,30 @@ func (c *ManagedConfig) update(req ControlRequest) error {
 			modes = append(modes, req.Mode)
 		}
 		c.Enabled = modes
+	case "set-balancer":
+		if !slices.Contains(balancerPolicies[:], req.Balancer) {
+			return fmt.Errorf("unknown SOCKS5 balancer %q", req.Balancer)
+		}
+		modes := config.ClientModes()
+		for _, mode := range req.Enabled {
+			if !slices.Contains(modes, mode) {
+				return fmt.Errorf("unsupported transport %q", mode)
+			}
+		}
+		order := modes
+		if req.Balancer == failoverPolicy {
+			order = req.Enabled
+		}
+		pool := make([]string, 0, min(len(req.Enabled), len(modes)))
+		for _, mode := range order {
+			if slices.Contains(req.Enabled, mode) && !slices.Contains(pool, mode) {
+				pool = append(pool, mode)
+			}
+		}
+		pools := make(map[string][]string, len(c.Balancers)+1)
+		maps.Copy(pools, c.Balancers)
+		pools[req.Balancer] = pool
+		c.Balancers = pools
 	case "rotate":
 		creds, err := GenerateCredentials()
 		if err != nil {
@@ -175,7 +210,7 @@ func (c *ManagedConfig) update(req ControlRequest) error {
 }
 
 func (c ManagedConfig) response(op string) ControlResponse {
-	r := ControlResponse{OK: true, Enabled: c.Enabled}
+	r := ControlResponse{OK: true, Enabled: c.Enabled, Balancers: c.Balancers}
 	if op == "show" || op == "rotate" {
 		r.Credentials = &c.Credentials
 	}

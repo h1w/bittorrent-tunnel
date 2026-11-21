@@ -8,16 +8,25 @@ import (
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/socks"
 	"bittorrent-tunnel/btawg/internal/tunsetup"
 )
 
 type managedTunnel struct {
-	c    *Client
-	stop context.CancelFunc
-	done chan struct{}
+	c           *Client
+	proxy       *socks.Server
+	life        context.Context
+	stop        context.CancelFunc
+	done        chan struct{}
+	score       atomic.Int64 // nanoseconds; zero means not eligible
+	carrierMode bool
+	carrier     atomic.Pointer[carrierHealth]
+	stopProbe   context.CancelFunc
+	probeDone   chan struct{}
 }
 
 // Managed runs independent data paths with fixed SOCKS ports and one VPN IP.
@@ -28,20 +37,26 @@ type Managed struct {
 	route   *tunsetup.ProxyRoute
 	mu      sync.Mutex
 	tunnels []*managedTunnel
+	fixed   []string
+	pools   map[string][]string
+	balance [len(balancerPolicies)]balancer
 	auth    Credentials
 	closed  bool
 }
 
 func NewManaged(ctx context.Context, cfg config.ClientConfig, enabled []string, listenIP netip.Addr, auth Credentials, realTUN bool, tunBase string) (*Managed, error) {
-	return newManagedAt(ctx, cfg, enabled, listenIP, auth, realTUN, tunBase, ManagedPortBase)
+	return newManagedAt(ctx, cfg, enabled, listenIP, auth, realTUN, tunBase, ManagedPortBase, nil)
 }
 
-func newManagedAt(ctx context.Context, cfg config.ClientConfig, enabled []string, listenIP netip.Addr, auth Credentials, realTUN bool, tunBase string, portBase int) (*Managed, error) {
+func newManagedAt(ctx context.Context, cfg config.ClientConfig, enabled []string, listenIP netip.Addr, auth Credentials, realTUN bool, tunBase string, portBase int, pools map[string][]string) (*Managed, error) {
 	inbound, err := newManaged(ctx, listenIP, portBase)
 	if err != nil {
 		return nil, err
 	}
-	m := &Managed{inbound: inbound, cfg: cfg, tunnels: make([]*managedTunnel, len(inbound.slots))}
+	m := &Managed{inbound: inbound, cfg: cfg, tunnels: make([]*managedTunnel, len(config.ClientModes()))}
+	for i, policy := range balancerPolicies {
+		m.balance[i].policy = policy
+	}
 	if realTUN {
 		dev, err := openClientTUN(cfg, tunBase)
 		if err != nil {
@@ -56,7 +71,7 @@ func newManagedAt(ctx context.Context, cfg config.ClientConfig, enabled []string
 		}
 		m.shared = newSharedTUN(dev, tunBase, config.DefaultMTU)
 	}
-	if err := m.Apply(enabled, auth); err != nil {
+	if err := m.apply(enabled, auth, pools, nil); err != nil {
 		m.Close()
 		return nil, err
 	}
@@ -64,12 +79,20 @@ func newManagedAt(ctx context.Context, cfg config.ClientConfig, enabled []string
 }
 
 func (m *Managed) Apply(enabled []string, auth Credentials) error {
-	return m.apply(enabled, auth, nil)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.applyLocked(enabled, auth, m.pools, nil)
+}
+
+func (m *Managed) apply(enabled []string, auth Credentials, pools map[string][]string, save func() error) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.applyLocked(enabled, auth, pools, save)
 }
 
 // Prepare every requested path before persisting or changing live listeners.
 // A failed start/write leaves existing sessions and config unchanged.
-func (m *Managed) apply(enabled []string, auth Credentials, save func() error) error {
+func (m *Managed) applyLocked(enabled []string, auth Credentials, pools map[string][]string, save func() error) error {
 	if !auth.valid() {
 		return fmt.Errorf("invalid SOCKS5 credentials")
 	}
@@ -79,8 +102,32 @@ func (m *Managed) apply(enabled []string, auth Credentials, save func() error) e
 			return fmt.Errorf("unsupported transport %q", mode)
 		}
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	var poolModes [len(balancerPolicies)][]string
+	for policy, pool := range pools {
+		if !slices.Contains(balancerPolicies[:], policy) {
+			return fmt.Errorf("unknown SOCKS5 balancer %q", policy)
+		}
+		for _, mode := range pool {
+			if !slices.Contains(modes, mode) {
+				return fmt.Errorf("unsupported transport %q", mode)
+			}
+		}
+	}
+	for i, policy := range balancerPolicies {
+		pool, explicit := pools[policy]
+		if !explicit {
+			pool = enabled
+		}
+		poolModes[i] = pool
+	}
+	usedByBalancer := func(mode string) bool {
+		for _, pool := range poolModes {
+			if slices.Contains(pool, mode) {
+				return true
+			}
+		}
+		return false
+	}
 	if m.closed {
 		return fmt.Errorf("managed client closed")
 	}
@@ -93,7 +140,7 @@ func (m *Managed) apply(enabled []string, auth Credentials, save func() error) e
 		}
 	}()
 	for i, mode := range modes {
-		if m.tunnels[i] != nil || !slices.Contains(enabled, mode) {
+		if m.tunnels[i] != nil || (!slices.Contains(enabled, mode) && !usedByBalancer(mode)) {
 			continue
 		}
 		cfg := m.cfg
@@ -118,49 +165,81 @@ func (m *Managed) apply(enabled []string, auth Credentials, save func() error) e
 			return err
 		}
 	}
-	if m.shared != nil {
-		var primary *tunPath
-		for i, mode := range modes {
-			if slices.Contains(enabled, mode) {
-				if c := pending[i]; c != nil {
-					primary = c.path
-				} else {
-					primary = m.tunnels[i].c.path
-				}
-				break
-			}
-		}
-		m.shared.primary.Store(primary)
-	}
 	rotated := m.auth != auth
+	adaptive := &m.balance[slices.Index(balancerPolicies[:], adaptivePolicy)]
+	var primary *tunPath
 	for i, mode := range modes {
-		if !slices.Contains(enabled, mode) {
-			if t := m.tunnels[i]; t != nil {
-				m.inbound.replace(i, nil)
-				t.close()
-				m.tunnels[i] = nil
-			}
-			continue
-		}
 		if c := pending[i]; c != nil {
 			pending[i] = nil
 			m.tunnels[i] = startManagedTunnel(m.inbound.ctx, c, mode)
-		} else if !rotated {
+		}
+		tunnel := m.tunnels[i]
+		fixed := slices.Contains(enabled, mode)
+		wasFixed := slices.Contains(m.fixed, mode)
+		if fixed {
+			if primary == nil {
+				primary = tunnel.c.path
+			}
+			if !wasFixed || rotated {
+				m.inbound.replace(i, tunnel.c.localProxy().WithCredentials(auth.Username, auth.Password))
+			}
+		} else if wasFixed {
+			m.inbound.replace(i, nil)
+		}
+		if tunnel != nil && usedByBalancer(mode) {
+			tunnel.watch(true, adaptive)
+		}
+	}
+	if m.shared != nil {
+		m.shared.primary.Store(primary)
+	}
+	for i, pool := range poolModes {
+		paths := make([]*managedTunnel, 0, len(pool))
+		policy := balancerPolicies[i]
+		if _, custom := pools[policy]; custom && policy == failoverPolicy {
+			for _, mode := range pool {
+				tunnel := m.tunnels[slices.Index(modes, mode)]
+				if !slices.Contains(paths, tunnel) {
+					paths = append(paths, tunnel)
+				}
+			}
+		} else {
+			for j, mode := range modes {
+				if slices.Contains(pool, mode) {
+					paths = append(paths, m.tunnels[j])
+				}
+			}
+		}
+		b := &m.balance[i]
+		b.replace(paths)
+		if rotated {
+			m.inbound.replace(len(modes)+i, socks.NewBalancer(b.upstream).WithCredentials(auth.Username, auth.Password))
+		}
+	}
+	for i, mode := range modes {
+		t := m.tunnels[i]
+		if t == nil || usedByBalancer(mode) {
 			continue
 		}
-		m.inbound.replace(i, m.tunnels[i].c.localProxy().WithCredentials(auth.Username, auth.Password))
+		if slices.Contains(enabled, mode) {
+			t.watch(false, nil)
+		} else {
+			t.close()
+			m.tunnels[i] = nil
+		}
 	}
-	m.auth = auth
+	m.auth, m.fixed, m.pools = auth, slices.Clone(enabled), pools
 	return nil
 }
 
 func startManagedTunnel(parent context.Context, c *Client, mode string) *managedTunnel {
 	ctx, stop := context.WithCancel(parent)
-	t := &managedTunnel{c: c, stop: stop, done: make(chan struct{})}
+	t := &managedTunnel{c: c, proxy: c.localProxy(), life: ctx, stop: stop, done: make(chan struct{}), carrierMode: config.IsCarrierMode(mode)}
 	go func() {
 		defer close(t.done)
+		defer stop()
 		for ctx.Err() == nil {
-			err := c.runTunnel(ctx)
+			err := c.runTunnel(ctx, &t.carrier)
 			if ctx.Err() != nil {
 				return
 			}
@@ -181,7 +260,12 @@ func startManagedTunnel(parent context.Context, c *Client, mode string) *managed
 	return t
 }
 
-func (t *managedTunnel) close() { t.stop(); <-t.done; t.c.Close() }
+func (t *managedTunnel) close() {
+	t.stop()
+	t.watch(false, nil)
+	<-t.done
+	t.c.Close()
+}
 
 func (m *Managed) Close() error {
 	m.mu.Lock()
