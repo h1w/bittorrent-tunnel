@@ -20,11 +20,12 @@ var errLeaseLost = errors.New("router mapping no longer confirmed")
 // router identifies the default interface and its route-selected IPv4 source.
 // Control traffic uses separate sockets, never the application UDP listener.
 type router struct {
-	gateway netip.Addr
-	source  netip.Addr
-	ifindex int
-	natPort uint16
-	ssdp    netip.AddrPort
+	gateway            netip.Addr
+	source             netip.Addr
+	ifindex            int
+	natPort            uint16
+	ssdp               netip.AddrPort
+	allowPermanentUPnP bool
 }
 
 type mapping interface {
@@ -36,7 +37,9 @@ type lease struct {
 	endpoint netip.AddrPort
 	started  time.Time
 	expires  time.Time
-	// A finite, acknowledged mapping, eligible for best-effort removal.
+	// Permanent entries have no expiration, but still need revalidation.
+	permanent bool
+	// An entry eligible for best-effort, backend-verified removal.
 	owned bool
 	// NAT-PMP has no nonce; record the router epoch when it acknowledged this mapping.
 	epoch uint32
@@ -44,6 +47,10 @@ type lease struct {
 
 func acknowledgedLease(endpoint netip.AddrPort, seconds uint32, started time.Time, owned bool) lease {
 	return lease{endpoint: endpoint, started: started, expires: started.Add(time.Duration(seconds) * time.Second), owned: owned}
+}
+
+func (l lease) validAt(now time.Time) bool {
+	return l.permanent || now.Before(l.expires)
 }
 
 // withoutCandidate keeps the port for router cleanup, but makes the
@@ -62,7 +69,9 @@ func (l lease) withoutCandidate() lease {
 // not a guarantee of end-to-end reachability. Router failures are nonfatal and
 // retried. Run returns an error only for invalid input or route discovery
 // failure, and returns nil on cancellation after bounded, best-effort cleanup.
-func Run(ctx context.Context, internalPort uint16, report func([]netip.AddrPort)) error {
+// allowPermanentUPnP permits a permanent entry only after IGD rejects a
+// finite lease. A permanent entry may survive a crash or failed cleanup.
+func Run(ctx context.Context, internalPort uint16, allowPermanentUPnP bool, report func([]netip.AddrPort)) error {
 	if internalPort == 0 || ctx.Err() != nil {
 		if report != nil {
 			report(nil)
@@ -82,6 +91,7 @@ func Run(ctx context.Context, internalPort uint16, report func([]netip.AddrPort)
 		}
 		return err
 	}
+	r.allowPermanentUPnP = allowPermanentUPnP
 	return maintain(ctx, r, internalPort, report)
 }
 
@@ -108,7 +118,7 @@ func maintain(ctx context.Context, r router, port uint16, report func([]netip.Ad
 	}
 	defer func() {
 		publish(netip.AddrPort{})
-		if active != nil && current.owned && time.Now().Before(current.expires) {
+		if active != nil && current.owned && current.validAt(time.Now()) {
 			_ = removeLease(ctx, active, current)
 		}
 	}()
@@ -122,7 +132,7 @@ func maintain(ctx context.Context, r router, port uint16, report func([]netip.Ad
 			}
 		}
 
-		if !time.Now().Before(current.expires) {
+		if !current.validAt(time.Now()) {
 			publish(netip.AddrPort{})
 			active = nil
 			wait(ctx, probeInterval)
@@ -130,8 +140,18 @@ func maintain(ctx context.Context, r router, port uint16, report func([]netip.Ad
 		}
 		if !usableEndpoint(current.endpoint) {
 			publish(netip.AddrPort{})
-			if current.owned && removeLease(ctx, active, current) == nil || !current.owned && current.endpoint.IsValid() {
+			if current.owned {
+				err := removeLease(ctx, active, current)
+				if err == nil || current.permanent && errors.Is(err, errLeaseLost) {
+					active = nil
+					continue
+				}
+			} else if current.endpoint.IsValid() {
 				active = nil
+				continue
+			}
+			if current.permanent {
+				wait(ctx, probeInterval)
 				continue
 			}
 			// An unacknowledged write may still have created a lease. Don't
@@ -142,11 +162,17 @@ func maintain(ctx context.Context, r router, port uint16, report func([]netip.Ad
 		if ctx.Err() == nil {
 			publish(current.endpoint)
 		}
-		renewal := current.started.Add(current.expires.Sub(current.started) / 2)
+		renewal, deadline := current.started.Add(current.expires.Sub(current.started)/2), current.expires
+		if current.permanent {
+			renewal = current.started.Add(probeInterval)
+		}
 		if !wait(ctx, time.Until(renewal)) {
 			break
 		}
-		renewCtx, cancel := context.WithDeadline(ctx, current.expires)
+		if current.permanent {
+			deadline = time.Now().Add(probeTimeout)
+		}
+		renewCtx, cancel := context.WithDeadline(ctx, deadline)
 		newLease, err := active.refresh(renewCtx, current)
 		cancel()
 		if err == nil {
@@ -156,10 +182,17 @@ func maintain(ctx context.Context, r router, port uint16, report func([]netip.Ad
 		if errors.Is(err, errLeaseLost) {
 			publish(netip.AddrPort{})
 			current = newLease.withoutCandidate()
-			if current.expires.IsZero() {
+			if !current.permanent && current.expires.IsZero() {
 				active = nil
 				wait(ctx, probeInterval)
 			}
+			continue
+		}
+		if current.permanent {
+			// An unreachable router can no longer confirm the candidate.
+			// Keep the exact port for ownership-checked cleanup.
+			publish(netip.AddrPort{})
+			current = current.withoutCandidate()
 			continue
 		}
 		// The last acknowledgement remains usable until its own expiry. If
@@ -192,11 +225,18 @@ func (r router) acquire(ctx context.Context, port uint16, first int) (mapping, l
 		if err == nil && usableEndpoint(current.endpoint) {
 			return backend, current, next
 		}
-		if current.expires.IsZero() {
+		if !current.permanent && current.expires.IsZero() {
 			continue
 		}
-		if !current.owned && !current.endpoint.IsValid() || current.owned && removeLease(ctx, backend, current) != nil {
+		if !current.owned && !current.endpoint.IsValid() {
 			return backend, current.withoutCandidate(), next
+		}
+		if current.owned {
+			err := removeLease(ctx, backend, current)
+			if err != nil && !(current.permanent && errors.Is(err, errLeaseLost)) {
+				return backend, current.withoutCandidate(), next
+			}
+			continue
 		}
 	}
 	return nil, lease{}, first
@@ -205,7 +245,11 @@ func (r router) acquire(ctx context.Context, port uint16, first int) (mapping, l
 func removeLease(ctx context.Context, backend mapping, current lease) error {
 	// Cancellation should stop probing/renewal, not prevent removal. Never
 	// start a deletion with a lease that may already have been reassigned.
-	cleanup, cancel := context.WithDeadline(context.WithoutCancel(ctx), minTime(current.expires, time.Now().Add(cleanupTimeout)))
+	deadline := time.Now().Add(cleanupTimeout)
+	if !current.permanent {
+		deadline = minTime(current.expires, deadline)
+	}
+	cleanup, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
 	defer cancel()
 	if err := cleanup.Err(); err != nil {
 		return err

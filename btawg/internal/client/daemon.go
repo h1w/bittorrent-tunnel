@@ -109,7 +109,7 @@ func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath st
 	}
 	defer m.Close()
 	m.applyRoutes(cfg.Routes)
-	m.startNetwork(cfg.P2P, cfg.AutoMap, cfg.ServeEgress, cfg.PeerPort, cfg.PeerEndpoint, cfg.PeerTCPEndpoint)
+	m.startNetwork(cfg.P2P, cfg.AutoMap, cfg.AllowPermanentUPnP, cfg.ServeEgress, cfg.PeerPort, cfg.PeerEndpoint, cfg.PeerTCPEndpoint)
 	d := &clientControl{m: m, path: cfgPath, cfg: cfg}
 	if err := service.NotifyReady(); err != nil {
 		return err

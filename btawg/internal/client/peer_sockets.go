@@ -42,7 +42,7 @@ type peerSockets struct {
 	cancel context.CancelFunc
 }
 
-func openPeerSockets(ctx context.Context, port uint16, autoMap bool) (*peerSockets, error) {
+func openPeerSockets(ctx context.Context, port uint16, autoMap, allowPermanentUPnP bool) (*peerSockets, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	s := &peerSockets{native: make(map[string][2]*nativepeer.Socket), cancel: cancel}
 	var err error
@@ -82,7 +82,7 @@ func openPeerSockets(ctx context.Context, port uint16, autoMap bool) (*peerSocke
 	if autoMap {
 		for _, entry := range s.all {
 			s.worker.Go(func() {
-				if err := portmap.Run(ctx, entry.Port(), func(aps []netip.AddrPort) {
+				if err := portmap.Run(ctx, entry.Port(), allowPermanentUPnP, func(aps []netip.AddrPort) {
 					s.mu.Lock()
 					entry.mapped = slices.Clone(aps)
 					s.mu.Unlock()

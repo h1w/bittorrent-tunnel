@@ -166,6 +166,118 @@ func TestIGDRenewsAndDeletesOnlyVerifiedOwnedLease(t *testing.T) {
 	}
 }
 
+func TestIGDOnlyPermanentLeases(t *testing.T) {
+	const service = "urn:schemas-upnp-org:service:WANIPConnection:1"
+	for _, tc := range []struct {
+		name                      string
+		allow, replace, lostReply bool
+	}{
+		{name: "default rejects"},
+		{name: "opted in", allow: true},
+		{name: "foreign replacement", allow: true, replace: true},
+		{name: "lost add reply", allow: true, lostReply: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var mu sync.Mutex
+			var description string
+			finiteRejected := make(chan struct{}, 1)
+			nat, packets := testGateway(t)
+			ssdp, discovery := testGateway(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				if req.Method == http.MethodGet {
+					fmt.Fprint(w, testDescription(service, "/control"))
+					return
+				}
+				action := strings.TrimPrefix(strings.Trim(req.Header.Get("SOAPAction"), `"`), service+"#")
+				mu.Lock()
+				defer mu.Unlock()
+				switch action {
+				case "GetExternalIPAddress":
+					testSOAPReply(w, service, action, `<NewExternalIPAddress>8.8.4.4</NewExternalIPAddress>`)
+				case "GetSpecificPortMappingEntry":
+					if description == "" {
+						testSOAPFault(w, 714)
+						return
+					}
+					testSOAPReply(w, service, action, `<NewInternalPort>42301</NewInternalPort><NewInternalClient>127.0.0.1</NewInternalClient><NewEnabled>1</NewEnabled><NewLeaseDuration>0</NewLeaseDuration><NewPortMappingDescription>`+description+`</NewPortMappingDescription>`)
+				case "AddPortMapping":
+					var envelope struct {
+						Body struct {
+							Add struct {
+								Description string `xml:"NewPortMappingDescription"`
+								Seconds     uint32 `xml:"NewLeaseDuration"`
+							} `xml:"AddPortMapping"`
+						}
+					}
+					if err := xml.NewDecoder(req.Body).Decode(&envelope); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+					if envelope.Body.Add.Seconds != 0 {
+						testSOAPFault(w, 725)
+						select {
+						case finiteRejected <- struct{}{}:
+						default:
+						}
+						return
+					}
+					if !tc.allow || description != "" {
+						t.Error("unexpected permanent AddPortMapping")
+						testSOAPFault(w, 718)
+						return
+					}
+					description = envelope.Body.Add.Description
+					if tc.lostReply {
+						w.WriteHeader(http.StatusBadGateway)
+						return
+					}
+					testSOAPReply(w, service, action, "")
+				case "DeletePortMapping":
+					description = ""
+					testSOAPReply(w, service, action, "")
+				default:
+					t.Errorf("unexpected SOAP action %q", action)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			}))
+			defer server.Close()
+			r := router{source: testLocal, gateway: testLocal, natPort: nat.LocalAddr().(*net.UDPAddr).AddrPort().Port(), ssdp: ssdp.LocalAddr().(*net.UDPAddr).AddrPort()}
+			r.allowPermanentUPnP = tc.allow
+			cancel, reports, done := startTestMapping(t, r, 42301)
+			defer cancel()
+			rejectNAT(t, nat, packets)
+			sendLocation(t, ssdp, receive(t, discovery), server.URL+"/igd.xml")
+			receive(t, finiteRejected)
+			if tc.allow {
+				checkReport(t, reports, "8.8.4.4:42301")
+			}
+			if tc.replace {
+				mu.Lock()
+				description = "replacement"
+				mu.Unlock()
+			}
+			cancel()
+			if tc.allow {
+				checkReport(t, reports, "")
+			}
+			if err := receive(t, done); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			want := ""
+			if tc.replace {
+				want = "replacement"
+			}
+			if description != want {
+				t.Fatalf("mapping left on router: %q, want %q", description, want)
+			}
+		})
+	}
+}
+
 func TestIGDRejectsOffGatewayAndRedirectsAndBoundsBodies(t *testing.T) {
 	var unwanted atomic.Int32
 	var requested = make(chan string, 8)

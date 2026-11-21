@@ -62,8 +62,8 @@ func (m *Managed) applyPeerSettings(cfg PeerSettings) {
 	m.network.peer.Store(&cfg)
 }
 
-func (m *Managed) startNetwork(p2p, autoMap, serve bool, port uint16, endpoint, tcpEndpoint string) {
-	m.network.start(p2p, autoMap, serve, port, endpoint, tcpEndpoint)
+func (m *Managed) startNetwork(p2p, autoMap, allowPermanentUPnP, serve bool, port uint16, endpoint, tcpEndpoint string) {
+	m.network.start(p2p, autoMap, allowPermanentUPnP, serve, port, endpoint, tcpEndpoint)
 }
 
 func (n *meshNode) selectProxy(port int, path *managedTunnel) (*socks.Server, context.Context) {
@@ -341,7 +341,7 @@ func (n *meshNode) runExit(ctx context.Context, path *managedTunnel, running *at
 	return routeproxy.ServeWithBlockedPrefixes(ctx, ln, n.allowRoute, blocked)
 }
 
-func (n *meshNode) start(p2p, autoMap, serve bool, port uint16, endpoint, tcpEndpoint string) {
+func (n *meshNode) start(p2p, autoMap, allowPermanentUPnP, serve bool, port uint16, endpoint, tcpEndpoint string) {
 	n.owner.networkWG.Go(func() {
 		var exitRunning atomic.Int32
 		if serve {
@@ -350,7 +350,7 @@ func (n *meshNode) start(p2p, autoMap, serve bool, port uint16, endpoint, tcpEnd
 		if p2p && n.owner.shared != nil {
 			n.owner.networkWG.Go(n.servePeerProbe)
 		}
-		n.run(p2p, autoMap, port, endpoint, tcpEndpoint, &exitRunning)
+		n.run(p2p, autoMap, allowPermanentUPnP, port, endpoint, tcpEndpoint, &exitRunning)
 	})
 }
 

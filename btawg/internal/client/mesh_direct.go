@@ -57,7 +57,7 @@ func newDirectIdentity() (directIdentity, error) {
 	return directIdentity{private, public, tlsID}, err
 }
 
-func (n *meshNode) run(p2p, autoMap bool, port uint16, endpoint, tcpEndpoint string, exitRunning *atomic.Int32) {
+func (n *meshNode) run(p2p, autoMap, allowPermanentUPnP bool, port uint16, endpoint, tcpEndpoint string, exitRunning *atomic.Int32) {
 	var sockets *peerSockets
 	var identity directIdentity
 	if p2p && n.owner.shared != nil {
@@ -68,7 +68,7 @@ func (n *meshNode) run(p2p, autoMap bool, port uint16, endpoint, tcpEndpoint str
 		}
 		identity, err = newDirectIdentity()
 		if err == nil {
-			sockets, err = openPeerSockets(n.ctx, port, autoMap)
+			sockets, err = openPeerSockets(n.ctx, port, autoMap, allowPermanentUPnP)
 		}
 		if err != nil {
 			log.Printf("btawg-client: direct peer sockets: %v", err)

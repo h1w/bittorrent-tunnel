@@ -47,6 +47,7 @@ func clientSetup(install bool) (*service.Screen, error) {
 	if previous != nil {
 		help = "Leave the import blank to keep it. Saving changes restarts a running service."
 	}
+	help += " Permanent UPnP mappings may remain after a crash."
 	submit := "Save settings"
 	if install {
 		submit = "Save and install"
@@ -60,6 +61,7 @@ func clientSetup(install bool) (*service.Screen, error) {
 			{Label: "Userspace only (no TUN)", Toggle: true, Checked: cfg.NoTUN},
 			{Label: "Allow direct peer connections (P2P)", Toggle: true, Checked: cfg.P2P},
 			{Label: "Automatically map the peer UDP port", Toggle: true, Checked: cfg.AutoMap},
+			{Label: "Allow permanent UPnP mappings (e.g. MikroTik)", Toggle: true, Checked: cfg.AllowPermanentUPnP},
 			{Label: "Allow serving assigned egress routes", Toggle: true, Checked: cfg.ServeEgress},
 			{Label: "P2P listen port (0 = automatic)", Value: strconv.Itoa(int(cfg.PeerPort))},
 			{Label: "Public P2P UDP address (optional)", Value: cfg.PeerEndpoint},
@@ -72,15 +74,15 @@ func clientSetup(install bool) (*service.Screen, error) {
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return nil, err
 			}
-			port, err := parsePeerPort(fields[7].Value)
+			port, err := parsePeerPort(fields[8].Value)
 			if err != nil {
 				return nil, err
 			}
 			settings := client.ManagedConfig{
 				ListenIP: fields[1].Value, TUNName: fields[2].Value, NoTUN: fields[3].Checked,
-				P2P: fields[4].Checked, AutoMap: fields[5].Checked, ServeEgress: fields[6].Checked,
-				PeerPort: port, PeerEndpoint: fields[8].Value,
-				PeerTCPEndpoint: fields[9].Value,
+				P2P: fields[4].Checked, AutoMap: fields[5].Checked, AllowPermanentUPnP: fields[6].Checked, ServeEgress: fields[7].Checked,
+				PeerPort: port, PeerEndpoint: fields[9].Value,
+				PeerTCPEndpoint: fields[10].Value,
 			}
 			if err := saveClientSettings(previous, fields[0].Value, settings); err != nil {
 				return nil, err
@@ -137,6 +139,7 @@ func saveClientSettings(previous *client.ManagedConfig, raw string, settings cli
 	}
 	next.ListenIP, next.TUNName, next.NoTUN = ip.String(), tun, settings.NoTUN
 	next.P2P, next.AutoMap, next.ServeEgress = settings.P2P, settings.AutoMap, settings.ServeEgress
+	next.AllowPermanentUPnP = settings.AllowPermanentUPnP && settings.AutoMap
 	next.PeerPort, next.PeerEndpoint = settings.PeerPort, strings.TrimSpace(settings.PeerEndpoint)
 	next.PeerTCPEndpoint = strings.TrimSpace(settings.PeerTCPEndpoint)
 	return next.Save(client.ManagedConfigPath)

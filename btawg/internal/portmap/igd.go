@@ -18,12 +18,12 @@ const soapEnvelope = "http://schemas.xmlsoap.org/soap/envelope/"
 
 type igdAction struct {
 	XMLName     xml.Name
-	External    string `xml:"NewExternalIPAddress"`
-	Client      string `xml:"NewInternalClient"`
-	Port        uint16 `xml:"NewInternalPort"`
-	Description string `xml:"NewPortMappingDescription"`
-	Seconds     uint32 `xml:"NewLeaseDuration"`
-	Enabled     string `xml:"NewEnabled"`
+	External    string  `xml:"NewExternalIPAddress"`
+	Client      string  `xml:"NewInternalClient"`
+	Port        uint16  `xml:"NewInternalPort"`
+	Description string  `xml:"NewPortMappingDescription"`
+	Seconds     *uint32 `xml:"NewLeaseDuration"`
+	Enabled     string  `xml:"NewEnabled"`
 }
 
 type igdReply struct {
@@ -85,11 +85,12 @@ func igdScope(port uint16) string {
 }
 
 type igdMapping struct {
-	source      netip.Addr
-	port        uint16
-	description string
-	services    []igdService
-	selected    int // index of the service which accepted an Add request
+	source         netip.Addr
+	port           uint16
+	description    string
+	services       []igdService
+	selected       int // index of the service which accepted an Add request
+	allowPermanent bool
 }
 
 func (r router) probeIGD(ctx context.Context, port uint16) (mapping, error) {
@@ -101,25 +102,46 @@ func (r router) probeIGD(ctx context.Context, port uint16) (mapping, error) {
 	if _, err := rand.Read(token[:]); err != nil {
 		return nil, err
 	}
-	return &igdMapping{source: r.source, port: port, description: "btawg-" + hex.EncodeToString(token[:]), services: services}, nil
+	return &igdMapping{source: r.source, port: port, description: "btawg-" + hex.EncodeToString(token[:]), services: services, allowPermanent: r.allowPermanentUPnP}, nil
 }
 
 func (m *igdMapping) owns(entry igdAction) bool {
 	return strings.TrimSpace(entry.Client) == m.source.String() && entry.Port == m.port && entry.Description == m.description
 }
 
-func (m *igdMapping) add(ctx context.Context, s igdService, endpoint netip.AddrPort) (lease, error) {
-	args := igdScope(endpoint.Port()) + `<NewInternalPort>` + strconv.Itoa(int(m.port)) + `</NewInternalPort><NewInternalClient>` + m.source.String() + `</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>` + m.description + `</NewPortMappingDescription><NewLeaseDuration>` + strconv.Itoa(requestedSeconds) + `</NewLeaseDuration>`
+func (m *igdMapping) add(ctx context.Context, s igdService, endpoint netip.AddrPort, seconds uint32) (lease, error) {
+	scope := igdScope(endpoint.Port())
+	args := scope + `<NewInternalPort>` + strconv.Itoa(int(m.port)) + `</NewInternalPort><NewInternalClient>` + m.source.String() + `</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>` + m.description + `</NewPortMappingDescription><NewLeaseDuration>` + strconv.FormatUint(uint64(seconds), 10) + `</NewLeaseDuration>`
 	started := time.Now()
 	if _, err := s.call(ctx, "AddPortMapping", args); err != nil {
-		return uncertainWrite(started, err), err
+		if seconds != 0 && m.allowPermanent && igdErrorCode(err, 725) {
+			// Recheck before retrying: the first write was explicitly rejected,
+			// but another client could have claimed the port since our lookup.
+			entry, err := s.call(ctx, "GetSpecificPortMappingEntry", scope)
+			if igdErrorCode(err, 714) || err == nil && m.owns(entry) {
+				return m.add(ctx, s, endpoint, 0)
+			}
+			return lease{}, errLeaseLost
+		}
+		if seconds != 0 {
+			return uncertainWrite(started, err), err
+		}
+		var result routerResult
+		if errors.As(err, &result) {
+			return lease{}, err
+		}
+		// A permanent write can outlive an HTTP timeout. Read back the
+		// exact entry before publishing or attempting ownership-checked cleanup.
 	}
 
 	// The action's success reply has no arguments. Confirm the entry's
 	// enabled flag, lease length and ownership before publishing it.
 	lookup := time.Now()
-	current := acknowledgedLease(endpoint, requestedSeconds, started, true)
-	entry, err := s.call(ctx, "GetSpecificPortMappingEntry", igdScope(endpoint.Port()))
+	current := acknowledgedLease(endpoint, seconds, started, true)
+	if seconds == 0 {
+		current = lease{endpoint: endpoint, started: started, owned: true, permanent: true}
+	}
+	entry, err := s.call(ctx, "GetSpecificPortMappingEntry", scope)
 	if err != nil {
 		if igdErrorCode(err, 714) {
 			return lease{}, errLeaseLost
@@ -129,14 +151,23 @@ func (m *igdMapping) add(ctx context.Context, s igdService, endpoint netip.AddrP
 	if !m.owns(entry) {
 		return lease{}, errLeaseLost
 	}
-	if entry.Seconds == 0 || entry.Enabled != "1" && !strings.EqualFold(entry.Enabled, "true") {
-		// Legacy routers may ignore the requested duration. Never publish
-		// a permanent or disabled entry; let scoped cleanup verify it again.
+	if entry.Seconds != nil && *entry.Seconds == 0 {
+		current.permanent = true
+		current.expires = time.Time{}
+	}
+	if !entry.enabled() || entry.Seconds == nil || (*entry.Seconds == 0) != (seconds == 0) {
+		// Don't publish an unexpected permanent or disabled entry.
 		return current, errLeaseLost
 	}
 	current.started = lookup
-	current.expires = lookup.Add(time.Duration(min(entry.Seconds, requestedSeconds)) * time.Second)
+	if !current.permanent {
+		current.expires = lookup.Add(time.Duration(min(*entry.Seconds, seconds)) * time.Second)
+	}
 	return current, nil
+}
+
+func (e igdAction) enabled() bool {
+	return e.Enabled == "1" || strings.EqualFold(e.Enabled, "true")
 }
 
 func (m *igdMapping) refresh(ctx context.Context, old lease) (lease, error) {
@@ -156,7 +187,17 @@ func (m *igdMapping) refresh(ctx context.Context, old lease) (lease, error) {
 		if !m.owns(entry) {
 			return lease{}, errLeaseLost
 		}
-		return m.add(ctx, s, netip.AddrPortFrom(external, old.endpoint.Port()))
+		endpoint := netip.AddrPortFrom(external, old.endpoint.Port())
+		if old.permanent {
+			// Permanent entries don't need rewriting. Confirm that the router
+			// still has the enabled entry we created before advertising it again.
+			if !entry.enabled() || entry.Seconds == nil || *entry.Seconds != 0 {
+				return old, errLeaseLost
+			}
+			old.endpoint, old.started = endpoint, time.Now()
+			return old, nil
+		}
+		return m.add(ctx, s, endpoint, requestedSeconds)
 	}
 
 	for i, s := range m.services {
@@ -183,8 +224,8 @@ func (m *igdMapping) refresh(ctx context.Context, old lease) (lease, error) {
 			if !igdErrorCode(err, 714) { // not confirmed free; don't overwrite
 				break
 			}
-			current, err := m.add(ctx, s, netip.AddrPortFrom(external, port))
-			if err == nil || !current.expires.IsZero() {
+			current, err := m.add(ctx, s, netip.AddrPortFrom(external, port), requestedSeconds)
+			if err == nil || current.validAt(time.Now()) {
 				m.selected = i
 				return current, err
 			}
@@ -194,7 +235,7 @@ func (m *igdMapping) refresh(ctx context.Context, old lease) (lease, error) {
 			break
 		}
 	}
-	return lease{}, errors.New("no IGD service supports a safe temporary UDP mapping")
+	return lease{}, errors.New("no IGD service accepted the UDP port mapping")
 }
 
 func (m *igdMapping) remove(ctx context.Context, current lease) error {

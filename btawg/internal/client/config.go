@@ -123,14 +123,15 @@ type ManagedConfig struct {
 	// A missing balancer pool follows Enabled; an empty list routes nothing.
 	Balancers map[string][]string `json:"balancers,omitempty"`
 	// Missing entries use the hub; explicit choices survive catalogue changes.
-	Routes          map[int]string `json:"routes,omitempty"`
-	P2P             bool           `json:"p2p,omitempty"`
-	AutoMap         bool           `json:"auto_map,omitempty"`
-	ServeEgress     bool           `json:"serve_egress,omitempty"`
-	PeerPort        uint16         `json:"peer_port,omitempty"` // zero lets the OS allocate a port
-	PeerEndpoint    string         `json:"peer_endpoint,omitempty"`
-	PeerTCPEndpoint string         `json:"peer_tcp_endpoint,omitempty"`
-	Peer            PeerSettings   `json:"peer"`
+	Routes             map[int]string `json:"routes,omitempty"`
+	P2P                bool           `json:"p2p,omitempty"`
+	AutoMap            bool           `json:"auto_map,omitempty"`
+	AllowPermanentUPnP bool           `json:"allow_permanent_upnp,omitempty"`
+	ServeEgress        bool           `json:"serve_egress,omitempty"`
+	PeerPort           uint16         `json:"peer_port,omitempty"` // zero lets the OS allocate a port
+	PeerEndpoint       string         `json:"peer_endpoint,omitempty"`
+	PeerTCPEndpoint    string         `json:"peer_tcp_endpoint,omitempty"`
+	Peer               PeerSettings   `json:"peer"`
 }
 
 func selectedRouteID(routes map[int]string, port int) string {
@@ -151,6 +152,9 @@ func (c ManagedConfig) validatePeerSettings(realTUN bool) error {
 	}
 	if c.AutoMap && !c.P2P {
 		return fmt.Errorf("automatic peer port mapping requires P2P")
+	}
+	if c.AllowPermanentUPnP && !c.AutoMap {
+		return fmt.Errorf("permanent UPnP mappings require automatic peer port mapping")
 	}
 	for i, raw := range [2]string{c.PeerEndpoint, c.PeerTCPEndpoint} {
 		if raw == "" {

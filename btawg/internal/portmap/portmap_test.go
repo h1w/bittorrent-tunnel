@@ -267,7 +267,7 @@ eth4 00000000 0100A8C0 0003 0 0 0 0000FFFF 0 0 0
 
 func TestRunRejectsZeroInternalPort(t *testing.T) {
 	called := false
-	err := Run(context.Background(), 0, func(addrs []netip.AddrPort) { called = len(addrs) == 0 })
+	err := Run(context.Background(), 0, false, func(addrs []netip.AddrPort) { called = len(addrs) == 0 })
 	if err == nil || !called {
 		t.Fatalf("zero listener port: got err %v, cleared report %t", err, called)
 	}

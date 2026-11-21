@@ -187,7 +187,7 @@ func newDirectFixture(t *testing.T, cfg config.ClientConfig, name string) *Manag
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
-	m.startNetwork(true, false, false, 0, "", "")
+	m.startNetwork(true, false, false, false, 0, "", "")
 	return m
 }
 

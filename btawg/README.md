@@ -324,6 +324,16 @@ and WG use separate UDP sockets. DHT discovers the
 hub, not clients. Direct paths expire if the hub cannot renew their leases.
 Peer endpoints are shared only with authorized peers.
 
+For routers that reject finite IGD leases (`725 OnlyPermanentLeasesSupported`,
+including MikroTik RouterOS), enable **Allow permanent UPnP mappings** in
+**Service settings** alongside **Automatically map the peer UDP port**.
+This is off by default. The client tries a finite lease first, checks that a
+permanent mapping still belongs to it, and attempts to delete it on a clean
+shutdown. After a crash or failed cleanup, remove any stale `btawg-*` mappings
+for this device from the router. In MikroTik WinBox, check **IP → Firewall → NAT**.
+Discovery and port mapping still require a reachable UPnP IGD and do not
+open a port through an upstream NAT or the host firewall.
+
 ### Select a client exit or cascade
 
 1. On each participating device, enable **Allow serving assigned egress routes**
