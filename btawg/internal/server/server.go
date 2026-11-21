@@ -28,6 +28,7 @@ import (
 	"bittorrent-tunnel/btawg/internal/carrier"
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/dht"
+	"bittorrent-tunnel/btawg/internal/direct"
 	"bittorrent-tunnel/btawg/internal/iptunnel"
 	"bittorrent-tunnel/btawg/internal/store"
 	"bittorrent-tunnel/btawg/internal/tunneldns"
@@ -64,10 +65,11 @@ type Server struct {
 	closeErr     error
 	trafficWG    sync.WaitGroup
 	carrierWG    sync.WaitGroup
+	meshWG       sync.WaitGroup
 	savedTraffic map[string]store.Traffic
 	hashes       map[[20]byte]string
 	peers        map[string]store.ClientRecord
-	sessions     map[string]map[carrier.Transport]struct{}
+	sessions     map[string]map[carrier.Transport]chan struct{}
 	tlsSessions  map[string]carrier.Transport // current TLS carrier by enrolled peer ID
 	gateways     []netip.Prefix
 	byPeerID     map[string]store.ClientRecord
@@ -75,6 +77,7 @@ type Server struct {
 
 	policy *policySnapshot
 	panel  *panelListeners
+	mesh   *meshControl
 
 	udpPC  net.PacketConn
 	sock   utp.Socket
@@ -136,6 +139,7 @@ func newServer(cfg config.ServerConfig, st *store.Store, tunName string) (*Serve
 		return nil, err
 	}
 	s.trafficWG.Go(s.refreshHandshakeRoutes)
+	s.mesh = newMeshControl()
 	return s, nil
 }
 
@@ -245,7 +249,7 @@ func prepareServer(cfg config.ServerConfig, st *store.Store) (*Server, error) {
 		pubKey:       serverPub,
 		tlsIdentity:  tlsIdentity,
 		peers:        make(map[string]store.ClientRecord),
-		sessions:     make(map[string]map[carrier.Transport]struct{}),
+		sessions:     make(map[string]map[carrier.Transport]chan struct{}),
 		tlsSessions:  make(map[string]carrier.Transport),
 		modeDevs:     make(map[string]*device.Device),
 		modeBinds:    make(map[string]*bind.Bind),
@@ -385,9 +389,14 @@ func (s *Server) SetManaged(managed bool) {
 }
 
 // ReloadPolicy applies stored group addresses, peer addresses and access rules.
-func (s *Server) ReloadPolicy() (err error) {
+func (s *Server) ReloadPolicy() error {
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	return s.reloadPolicy()
+}
+
+// reloadPolicy requires applyMu.
+func (s *Server) reloadPolicy() (err error) {
 	defer func() {
 		if err == nil {
 			return
@@ -460,10 +469,22 @@ func (s *Server) Run(ctx context.Context) error {
 		{accept: s.tcpLn.Accept, proto: "tcp"},
 		{accept: s.sock.Accept, proto: "utp"},
 	}
-	errs := make(chan error, len(listeners)+1)
+	errs := make(chan error, len(listeners)+4)
 	if s.dnsLn != nil {
 		go func() { errs <- tunneldns.Serve(runCtx, s.dnsLn, s.policy.allowDNS) }()
 	}
+	s.mu.Lock()
+	select {
+	case <-s.closed:
+		s.mu.Unlock()
+		return nil
+	default:
+	}
+	s.meshWG.Go(func() { errs <- s.serveMesh(runCtx) })
+	s.meshWG.Go(func() { errs <- s.serveRouteRelay(runCtx) })
+	s.meshWG.Go(func() { errs <- direct.ServeObserver(runCtx, s.sock) })
+	s.mu.Unlock()
+	defer func() { cancel(); s.meshWG.Wait() }()
 	for _, ln := range listeners {
 		go func(ln listener) {
 			for {
@@ -627,9 +648,10 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn, proto string) {
 		b.Attach(bind.Endpoint(ip), t)
 	}
 	if s.sessions[id] == nil {
-		s.sessions[id] = make(map[carrier.Transport]struct{})
+		s.sessions[id] = make(map[carrier.Transport]chan struct{})
 	}
-	s.sessions[id][t] = struct{}{}
+	retired := make(chan struct{})
+	s.sessions[id][t] = retired
 	s.attached[rec.IP]++
 	s.mu.Unlock()
 	s.applyMu.Unlock()
@@ -663,6 +685,7 @@ func (s *Server) acceptConn(ctx context.Context, c net.Conn, proto string) {
 	} else {
 		delete(s.attached, rec.IP)
 	}
+	close(retired)
 	s.mu.Unlock()
 }
 
@@ -709,20 +732,29 @@ func (s *Server) reloadPeers() error {
 		next[r.ID] = r
 		byPeerID[r.PeerID] = r
 	}
-	var closeList []carrier.Transport
+	type retiringSession struct {
+		transport carrier.Transport
+		done      <-chan struct{}
+	}
+	var closing []retiringSession
 	s.mu.Lock()
 	s.byPeerID = byPeerID
 	for id, old := range s.peers {
 		if r, ok := next[id]; ok && r.IP == old.IP && r.PubKey == old.PubKey && r.PrivKey == old.PrivKey && r.PeerID == old.PeerID {
 			continue
 		}
-		for t := range s.sessions[old.PeerID] {
-			closeList = append(closeList, t)
+		for t, done := range s.sessions[old.PeerID] {
+			closing = append(closing, retiringSession{t, done})
 		}
 	}
 	s.mu.Unlock()
-	for _, t := range closeList {
-		t.Close()
+	for _, session := range closing {
+		session.transport.Close()
+	}
+	// TLS engines pin only the source IP. Drain their readers before any
+	// later enrollment can reuse the address and accept their queued packets.
+	for _, session := range closing {
+		<-session.done
 	}
 	for id, old := range s.peers {
 		if r, ok := next[id]; ok && r.IP == old.IP && r.PubKey == old.PubKey {
@@ -792,6 +824,27 @@ func (s *Server) RegisterClient(rec store.ClientRecord) error { return s.ReloadP
 // RevokeClient applies a revocation already persisted by the panel.
 func (s *Server) RevokeClient(rec store.ClientRecord) error { return s.ReloadPolicy() }
 
+// DeleteClient retires the old key before making the VPN address reusable.
+// A failed reload leaves the record revoked with its address still reserved.
+func (s *Server) DeleteClient(id string) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	if err := s.st.RevokeClient(id); err != nil {
+		return err
+	}
+	if err := s.reloadPolicy(); err != nil {
+		return err
+	}
+	if err := s.st.DeleteClient(id); err != nil {
+		return err
+	}
+	s.policy.mu.Lock()
+	delete(s.policy.traffic, id)
+	s.policy.mu.Unlock()
+	delete(s.savedTraffic, id)
+	return nil
+}
+
 // ConnectedCount reports how many carriers are attached per overlay IP.
 func (s *Server) ConnectedCount() map[string]int {
 	s.mu.Lock()
@@ -816,6 +869,7 @@ func (s *Server) Close() error {
 		s.mu.Unlock()
 		s.closePanel()
 		s.trafficWG.Wait()
+		s.meshWG.Wait()
 		for _, a := range s.anns {
 			a.Close()
 		}

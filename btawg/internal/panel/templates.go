@@ -29,6 +29,7 @@ const layout = `<!doctype html>
 <a href="/" {{if eq .Active "dashboard"}}class="active" aria-current="page"{{end}}>Overview</a>
 <a href="/clients" {{if eq .Active "clients"}}class="active" aria-current="page"{{end}}>Clients</a>
 <a href="/groups" {{if eq .Active "groups"}}class="active" aria-current="page"{{end}}>Groups</a>
+<a href="/routes" {{if eq .Active "routes"}}class="active" aria-current="page"{{end}}>Routes</a>
 <a href="/server" {{if eq .Active "server"}}class="active" aria-current="page"{{end}}>Server</a>
 </nav>
 <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="quiet">Sign out</button></form>
@@ -76,9 +77,8 @@ const liveTableTmpl = `{{define "live-table"}}
 <td role="cell" class="live-state"><span data-status class="tag{{if eq $live.Status "active"}} ok{{else if .Revoked}} revoked{{end}}">{{statusLabel $live.Status}}</span><span class="sub" data-seen>{{seenAt $live.LastSeen}}</span></td>
 <td role="cell" class="rates numbers"><span class="mobile-label">Current speed</span><span data-rates>↑ — · ↓ —</span></td>
 <td role="cell" class="usage numbers"><span class="mobile-label">Total VPN traffic</span><strong data-total>{{byteSize (sum $live.Up $live.Down)}}</strong><span class="sub" data-breakdown>↑ {{byteSize $live.Up}} · ↓ {{byteSize $live.Down}}</span></td>
-<td role="cell" class="actions">{{if not .Revoked}}<a href="/clients/import?id={{.ID}}">Import config</a>
-{{if eq $.Active "clients"}}{{template "client-actions" (clientActions . $)}}{{else}}<span class="sub"><a href="/clients#client-{{.ID}}">Manage</a></span>{{end}}
-{{else}}<span class="sub">Access disabled</span>{{end}}</td></tr>
+<td role="cell" class="actions">{{if .Revoked}}<span class="sub">Access disabled</span>{{else}}<a href="/clients/import?id={{.ID}}">Import config</a>{{end}}
+{{if eq $.Active "clients"}}{{template "client-actions" (clientActions . $)}}{{else}}<span class="sub"><a href="/clients#client-{{.ID}}">Manage</a></span>{{end}}</td></tr>
 {{end}}
 </tbody></table></div>
 <p class="empty" data-no-matches hidden>No clients match your search.</p>
@@ -154,6 +154,7 @@ const clientsTmpl = `{{define "content"}}
 const clientActionsTmpl = `{{define "client-actions"}}
 {{$c := .Client}}
 <details><summary>Access &amp; actions</summary>
+{{if not $c.Revoked}}
 <form class="stack" method="post" action="/clients/policy">
 <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="id" value="{{$c.ID}}">
 <label>Internet<select name="internet">
@@ -178,6 +179,10 @@ const clientActionsTmpl = `{{define "client-actions"}}
 <form method="post" action="/clients/revoke" onsubmit="return confirm('Revoke access for this client?')">
 <input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="id" value="{{$c.ID}}">
 <button class="warn">Revoke access</button></form>
+{{end}}
+<form method="post" action="/clients/delete" onsubmit="return confirm('Permanently delete this client and its traffic history? The VPN address will be available for reuse.')">
+<input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="id" value="{{$c.ID}}">
+<button class="warn">Delete client</button></form>
 </details>
 {{end}}`
 
@@ -295,6 +300,8 @@ func init() {
 		"native":     nativeTmpl,
 		"groups":     groupsTmpl,
 		"group-edit": groupEditTmpl,
+		"routes":     routesTmpl,
+		"route-edit": routeEditTmpl,
 	} {
 		clone, err := layoutTmpl.Clone()
 		if err != nil {

@@ -25,14 +25,28 @@ type ControlRequest struct {
 	Mode     string   `json:"mode,omitempty"`
 	Balancer string   `json:"balancer,omitempty"`
 	Enabled  []string `json:"enabled,omitempty"`
+	Port     int      `json:"port,omitempty"`
+	RouteID  string   `json:"route_id,omitempty"`
 }
 
 type ControlResponse struct {
-	OK          bool                `json:"ok"`
-	Enabled     []string            `json:"enabled"`
-	Balancers   map[string][]string `json:"balancers,omitempty"`
-	Credentials *Credentials        `json:"credentials,omitempty"`
-	Error       string              `json:"error,omitempty"`
+	OK             bool                `json:"ok"`
+	Enabled        []string            `json:"enabled"`
+	Balancers      map[string][]string `json:"balancers,omitempty"`
+	Credentials    *Credentials        `json:"credentials,omitempty"`
+	Routes         []RouteOption       `json:"routes,omitempty"`
+	SelectedRoutes map[int]string      `json:"selected_routes,omitempty"`
+	P2P            bool                `json:"p2p"`
+	AutoMap        bool                `json:"auto_map"`
+	ServeEgress    bool                `json:"serve_egress"`
+	PeerPort       uint16              `json:"peer_port,omitempty"`
+	PeerEndpoint   string              `json:"peer_endpoint,omitempty"`
+	Error          string              `json:"error,omitempty"`
+}
+
+// RouteID returns the saved egress for port, or the implicit hub default.
+func (r ControlResponse) RouteID(port int) string {
+	return selectedRouteID(r.SelectedRoutes, port)
 }
 
 type clientControl struct {
@@ -47,6 +61,9 @@ func RunManaged(ctx context.Context, cfg ManagedConfig, realTUN bool, tunName st
 }
 
 func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath string, realTUN bool, tunName string, portBase int) error {
+	if err := cfg.validatePeerSettings(realTUN); err != nil {
+		return err
+	}
 	importCfg, err := config.ParseImportString(cfg.Import)
 	if err != nil {
 		return err
@@ -69,7 +86,7 @@ func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath st
 	if err := os.Chmod(socketPath, 0600); err != nil {
 		return err
 	}
-	m, err := newManagedAt(ctx, importCfg, cfg.Enabled, listenIP, cfg.Credentials, realTUN, tunName, portBase, cfg.Balancers)
+	m, err := newManagedAt(ctx, importCfg, cfg.Enabled, listenIP, cfg.Credentials, realTUN, tunName, portBase, cfg.Balancers, cfg.Routes)
 	if err != nil {
 		return err
 	}
@@ -89,6 +106,8 @@ func runManagedAt(ctx context.Context, cfg ManagedConfig, cfgPath, socketPath st
 		defer func() { stopWatch(); <-watchDone }()
 	}
 	defer m.Close()
+	m.applyRoutes(cfg.Routes)
+	m.startNetwork(cfg.P2P, cfg.AutoMap, cfg.ServeEgress, cfg.PeerPort, cfg.PeerEndpoint)
 	d := &clientControl{m: m, path: cfgPath, cfg: cfg}
 	if err := service.NotifyReady(); err != nil {
 		return err
@@ -132,27 +151,36 @@ func (d *clientControl) handle(req ControlRequest) ControlResponse {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	next := d.cfg
-	if err := next.update(req); err != nil {
+	options := d.m.RouteOptions()
+	if err := next.update(req, options, true); err != nil {
 		return ControlResponse{Error: err.Error()}
 	}
-	if req.mutates() {
+	if req.Op == "set-route" {
+		if err := next.Save(d.path); err != nil {
+			return ControlResponse{Error: err.Error()}
+		}
+		d.m.applyRoutes(next.Routes)
+		d.cfg = next
+	} else if req.mutates() {
 		if err := d.m.apply(next.Enabled, next.Credentials, next.Balancers, func() error { return next.Save(d.path) }); err != nil {
 			return ControlResponse{Error: err.Error()}
 		}
 		d.cfg = next
 	}
-	return next.response(req.Op)
+	r := next.response(req.Op)
+	r.Routes = options
+	return r
 }
 
 func (r ControlRequest) mutates() bool {
 	switch r.Op {
-	case "apply", "toggle", "rotate", "set-balancer":
+	case "apply", "toggle", "rotate", "set-balancer", "set-route":
 		return true
 	}
 	return false
 }
 
-func (c *ManagedConfig) update(req ControlRequest) error {
+func (c *ManagedConfig) update(req ControlRequest, options []RouteOption, running bool) error {
 	switch req.Op {
 	case "status", "show":
 	case "apply":
@@ -173,6 +201,27 @@ func (c *ManagedConfig) update(req ControlRequest) error {
 			modes = append(modes, req.Mode)
 		}
 		c.Enabled = modes
+	case "set-route":
+		if req.Port < ManagedPortBase || req.Port >= ManagedPortBase+len(config.ClientModes())+len(balancerPolicies) {
+			return fmt.Errorf("unknown SOCKS5 port %d", req.Port)
+		}
+		current := selectedRouteID(c.Routes, req.Port)
+		if req.RouteID == "" || running && !slices.ContainsFunc(options, func(option RouteOption) bool { return option.ID == req.RouteID }) {
+			return fmt.Errorf("egress route %q is not available", req.RouteID)
+		}
+		if !running && req.RouteID != current && req.RouteID != HubRouteID {
+			return errors.New("start the service to select another egress route")
+		}
+		if req.RouteID != current {
+			routes := make(map[int]string, len(c.Routes)+1)
+			maps.Copy(routes, c.Routes)
+			if req.RouteID == HubRouteID {
+				delete(routes, req.Port)
+			} else {
+				routes[req.Port] = req.RouteID
+			}
+			c.Routes = routes
+		}
 	case "set-balancer":
 		if !slices.Contains(balancerPolicies[:], req.Balancer) {
 			return fmt.Errorf("unknown SOCKS5 balancer %q", req.Balancer)
@@ -210,7 +259,11 @@ func (c *ManagedConfig) update(req ControlRequest) error {
 }
 
 func (c ManagedConfig) response(op string) ControlResponse {
-	r := ControlResponse{OK: true, Enabled: c.Enabled, Balancers: c.Balancers}
+	r := ControlResponse{
+		OK: true, Enabled: c.Enabled, Balancers: c.Balancers, SelectedRoutes: c.Routes,
+		P2P: c.P2P, AutoMap: c.AutoMap, ServeEgress: c.ServeEgress,
+		PeerPort: c.PeerPort, PeerEndpoint: c.PeerEndpoint,
+	}
 	if op == "show" || op == "rotate" {
 		r.Credentials = &c.Credentials
 	}

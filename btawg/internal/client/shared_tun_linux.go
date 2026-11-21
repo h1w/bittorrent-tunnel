@@ -1,6 +1,7 @@
 package client
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
+
+	"bittorrent-tunnel/btawg/internal/mesh"
 )
 
 const (
@@ -24,17 +27,23 @@ const (
 // a Linux device. SOCKS owns its source selectors while its kernel packets
 // drain; other traffic uses the lowest-index enabled transport.
 type sharedTUN struct {
-	dev     tun.Device
-	name    string
-	mtu     int
-	primary atomic.Pointer[tunPath]
-	pool    sync.Pool
-	workers sync.WaitGroup
-	done    chan struct{}
-	readErr error // published by closing done
+	dev         tun.Device
+	name        string
+	mtu         int
+	primary     atomic.Pointer[tunPath]
+	servicePath atomic.Pointer[tunPath]
+	pool        sync.Pool
+	workers     sync.WaitGroup
+	done        chan struct{}
+	readErr     error // published by closing done
 
-	mu    sync.RWMutex
-	ports map[localPort]*socketPath
+	mu            sync.RWMutex
+	ports         map[localPort]*socketPath
+	direct        map[netip.Addr]*tunPath
+	directRanges  []netip.Prefix
+	directGateway netip.Addr
+	directOwn     netip.Addr
+	directWanted  chan netip.Addr
 }
 
 type localPort struct {
@@ -49,12 +58,14 @@ type socketPath struct {
 }
 
 type tunPath struct {
-	shared  *sharedTUN
-	packets chan *[]byte
-	done    chan struct{}
-	events  chan tun.Event
-	mu      sync.Mutex // serialize close and enqueue
-	closed  bool
+	shared      *sharedTUN
+	directLife  context.Context
+	directUntil *atomic.Int64
+	packets     chan *[]byte
+	done        chan struct{}
+	events      chan tun.Event
+	mu          sync.Mutex // serialize close and enqueue
+	closed      bool
 }
 
 func newSharedTUN(dev tun.Device, name string, mtu int) *sharedTUN {
@@ -180,7 +191,32 @@ func (s *sharedTUN) packetPath(p []byte, hlen int) *tunPath {
 		owner := s.ports[key]
 		s.mu.RUnlock()
 		if owner != nil {
+			if !owner.path.validDirect() {
+				return nil
+			}
 			return owner.path
+		}
+	}
+	if primary := s.primary.Load(); primary == nil && p[9] == 6 && len(p) >= hlen+4 && binary.BigEndian.Uint16(p[hlen:]) == mesh.EgressPort {
+		return s.servicePath.Load()
+	}
+	if dst := netip.AddrFrom4([4]byte(p[16:20])); dst.IsValid() {
+		s.mu.RLock()
+		path := s.direct[dst]
+		if wanted := s.directWanted; wanted != nil && dst != s.directGateway && dst != s.directOwn {
+			for _, prefix := range s.directRanges {
+				if prefix.Contains(dst) {
+					select {
+					case wanted <- dst:
+					default:
+					}
+					break
+				}
+			}
+		}
+		s.mu.RUnlock()
+		if path != nil && path.validDirect() {
+			return path
 		}
 	}
 	return s.primary.Load()
@@ -222,6 +258,10 @@ func (p *tunPath) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			default:
 				return n, nil
 			}
+		}
+		if !p.validDirect() {
+			p.shared.pool.Put(b)
+			return n, net.ErrClosed
 		}
 		packet := (*b)[packetHeadroom:]
 		if len(packet) > len(bufs[n])-offset {

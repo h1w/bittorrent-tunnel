@@ -5,8 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"os"
 
+	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/mesh"
 	"bittorrent-tunnel/btawg/internal/service"
 )
 
@@ -17,9 +20,17 @@ const ManagedConfigPath = "/etc/btawg/client.json"
 // TUI control.
 const ControlSocketPath = "/run/btawg-client/control.sock"
 
-// ManagedConfig is the durable client state: the import secret, the enabled
-// connection modes, the SOCKS5 bind address, and the shared credentials. It
-// lives under /etc/btawg and survives upgrades and restarts.
+// HubRouteID names the server egress and is the default for unconfigured ports.
+const HubRouteID = mesh.HubRoute
+
+// RouteOption is one egress route currently permitted by the hub.
+type RouteOption struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// ManagedConfig is the root-owned client configuration and persists across
+// upgrades and restarts.
 type ManagedConfig struct {
 	Import      string      `json:"import"`
 	Enabled     []string    `json:"enabled"`
@@ -29,6 +40,40 @@ type ManagedConfig struct {
 	TUNName     string      `json:"tun_name,omitempty"`
 	// A missing balancer pool follows Enabled; an empty list routes nothing.
 	Balancers map[string][]string `json:"balancers,omitempty"`
+	// Missing entries use the hub; explicit choices survive catalogue changes.
+	Routes       map[int]string `json:"routes,omitempty"`
+	P2P          bool           `json:"p2p,omitempty"`
+	AutoMap      bool           `json:"auto_map,omitempty"`
+	ServeEgress  bool           `json:"serve_egress,omitempty"`
+	PeerPort     uint16         `json:"peer_port,omitempty"` // zero lets the OS allocate a port
+	PeerEndpoint string         `json:"peer_endpoint,omitempty"`
+}
+
+func selectedRouteID(routes map[int]string, port int) string {
+	if id := routes[port]; id != "" {
+		return id
+	}
+	return HubRouteID
+}
+
+var globalIPv6 = netip.MustParsePrefix("2000::/3")
+
+func (c ManagedConfig) validatePeerSettings(realTUN bool) error {
+	if c.P2P && (!realTUN || c.NoTUN) {
+		return fmt.Errorf("direct peer connections require a TUN interface")
+	}
+	if c.AutoMap && !c.P2P {
+		return fmt.Errorf("automatic peer port mapping requires P2P")
+	}
+	if c.PeerEndpoint != "" {
+		endpoint, err := netip.ParseAddrPort(c.PeerEndpoint)
+		ip := endpoint.Addr()
+		if err != nil || endpoint.Port() == 0 || ip.Zone() != "" || ip.Is4In6() ||
+			!config.PublicIPv4(ip) && !globalIPv6.Contains(ip) {
+			return fmt.Errorf("public P2P UDP address must be a public IPv4 or global IPv6 address with a nonzero port")
+		}
+	}
+	return nil
 }
 
 // LoadManagedConfig reads the client configuration from path.
@@ -46,6 +91,9 @@ func LoadManagedConfig(path string) (ManagedConfig, error) {
 
 // Save writes the configuration atomically with root-only permissions.
 func (c ManagedConfig) Save(path string) error {
+	if err := c.validatePeerSettings(!c.NoTUN); err != nil {
+		return err
+	}
 	b, err := json.MarshalIndent(c, "", "  ")
 	if err != nil {
 		return err

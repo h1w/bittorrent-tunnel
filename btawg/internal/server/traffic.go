@@ -37,6 +37,8 @@ func (s *Server) Traffic() map[string]store.Traffic {
 // flushTraffic is called by the sampler, then on shutdown after the sampler
 // and both device engines have stopped. Failed commits leave records dirty.
 func (s *Server) flushTraffic() error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 	changed := s.Traffic()
 	for id, v := range changed {
 		if v == s.savedTraffic[id] {

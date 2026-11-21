@@ -29,12 +29,13 @@ type Action struct {
 	Run     func() (*Screen, error)
 }
 
-// Screen is a document (optionally acknowledged) or a setup form. Secret
-// fields are never rendered, including when pasted into the terminal.
+// Screen is a choice list, a document (optionally acknowledged), or a setup
+// form. Secret fields are never rendered, including when pasted into the terminal.
 type Screen struct {
 	Title   string
 	Text    string
 	Fields  []Field
+	Choices []Action // an alternative to a form or document
 	Submit  string
 	Save    func([]Field) (*Screen, error)
 	Dismiss func() error
@@ -104,6 +105,7 @@ type dashboard struct {
 	newRelease     string
 
 	screen    *Screen
+	history   []*Screen
 	confirm   *Action
 	message   string
 	selection int
@@ -191,10 +193,14 @@ func (d *dashboard) receive(u update) {
 	case u.err != nil:
 		d.message = "Error: " + u.err.Error()
 	case u.screen != nil:
+		if d.screen != nil && len(d.screen.Choices) > 0 {
+			d.history = append(d.history, d.screen)
+		}
 		d.open(u.screen)
 	case u.operation != "":
-		if d.screen != nil && d.screen.Save != nil {
+		if d.screen != nil && (d.screen.Save != nil || len(d.screen.Choices) > 0) {
 			d.open(nil)
+			d.history = nil
 		}
 		d.message = u.operation + ": done"
 	}
@@ -272,7 +278,10 @@ func (d *dashboard) activate() {
 		return
 	}
 	if s := d.screen; s != nil {
-		if s.Save == nil {
+		if len(s.Choices) > 0 {
+			a := s.Choices[d.selection]
+			d.run(a.Label, a.Run)
+		} else if s.Save == nil {
 			if s.Dismiss != nil {
 				if err := s.Dismiss(); err != nil {
 					d.message = "Error: " + err.Error()
@@ -318,7 +327,13 @@ func (d *dashboard) back() {
 		d.app.Stop()
 		return
 	}
-	d.open(nil)
+	if n := len(d.history); n > 0 {
+		d.open(d.history[n-1])
+		d.history[n-1] = nil
+		d.history = d.history[:n-1]
+	} else {
+		d.open(nil)
+	}
 	d.message = ""
 }
 
@@ -326,6 +341,8 @@ func (d *dashboard) move(delta int) {
 	switch {
 	case d.confirm != nil:
 		d.offset = clamp(d.offset+delta, 1)
+	case d.screen != nil && len(d.screen.Choices) > 0:
+		d.selection = clamp(d.selection+delta, len(d.screen.Choices)-1)
 	case d.screen != nil && d.screen.Save == nil:
 		d.offset = max(0, d.offset+delta)
 	case d.screen != nil:
@@ -396,7 +413,7 @@ func (d *dashboard) key(e tui.KeyEvent) {
 				case !f.Toggle && !e.Mod.Has(tui.ModCtrl|tui.ModAlt) && unicode.IsPrint(e.Rune) && len(f.Value) < 16384:
 					f.Value += string(e.Rune)
 				}
-			} else if e.Rune == ' ' && d.screen == nil {
+			} else if e.Rune == ' ' && (d.screen == nil || len(d.screen.Choices) > 0) {
 				d.activate()
 			}
 		}
@@ -420,7 +437,7 @@ func (d *dashboard) HandleMouse(e tui.MouseEvent) bool {
 				} else {
 					d.selection = h.index
 				}
-				if d.screen == nil || d.selection >= len(d.screen.Fields) || d.screen.Fields[d.selection].Toggle {
+				if d.screen == nil || len(d.screen.Choices) > 0 || d.selection >= len(d.screen.Fields) || d.screen.Fields[d.selection].Toggle {
 					d.activate()
 				}
 				d.app.MarkDirty()
@@ -495,7 +512,20 @@ func (d *dashboard) Render(app *tui.App) *tui.Element {
 		s := d.screen
 		main.AddChild(line(s.Title, heading))
 		text := wrap(s.Text, max(1, width-2))
-		if s.Save == nil {
+		if len(s.Choices) > 0 {
+			helpLines := min(len(text), 2, max(0, room-2))
+			for _, row := range text[:helpLines] {
+				main.AddChild(line(row, muted))
+			}
+			from, to := d.window(len(s.Choices), max(1, room-1-helpLines))
+			for i := from; i < to; i++ {
+				d.addChoice(main, s.Choices[i].Label, i, i == d.selection)
+			}
+			footer = "↑/↓ Move  •  Enter / Space Select  •  Esc Back"
+			if from > 0 || to < len(s.Choices) {
+				footer = fmt.Sprintf("%d/%d  •  %s", d.selection+1, len(s.Choices), footer)
+			}
+		} else if s.Save == nil {
 			limit := max(1, room-1)
 			d.offset = clamp(d.offset, len(text)-limit)
 			for _, row := range text[d.offset:min(len(text), d.offset+limit)] {

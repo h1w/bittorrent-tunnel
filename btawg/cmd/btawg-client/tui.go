@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 
 	"bittorrent-tunnel/btawg/internal/client"
@@ -57,6 +58,11 @@ func clientSetup(install bool) (*service.Screen, error) {
 			{Label: "SOCKS5 listen IPv4", Value: cfg.ListenIP},
 			{Label: "TUN interface name", Value: cfg.TUNName},
 			{Label: "Userspace only (no TUN)", Toggle: true, Checked: cfg.NoTUN},
+			{Label: "Allow direct peer connections (P2P)", Toggle: true, Checked: cfg.P2P},
+			{Label: "Automatically map the peer UDP port", Toggle: true, Checked: cfg.AutoMap},
+			{Label: "Allow serving assigned egress routes", Toggle: true, Checked: cfg.ServeEgress},
+			{Label: "P2P listen port (0 = automatic)", Value: strconv.Itoa(int(cfg.PeerPort))},
+			{Label: "Public P2P UDP address (optional)", Value: cfg.PeerEndpoint},
 		},
 		Save: func(fields []service.Field) (*service.Screen, error) {
 			state, _, err := service.Client.State()
@@ -72,7 +78,16 @@ func clientSetup(install bool) (*service.Screen, error) {
 			} else if !errors.Is(err, os.ErrNotExist) {
 				return nil, err
 			}
-			if err := saveClientSettings(previous, fields[0].Value, fields[1].Value, fields[3].Checked, fields[2].Value); err != nil {
+			port, err := parsePeerPort(fields[7].Value)
+			if err != nil {
+				return nil, err
+			}
+			settings := client.ManagedConfig{
+				ListenIP: fields[1].Value, TUNName: fields[2].Value, NoTUN: fields[3].Checked,
+				P2P: fields[4].Checked, AutoMap: fields[5].Checked, ServeEgress: fields[6].Checked,
+				PeerPort: port, PeerEndpoint: fields[8].Value,
+			}
+			if err := saveClientSettings(previous, fields[0].Value, settings); err != nil {
 				return nil, err
 			}
 			if install {
@@ -83,13 +98,21 @@ func clientSetup(install bool) (*service.Screen, error) {
 	}, nil
 }
 
-func saveClientSettings(previous *client.ManagedConfig, raw, listen string, noTUN bool, tun string) error {
-	raw, listen, tun = strings.TrimSpace(raw), strings.TrimSpace(listen), strings.TrimSpace(tun)
+func parsePeerPort(raw string) (uint16, error) {
+	port, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 16)
+	if err != nil {
+		return 0, errors.New("P2P listen port must be between 0 and 65535")
+	}
+	return uint16(port), nil
+}
+
+func saveClientSettings(previous *client.ManagedConfig, raw string, settings client.ManagedConfig) error {
+	raw, listen, tun := strings.TrimSpace(raw), strings.TrimSpace(settings.ListenIP), strings.TrimSpace(settings.TUNName)
 	ip, err := netip.ParseAddr(listen)
 	if err != nil || !ip.Is4() {
 		return errors.New("SOCKS5 listen address must be IPv4")
 	}
-	if !noTUN {
+	if !settings.NoTUN {
 		if err := service.ValidateInterface(tun, 15); err != nil {
 			return err
 		}
@@ -117,7 +140,9 @@ func saveClientSettings(previous *client.ManagedConfig, raw, listen string, noTU
 			return err
 		}
 	}
-	next.ListenIP, next.TUNName, next.NoTUN = ip.String(), tun, noTUN
+	next.ListenIP, next.TUNName, next.NoTUN = ip.String(), tun, settings.NoTUN
+	next.P2P, next.AutoMap, next.ServeEgress = settings.P2P, settings.AutoMap, settings.ServeEgress
+	next.PeerPort, next.PeerEndpoint = settings.PeerPort, strings.TrimSpace(settings.PeerEndpoint)
 	return next.Save(client.ManagedConfigPath)
 }
 
@@ -129,25 +154,46 @@ func clientActions(_ string) ([]service.Action, error) {
 	if err != nil {
 		return nil, err
 	}
+	return append(portActions(status, running),
+		service.Action{Label: "Show SOCKS5 credentials", Run: func() (*service.Screen, error) { return socksCredentials("show") }},
+		service.Action{Label: "Rotate SOCKS5 credentials", Confirm: "Replace the login and password for all ports? Existing SOCKS5 sessions will close.", Run: func() (*service.Screen, error) { return socksCredentials("rotate") }},
+	), nil
+}
+
+func portActions(status client.ControlResponse, running bool) []service.Action {
 	modes := config.ClientModes()
 	policies := client.BalancerPorts()
 	actions := make([]service.Action, 0, len(modes)+len(policies)+2)
 	for i, mode := range modes {
+		port := client.ManagedPortBase + i
 		checked, state := "[ ]", "off"
 		if running {
 			state = "reserved"
 		}
-		if slices.Contains(status.Enabled, mode) {
+		enabled := slices.Contains(status.Enabled, mode)
+		if enabled {
 			checked, state = "[x]", "enabled on start"
 			if running {
 				state = "enabled"
 			}
 		}
 		actions = append(actions, service.Action{
-			Label: fmt.Sprintf("%s %d  %-22s %s", checked, client.ManagedPortBase+i, mode, state),
+			Label: fmt.Sprintf("%s %d  %-22s %s  •  %s", checked, port, mode, state, routeLabel(status, port, running)),
 			Run: func() (*service.Screen, error) {
-				_, _, err := client.RequestControl(client.ControlRequest{Op: "toggle", Mode: mode})
-				return nil, err
+				toggle := "Enable tunnel"
+				if enabled {
+					toggle = "Disable tunnel"
+				}
+				return &service.Screen{
+					Title: fmt.Sprintf("SOCKS5 %d — %s", port, mode),
+					Choices: []service.Action{
+						{Label: toggle, Run: func() (*service.Screen, error) {
+							_, _, err := client.RequestControl(client.ControlRequest{Op: "toggle", Mode: mode})
+							return nil, err
+						}},
+						routeAction(port, status, running),
+					},
+				}, nil
 			},
 		})
 	}
@@ -159,14 +205,86 @@ func clientActions(_ string) ([]service.Action, error) {
 			pool = status.Enabled
 		}
 		actions = append(actions, service.Action{
-			Label: fmt.Sprintf("    %d  %-22s %d/%d tunnels", port, label, len(pool), len(modes)),
-			Run:   func() (*service.Screen, error) { return balancerSettings(port, label, policy) },
+			Label: fmt.Sprintf("    %d  %-22s %d/%d tunnels  •  %s", port, label, len(pool), len(modes), routeLabel(status, port, running)),
+			Run: func() (*service.Screen, error) {
+				return &service.Screen{
+					Title: fmt.Sprintf("SOCKS5 %d — %s", port, label),
+					Choices: []service.Action{
+						{Label: "Configure tunnels", Run: func() (*service.Screen, error) { return balancerSettings(port, label, policy) }},
+						routeAction(port, status, running),
+					},
+				}, nil
+			},
 		})
 	}
-	return append(actions,
-		service.Action{Label: "Show SOCKS5 credentials", Run: func() (*service.Screen, error) { return socksCredentials("show") }},
-		service.Action{Label: "Rotate SOCKS5 credentials", Confirm: "Replace the login and password for all ports? Existing SOCKS5 sessions will close.", Run: func() (*service.Screen, error) { return socksCredentials("rotate") }},
-	), nil
+	return actions
+}
+
+func routeLabel(status client.ControlResponse, port int, running bool) string {
+	id := status.RouteID(port)
+	if i := slices.IndexFunc(status.Routes, func(opt client.RouteOption) bool { return opt.ID == id }); i >= 0 {
+		return status.Routes[i].Name
+	}
+	if id == client.HubRouteID {
+		id = "Server default"
+	}
+	if running {
+		return "unavailable: " + id
+	}
+	return "offline: " + id
+}
+
+func routeChoices(status client.ControlResponse, port int, running bool) []client.RouteOption {
+	if running {
+		return status.Routes
+	}
+	if status.RouteID(port) != client.HubRouteID {
+		return []client.RouteOption{{ID: client.HubRouteID, Name: "Reset to server default"}}
+	}
+	return nil
+}
+
+func routeAction(port int, status client.ControlResponse, running bool) service.Action {
+	return service.Action{
+		Label: "Egress route: " + routeLabel(status, port, running),
+		Run: func() (*service.Screen, error) {
+			status, running, err := client.RequestControl(client.ControlRequest{Op: "status"})
+			if err != nil {
+				return nil, err
+			}
+			opts := routeChoices(status, port, running)
+			s := &service.Screen{
+				Title: fmt.Sprintf("SOCKS5 %d — Egress route", port),
+				Text:  "Selected: " + routeLabel(status, port, running),
+			}
+			switch {
+			case !running:
+				s.Text += "\nStart the service to see permitted routes."
+			case len(opts) == 0:
+				s.Text += "\nNo permitted routes are currently available."
+			}
+			s.Choices = make([]service.Action, 0, len(opts))
+			selected := status.RouteID(port)
+			for _, opt := range opts {
+				name := opt.Name
+				if running {
+					name += " (" + opt.ID + ")"
+				}
+				checked := "[ ] "
+				if opt.ID == selected {
+					checked = "[x] "
+				}
+				s.Choices = append(s.Choices, service.Action{
+					Label: checked + name,
+					Run: func() (*service.Screen, error) {
+						_, _, err := client.RequestControl(client.ControlRequest{Op: "set-route", Port: port, RouteID: opt.ID})
+						return nil, err
+					},
+				})
+			}
+			return s, nil
+		},
+	}
 }
 
 func balancerSettings(port int, label, policy string) (*service.Screen, error) {

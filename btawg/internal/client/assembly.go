@@ -31,29 +31,35 @@ type managedTunnel struct {
 
 // Managed runs independent data paths with fixed SOCKS ports and one VPN IP.
 type Managed struct {
-	inbound *managed
-	cfg     config.ClientConfig
-	shared  *sharedTUN
-	route   *tunsetup.ProxyRoute
-	mu      sync.Mutex
-	tunnels []*managedTunnel
-	fixed   []string
-	pools   map[string][]string
-	balance [len(balancerPolicies)]balancer
-	auth    Credentials
-	closed  bool
+	inbound   *managed
+	cfg       config.ClientConfig
+	shared    *sharedTUN
+	route     *tunsetup.ProxyRoute
+	mu        sync.Mutex
+	tunnels   []*managedTunnel
+	fixed     []string
+	pools     map[string][]string
+	balance   [len(balancerPolicies)]balancer
+	auth      Credentials
+	closed    bool
+	network   meshNode
+	networkWG sync.WaitGroup
 }
 
 func NewManaged(ctx context.Context, cfg config.ClientConfig, enabled []string, listenIP netip.Addr, auth Credentials, realTUN bool, tunBase string) (*Managed, error) {
 	return newManagedAt(ctx, cfg, enabled, listenIP, auth, realTUN, tunBase, ManagedPortBase, nil)
 }
 
-func newManagedAt(ctx context.Context, cfg config.ClientConfig, enabled []string, listenIP netip.Addr, auth Credentials, realTUN bool, tunBase string, portBase int, pools map[string][]string) (*Managed, error) {
+func newManagedAt(ctx context.Context, cfg config.ClientConfig, enabled []string, listenIP netip.Addr, auth Credentials, realTUN bool, tunBase string, portBase int, pools map[string][]string, routes ...map[int]string) (*Managed, error) {
 	inbound, err := newManaged(ctx, listenIP, portBase)
 	if err != nil {
 		return nil, err
 	}
 	m := &Managed{inbound: inbound, cfg: cfg, tunnels: make([]*managedTunnel, len(config.ClientModes()))}
+	m.network.owner, m.network.ctx = m, inbound.ctx
+	if len(routes) != 0 {
+		m.applyRoutes(routes[0])
+	}
 	for i, policy := range balancerPolicies {
 		m.balance[i].policy = policy
 	}
@@ -181,7 +187,9 @@ func (m *Managed) applyLocked(enabled []string, auth Credentials, pools map[stri
 				primary = tunnel.c.path
 			}
 			if !wasFixed || rotated {
-				m.inbound.replace(i, tunnel.c.localProxy().WithCredentials(auth.Username, auth.Password))
+				m.inbound.replace(i, socks.NewBalancer(func() (*socks.Server, context.Context) {
+					return m.network.selectProxy(ManagedPortBase+i, tunnel)
+				}).WithCredentials(auth.Username, auth.Password))
 			}
 		} else if wasFixed {
 			m.inbound.replace(i, nil)
@@ -213,7 +221,9 @@ func (m *Managed) applyLocked(enabled []string, auth Credentials, pools map[stri
 		b := &m.balance[i]
 		b.replace(paths)
 		if rotated {
-			m.inbound.replace(len(modes)+i, socks.NewBalancer(b.upstream).WithCredentials(auth.Username, auth.Password))
+			m.inbound.replace(len(modes)+i, socks.NewBalancer(func() (*socks.Server, context.Context) {
+				return m.network.selectProxy(ManagedPortBase+len(modes)+i, b.pick())
+			}).WithCredentials(auth.Username, auth.Password))
 		}
 	}
 	for i, mode := range modes {
@@ -229,6 +239,13 @@ func (m *Managed) applyLocked(enabled []string, auth Credentials, pools map[stri
 		}
 	}
 	m.auth, m.fixed, m.pools = auth, slices.Clone(enabled), pools
+	var paths []*managedTunnel
+	for _, t := range m.tunnels {
+		if t != nil {
+			paths = append(paths, t)
+		}
+	}
+	m.network.paths.Store(&paths)
 	return nil
 }
 
@@ -278,6 +295,7 @@ func (m *Managed) Close() error {
 		m.shared.primary.Store(nil)
 	}
 	m.inbound.Close()
+	m.networkWG.Wait()
 	for _, t := range m.tunnels {
 		if t != nil {
 			t.close()

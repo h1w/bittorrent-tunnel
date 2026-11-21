@@ -250,6 +250,11 @@ func (s *Store) RevokeClient(id string) error {
 			return err
 		}
 		NormalizeClientRecord(&rec)
+		if !rec.Revoked {
+			if err := invalidateEgressClientTx(tx, id); err != nil {
+				return err
+			}
+		}
 		rec.Revoked = true
 		return b.Put([]byte(id), mustJSON(rec))
 	})
@@ -262,8 +267,18 @@ func (s *Store) SaveClient(rec ClientRecord) error {
 	NormalizeClientRecord(&rec)
 	return s.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketClients)
-		if b.Get([]byte(rec.ID)) == nil {
+		raw := b.Get([]byte(rec.ID))
+		if raw == nil {
 			return ErrNotFound
+		}
+		var previous ClientRecord
+		if err := json.Unmarshal(raw, &previous); err != nil {
+			return err
+		}
+		if previous.PubKey != rec.PubKey || previous.PrivKey != rec.PrivKey || previous.PeerID != rec.PeerID || !previous.Created.Equal(rec.Created) || previous.Revoked != rec.Revoked {
+			if err := invalidateEgressClientTx(tx, rec.ID); err != nil {
+				return err
+			}
 		}
 		gRaw := tx.Bucket(bucketGroups).Get([]byte(rec.GroupID))
 		if gRaw == nil {
@@ -280,13 +295,23 @@ func (s *Store) SaveClient(rec ClientRecord) error {
 	})
 }
 
-// DeleteClient removes a client record permanently.
+// DeleteClient permanently removes a client record and its traffic history.
 func (s *Store) DeleteClient(id string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		if tx.Bucket(bucketClients).Get([]byte(id)) == nil {
+		key := []byte(id)
+		clients := tx.Bucket(bucketClients)
+		if clients.Get(key) == nil {
 			return ErrNotFound
 		}
-		return tx.Bucket(bucketClients).Delete([]byte(id))
+		if b := tx.Bucket(bucketTraffic); b != nil {
+			if err := b.Delete(key); err != nil {
+				return err
+			}
+		}
+		if err := invalidateEgressClientTx(tx, id); err != nil {
+			return err
+		}
+		return clients.Delete(key)
 	})
 }
 
@@ -380,6 +405,9 @@ func (s *Store) DeleteGroup(id string) error {
 		}
 		if count > 0 {
 			return ErrGroupNotEmpty
+		}
+		if err := invalidateEgressGroupTx(tx, id); err != nil {
+			return err
 		}
 		return b.Delete([]byte(id))
 	})

@@ -11,6 +11,7 @@ import (
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun"
 	"golang.org/x/net/ipv4"
 
+	"bittorrent-tunnel/btawg/internal/mesh"
 	"bittorrent-tunnel/btawg/internal/tunneldns"
 )
 
@@ -463,17 +464,17 @@ func (e *engineTun) Write(bufs [][]byte, offset int) (int, error) {
 // pinReverseFlow records that return traffic for packet belongs to this
 // engine. For fragmented packets the IP ID is also pinned so all fragments
 // follow the same path.
-// It reports a DNS flow, which already has a return path and must not make
-// periodic health probes the preferred route for unrelated traffic.
-func (e *engineTun) pinReverseFlow(packet []byte, now time.Time) (dns bool) {
+// It reports a hub service flow, which already has a return path and must
+// not let periodic health/control requests change unrelated routes.
+func (e *engineTun) pinReverseFlow(packet []byte, now time.Time) (service bool) {
 	if key, ok := flowKeyFromPacket(packet); ok {
 		e.router.flows.pin(key.reverse(), e, now)
-		dns = key.proto == 6 && key.b == tunneldns.Port
+		service = key.proto == 6 && (key.b == tunneldns.Port || key.b == mesh.ControlPort || key.b == mesh.RelayPort)
 	}
 	if fragKey, ok := fragmentKeyFromPacket(packet); ok {
 		e.router.flows.pinFragment(fragKey, e)
 	}
-	return dns
+	return service
 }
 
 // lookupClientEngine selects the engine that should receive a

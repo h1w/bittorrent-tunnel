@@ -106,13 +106,13 @@ UDP association. Existing sessions do not switch tunnels mid-stream.
 | 1091 | Round-robin | Next reachable tunnel in rotation |
 | 1092 | Adaptive | Keeps the current reachable tunnel unless another is consistently better |
 
-In the client dashboard, open a balancer's row, check any of the ten tunnels,
-and select **Save tunnel selection**. Each pool is saved separately and updated
-without restarting the service. Until customized, a pool follows the enabled
+In the client dashboard, open a balancer's row, choose **Configure tunnels**,
+check any of the ten tunnels, and select **Save tunnel selection**.
+Each pool is saved separately and updated without restarting the service. Until customized, a pool follows the enabled
 fixed modes. A custom pool can use a tunnel even if its fixed port is off.
 Uncheck all tunnels to stop forwarding on that balancer; the port remains
-reserved. Only new sessions can use a different tunnel. All three ports use
-the same hub and Internet exit IP and do not balance ordinary TUN traffic.
+reserved. Only new sessions can use a different tunnel. A balancer switches
+transports, never the selected Internet route. It does not balance ordinary TUN traffic.
 
 In **Failover**, highlight a tunnel and press **-** to move it up or **+** to
 move it down. Only checked rows count: the highest working one gets new
@@ -127,9 +127,9 @@ its replacement needs a fresh successful probe. Native AWG/WG still relies
 on background probes to detect loss of reachability. SOCKS5 requests do not
 run or wait for additional checks.
 
-Balancers test each candidate over the tunnel against the hub's overlay DNS
-TCP port (1053); no external website or DNS lookup is used. If no selected path
-answers, new SOCKS5 requests fail rather than using the host connection.
+Balancers test the tunnel against the hub's overlay control port (1054/TCP),
+or the overlay DNS port (1053/TCP) on an older hub. No external website or
+DNS lookup is used. If no selected path answers, new SOCKS5 requests fail.
 The hub still learns a return path for unsolicited VPN traffic from authenticated
 tunnel activity, so a newly connected path can receive new peer-initiated flows.
 Replies to established SOCKS flows stay pinned to their original path.
@@ -196,6 +196,12 @@ overridden. The hub gives the user the same address in all ten modes.
 Permission changes apply live, including closing disallowed active SOCKS
 sessions. A move to another subnet or a changed group CIDR needs a new
 import. Denied peer traffic is silently dropped.
+
+**Revoke access** disables the client's key but keeps the record and VPN
+address reserved. **Delete client** under **Clients → Access & actions**
+permanently removes either an active or a revoked client and its traffic
+history. The hub retires the old credentials before the address can be
+allocated again.
 
 ### Troubleshooting
 
@@ -291,12 +297,45 @@ usable in the original modes; there is no TLS-to-AWG fallback.
 
 ### Client-to-client
 
-Clients form a local network on the overlay: dial another client's
-`10.77.0.x` address directly (the hub re-encrypts packets between carriers,
-like kernel WireGuard's ip_forward). In netstack mode use
-`Client.OverlayDialTCP`; on a real TUN the kernel routes overlay addresses
-through `btawg0`. Use direct VPN IP traffic for LAN services; the client
-SOCKS5 proxy is for public IPv4 destinations only.
+Dial another client's VPN IPv4 address for peer services. Both ends must allow
+each other under the hub's peer ACL. The existing hub-relayed path still works
+between heterogeneous transports. Managed clients with a Linux TUN can also
+enable **Allow direct peer connections (P2P)** in **Service settings**, then
+restart. When both peers opt in and a path is authenticated, VPN packets can
+travel over direct AWG + BitTorrent extended µTP without changing either VPN IP.
+
+The hub introduces allowed pairs using their reachable LAN/public candidates,
+optional manual public UDP endpoint, global IPv6 or an address observed from
+the same UDP socket for hole punching. **Automatically map the peer UDP port**
+opts in to PCP, NAT-PMP and UPnP IGD; these cannot guarantee reachability
+through CGNAT. For a manual forward, set the client's **P2P listen port** and
+**Public P2P UDP address**. The automatic listen port tries UDP 6881–6889
+then an ephemeral port. DHT discovers the hub, not clients. Direct paths lose
+authorization if the hub cannot renew their short leases. Public peer addresses
+are shared with the authorized counterpart, not with the public DHT. Keep
+host firewall rules under operator control.
+
+### Select a client exit or cascade
+
+1. On each participating device, enable **Allow serving assigned egress routes**
+   in **Service settings** and restart. This exposes only the VPN-side service.
+2. In the server panel's **Routes** page, grant **Exit** or **Transit** to the
+   intended devices. Create a named route with an exit and an optional first
+   transit, then allow specific clients and/or groups. An empty audience grants
+   no access. The hub's Internet setting controls only the central server exit.
+3. In the client TUI, open any SOCKS5 port (1080–1092) and choose **Egress route**.
+   The selected ID persists per port. Each new TCP connection or UDP association
+   uses that exact route; the final node resolves hostnames and opens public
+   IPv4 destinations. Ordinary host Internet traffic is unchanged.
+
+The same authorized hop may use a direct path or relay through the hub. If the
+required hop or exit fails, no other exit or country is substituted. Active
+route sessions are closed on permission withdrawal or lease expiry. The
+transit is trusted and may see destinations; this is not an anonymity service.
+Control and relay listen on 1054/TCP and 1056/TCP on the hub TUN only. An
+egress node listens on 1055/TCP on the VPN only. If a host firewall filters
+the TUN, permit these ports on that interface; do not expose them on WAN.
+Update hub and clients for the new features; old imports continue working.
 
 ## Routing policy and groups
 
@@ -306,11 +345,11 @@ visibility and user exceptions are mutual: both endpoints must allow the
 other. Different transports do not create separate IP networks. These are
 routed IPv4 networks, not shared Ethernet segments.
 
-The hub enforces the policy after VPN authentication, on both overlay
-routing and internet egress. Internet can only use the central server.
-A real-TUN hub routes IPv4 through scoped NAT. Clients can use SOCKS5 with
-either a kernel TUN or `-no-tun`; a hub started with `-no-tun` is overlay-only
-and does not provide Internet egress or DNS. The client never installs a
+The hub enforces overlay policy and authorizes named egress routes separately.
+A real-TUN hub routes its own IPv4 exit through scoped NAT and serves overlay
+DNS. A `-no-tun` hub can coordinate and relay named routes but is not itself an
+Internet exit. Kernel and userspace clients can use named exits, but direct P2P
+requires a client kernel TUN. The client never installs a
 system-wide default route. Standalone WG/AWG users must add the desired
 public prefixes to `AllowedIPs` and the OS routes for Internet access.
 
@@ -420,12 +459,10 @@ one run below that threshold.
 - DHT discovery depends on bootstrap reachability; if a network blocks the
   public DHT, point both sides at a private bootstrap island with
   `-dht-bootstrap` (hub) and the import string's `dht_bootstrap` field.
-- The announced IP is the source address the DHT observes; a hub behind NAT
-  must forward 6881/udp. Clients work behind any NAT with no setup — their
-  traffic is purely outbound.
-- The hub needs a public IP (or that forward): client-to-client traffic
-  always routes through the hub, so there is no direct client↔client NAT
-  traversal in this MVP.
+- DHT returns the address observed by a DHT node; a NAT'd hub needs a
+  reachable public forwarding port. A client does not need an inbound port
+  to use the hub. Direct peer paths are opportunistic; a restrictive NAT or
+  firewall can leave the hub as the only viable path.
 - A local latency benchmark is not a WAN throughput guarantee. Measure raw
   TCP to the same hub in both directions and compare it with completed SOCKS
   transfers of the same size. A speed test to a different host is not a

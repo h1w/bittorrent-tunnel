@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync"
 	"sync/atomic"
 )
 
@@ -21,10 +22,22 @@ type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 // raw datagrams to arbitrary destinations and receives raw datagrams back.
 type DialUDPFunc func(ctx context.Context) (net.PacketConn, error)
 
+// NamedUDPConn exchanges UDP payloads without resolving outbound names in
+// the SOCKS server. Each reply carries the source IP and port.
+type NamedUDPConn interface {
+	ReadPacket([]byte) (int, netip.AddrPort, error)
+	WritePacket(host string, port uint16, data []byte) error
+	Close() error
+}
+
+// DialNamedUDPFunc opens an association and returns only after it is ready.
+type DialNamedUDPFunc func(context.Context) (NamedUDPConn, error)
+
 // Server is a SOCKS5 server with optional RFC 1929 authentication.
 type Server struct {
 	dial               DialFunc
 	dialUDP            DialUDPFunc
+	dialNamedUDP       DialNamedUDPFunc
 	resolveUDP         func(context.Context, netip.Addr, string) (netip.Addr, error)
 	selectUpstream     func() (*Server, context.Context)
 	greetingMethod     byte
@@ -34,6 +47,11 @@ type Server struct {
 // NewServer builds a local SOCKS5 server with the given upstream dialers.
 func NewServer(dial DialFunc, dialUDP DialUDPFunc) *Server {
 	return &Server{dial: dial, dialUDP: dialUDP}
+}
+
+// NewNamedUDPServer builds a proxy that sends UDP names to its upstream.
+func NewNamedUDPServer(dial DialFunc, dialUDP DialNamedUDPFunc) *Server {
+	return &Server{dial: dial, dialNamedUDP: dialUDP}
 }
 
 // NewBalancer admits SOCKS requests using its own credentials, then selects
@@ -154,7 +172,7 @@ func boundLoopbackBuffers(c net.Conn) {
 }
 
 func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ target) {
-	if s.dialUDP == nil {
+	if s.dialUDP == nil && s.dialNamedUDP == nil {
 		writeReply(c, replyCommandUnsupported)
 		return
 	}
@@ -169,38 +187,76 @@ func (s *Server) handleUDPAssociate(ctx context.Context, c net.Conn, _ target) {
 		return
 	}
 	defer relay.Close()
-	upstream, err := s.dialUDP(ctx)
+	var upstream net.PacketConn
+	var named NamedUDPConn
+	if s.dialNamedUDP != nil {
+		named, err = s.dialNamedUDP(ctx)
+	} else {
+		upstream, err = s.dialUDP(ctx)
+	}
 	if err != nil {
 		writeReply(c, replyGeneralFailure)
 		return
 	}
-	defer upstream.Close()
+	var closeOnce sync.Once
+	closeUpstream := func() {
+		closeOnce.Do(func() {
+			if named != nil {
+				_ = named.Close()
+			} else {
+				_ = upstream.Close()
+			}
+		})
+	}
+	defer closeUpstream()
 	if err := writeUDPReply(c, relay.LocalAddr()); err != nil {
 		return
 	}
-	s.pumpUDP(ctx, relay, upstream, c, peer.AddrPort().Addr().Unmap())
+	s.pumpUDP(ctx, relay, upstream, named, c, peer.AddrPort().Addr().Unmap(), closeUpstream)
 }
 
-func (s *Server) pumpUDP(ctx context.Context, relay *net.UDPConn, upstream net.PacketConn, ctrl net.Conn, peer netip.Addr) {
+func (s *Server) pumpUDP(ctx context.Context, relay *net.UDPConn, upstream net.PacketConn, named NamedUDPConn, ctrl net.Conn, peer netip.Addr, closeUpstream func()) {
 	type association struct{ addr netip.AddrPort }
 	var appAddr atomic.Pointer[association]
 	ctx, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(ctx, func() {
 		_ = ctrl.Close()
 		_ = relay.Close()
-		_ = upstream.Close()
+		closeUpstream()
 	})
 	defer stop()
-	defer cancel()
+	ctrlDone := make(chan struct{})
 	go func() {
+		defer close(ctrlDone)
 		_, _ = io.Copy(io.Discard, ctrl)
 		cancel()
 	}()
+	readDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-readDone
+		<-ctrlDone
+	}()
 	go func() {
+		defer close(readDone)
 		defer cancel()
-		buf := make([]byte, 65536)
+		// Reserve header space so a reply does not require copying its payload.
+		const head = 22
+		buf := make([]byte, head+65536)
 		for {
-			n, src, err := upstream.ReadFrom(buf)
+			var n int
+			var err error
+			var src netip.AddrPort
+			if named != nil {
+				n, src, err = named.ReadPacket(buf[head:])
+				if err == nil && (!src.IsValid() || src.Port() == 0) {
+					continue
+				}
+			} else {
+				var raw net.Addr
+				n, raw, err = upstream.ReadFrom(buf[head:])
+				src = udpAddrPort(raw)
+			}
 			if err != nil {
 				return
 			}
@@ -208,8 +264,14 @@ func (s *Server) pumpUDP(ctx context.Context, relay *net.UDPConn, upstream net.P
 			if app == nil {
 				continue
 			}
-			m := append(buildUDPHeader(src), buf[:n]...)
-			if _, err := relay.WriteToUDPAddrPort(m, app.addr); err != nil {
+			ip := src.Addr().Unmap()
+			size := head
+			if ip.Is4() {
+				size = 10
+			}
+			start := head - size
+			_ = appendUDPHeader(buf[start:start], ip, src.Port())
+			if _, err := relay.WriteToUDPAddrPort(buf[start:head+n], app.addr); err != nil {
 				return
 			}
 		}
@@ -229,6 +291,17 @@ func (s *Server) pumpUDP(ctx context.Context, relay *net.UDPConn, upstream net.P
 		}
 		dst, data, err := parseUDPTarget(buf[:n])
 		if err != nil || dst.port == 0 {
+			continue
+		}
+		if named != nil {
+			if appAddr.Load() == nil {
+				appAddr.Store(&association{app})
+			}
+			host := dst.host
+			if dst.ip.IsValid() {
+				host = dst.ip.String()
+			}
+			_ = named.WritePacket(host, dst.port, data)
 			continue
 		}
 		ip := dst.ip
@@ -405,29 +478,37 @@ func listenUDPFor(local net.Addr) (*net.UDPConn, error) {
 // buildUDPHeader renders the SOCKS5 UDP header for addr: RSV(2) FRAG ATYP
 // DST.ADDR DST.PORT.
 func buildUDPHeader(addr net.Addr) []byte {
-	var ip net.IP
-	var port int
+	var b [22]byte
+	src := udpAddrPort(addr)
+	return appendUDPHeader(b[:0], src.Addr(), src.Port())
+}
+
+func udpAddrPort(addr net.Addr) netip.AddrPort {
+	var ip netip.AddrPort
 	switch a := addr.(type) {
 	case *net.UDPAddr:
-		ip, port = a.IP, a.Port
+		ip = a.AddrPort()
 	case *net.TCPAddr:
-		ip, port = a.IP, a.Port
-	default:
-		ip, port = net.IPv4zero, 0
+		ip = a.AddrPort()
 	}
-	if v4 := ip.To4(); v4 != nil {
-		b := []byte{0, 0, 0, atypIPv4}
-		b = append(b, v4...)
-		var p [2]byte
-		binary.BigEndian.PutUint16(p[:], uint16(port))
-		return append(b, p[:]...)
+	if !ip.IsValid() {
+		return netip.AddrPortFrom(netip.IPv4Unspecified(), 0)
 	}
-	v6 := ip.To16()
-	b := []byte{0, 0, 0, atypIPv6}
-	b = append(b, v6...)
-	var p [2]byte
-	binary.BigEndian.PutUint16(p[:], uint16(port))
-	return append(b, p[:]...)
+	return netip.AddrPortFrom(ip.Addr().Unmap(), ip.Port())
+}
+
+func appendUDPHeader(b []byte, ip netip.Addr, port uint16) []byte {
+	ip = ip.Unmap()
+	if ip.Is4() {
+		v4 := ip.As4()
+		b = append(b, 0, 0, 0, atypIPv4)
+		b = append(b, v4[:]...)
+	} else {
+		v6 := ip.As16()
+		b = append(b, 0, 0, 0, atypIPv6)
+		b = append(b, v6[:]...)
+	}
+	return binary.BigEndian.AppendUint16(b, port)
 }
 
 type udpTarget struct {

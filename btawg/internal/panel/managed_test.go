@@ -27,7 +27,7 @@ func newManagedTestPanel(t *testing.T) (*httptest.Server, *store.Store, *fakeReg
 	if err != nil {
 		t.Fatalf("bcrypt: %v", err)
 	}
-	reg := &fakeRegistry{managed: true}
+	reg := &fakeRegistry{Store: st, managed: true}
 	p := New(st, reg, "admin", string(hash))
 	srv := httptest.NewServer(p.Handler())
 	t.Cleanup(srv.Close)

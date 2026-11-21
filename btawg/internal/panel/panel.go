@@ -7,6 +7,7 @@ package panel
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ import (
 type Registry interface {
 	RegisterClient(store.ClientRecord) error
 	RevokeClient(store.ClientRecord) error
+	DeleteClient(string) error
 	ReloadPolicy() error
 	Config() config.ServerConfig
 	Managed() bool
@@ -93,6 +95,7 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("GET /clients", p.auth(p.clientsPage))
 	mux.HandleFunc("POST /clients/create", p.auth(p.clientCreate))
 	mux.HandleFunc("POST /clients/revoke", p.auth(p.clientRevoke))
+	mux.HandleFunc("POST /clients/delete", p.auth(p.clientDelete))
 	mux.HandleFunc("POST /clients/move", p.auth(p.clientMove))
 	mux.HandleFunc("POST /clients/policy", p.auth(p.clientPolicy))
 	mux.HandleFunc("GET /clients/import", p.auth(p.clientImport))
@@ -101,6 +104,11 @@ func (p *Panel) Handler() http.Handler {
 	mux.HandleFunc("GET /groups/edit", p.auth(p.groupEdit))
 	mux.HandleFunc("POST /groups/save", p.auth(p.groupSave))
 	mux.HandleFunc("POST /groups/delete", p.auth(p.groupDelete))
+	mux.HandleFunc("GET /routes", p.auth(p.routesPage))
+	mux.HandleFunc("GET /routes/edit", p.auth(p.routeEdit))
+	mux.HandleFunc("POST /routes/save", p.auth(p.routeSave))
+	mux.HandleFunc("POST /routes/delete", p.auth(p.routeDelete))
+	mux.HandleFunc("POST /routes/role", p.auth(p.routeRole))
 	return mux
 }
 
@@ -381,6 +389,18 @@ func (p *Panel) clientRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := p.reg.RevokeClient(rec); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	http.Redirect(w, r, "/clients", http.StatusFound)
+}
+
+func (p *Panel) clientDelete(w http.ResponseWriter, r *http.Request) {
+	if err := p.reg.DeleteClient(r.PostFormValue("id")); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			http.Error(w, "unknown client", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
 		return
 	}
 	http.Redirect(w, r, "/clients", http.StatusFound)

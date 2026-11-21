@@ -3,6 +3,7 @@ package panel
 import (
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -12,10 +13,12 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"bittorrent-tunnel/btawg/internal/config"
+	"bittorrent-tunnel/btawg/internal/server"
 	"bittorrent-tunnel/btawg/internal/store"
 )
 
 type fakeRegistry struct {
+	*store.Store
 	registered   []store.ClientRecord
 	revoked      []store.ClientRecord
 	reloadCalls  int
@@ -71,7 +74,7 @@ func newTestPanel(t *testing.T) (*httptest.Server, *store.Store, *fakeRegistry) 
 	if err != nil {
 		t.Fatalf("bcrypt: %v", err)
 	}
-	reg := &fakeRegistry{}
+	reg := &fakeRegistry{Store: st}
 	p := New(st, reg, "admin", string(hash))
 	srv := httptest.NewServer(p.Handler())
 	t.Cleanup(srv.Close)
@@ -312,6 +315,94 @@ func TestRevokeClient(t *testing.T) {
 	}
 	if len(reg.revoked) != 1 {
 		t.Fatalf("registry saw %d revocations, want 1", len(reg.revoked))
+	}
+}
+
+func TestDeleteClientReleasesAddress(t *testing.T) {
+	for _, state := range []string{"active", "revoked"} {
+		t.Run(state, func(t *testing.T) {
+			st, err := store.Open(t.TempDir() + "/panel.db")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { st.Close() })
+			cfg := config.DefaultServerConfig()
+			cfg.ExternalIP = "127.0.0.1"
+			// Keep these ports distinct while obtaining all three from the OS.
+			var reservations []*net.UDPConn
+			for _, port := range []*int{&cfg.CarrierPort, &cfg.AWGPort, &cfg.WGPort} {
+				pc, err := net.ListenUDP("udp4", &net.UDPAddr{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { pc.Close() })
+				*port = pc.LocalAddr().(*net.UDPAddr).Port
+				reservations = append(reservations, pc)
+			}
+			for _, pc := range reservations {
+				pc.Close()
+			}
+			hub, err := server.New(cfg, st)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { hub.Close() })
+			hash, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.MinCost)
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := httptest.NewServer(New(st, hub, "admin", string(hash)).Handler())
+			t.Cleanup(srv.Close)
+			c := login(t, srv.URL)
+			id := createClientForTest(t, c, srv.URL, "old-client")
+			old, err := st.GetClient(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.SaveTraffic(map[string]store.Traffic{id: {Up: 1}}); err != nil {
+				t.Fatal(err)
+			}
+			form := map[string][]string{"csrf": {csrfOf(t, c, srv.URL, "/clients")}, "id": {id}}
+			if state == "revoked" {
+				resp, err := c.PostForm(srv.URL+"/clients/revoke", form)
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusFound {
+					t.Fatalf("revoke HTTP status = %d", resp.StatusCode)
+				}
+			}
+
+			resp, err := c.PostForm(srv.URL+"/clients/delete", form)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusFound {
+				t.Fatalf("delete HTTP status = %d, want redirect", resp.StatusCode)
+			}
+			resp, err = c.Get(srv.URL + "/clients/import?id=" + id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusNotFound {
+				t.Fatalf("deleted import HTTP status = %d, want 404", resp.StatusCode)
+			}
+			traffic, err := st.LoadTraffic()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := traffic[id]; exists {
+				t.Fatal("deleted client's traffic is still persisted")
+			}
+			replacement := createClientForTest(t, c, srv.URL, "replacement")
+			got, err := st.GetClient(replacement)
+			if err != nil || got.IP != old.IP || got.PubKey == old.PubKey {
+				t.Fatalf("replacement IP = %q, want %q with a new key; err = %v", got.IP, old.IP, err)
+			}
+		})
 	}
 }
 

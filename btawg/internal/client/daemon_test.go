@@ -19,6 +19,7 @@ func TestDaemonControlToggleRotatePersist(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := ManagedConfig{Import: raw, Enabled: []string{config.ModeWG}, ListenIP: "127.0.0.1", Credentials: Credentials{Username: "first", Password: "secret"}}
+	cfg.Routes = map[int]string{1080: "unavailable-route"}
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "state", "client.json")
 	socket := filepath.Join(dir, "run", "ctl.sock")
@@ -55,6 +56,12 @@ func TestDaemonControlToggleRotatePersist(t *testing.T) {
 			t.Fatal(err)
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if got := send(ControlRequest{Op: "status"}).RouteID(1080); got != "unavailable-route" {
+		t.Fatalf("daemon changed stale selection to %q", got)
+	}
+	if _, err := request(socket, ControlRequest{Op: "set-route", Port: 1092, RouteID: "not-in-live-catalogue"}); err == nil {
+		t.Fatal("daemon accepted an egress route missing from the catalogue")
 	}
 	send(ControlRequest{Op: "apply", Enabled: []string{config.ModeAWG}})
 	// The three inbounds have independent settings; [] is not the default pool.
@@ -100,6 +107,9 @@ func TestDaemonControlToggleRotatePersist(t *testing.T) {
 		t.Fatal("rotation or toggle was not persisted")
 	}
 	checkPools(loaded.Balancers)
+	if len(loaded.Routes) != 1 || loaded.Routes[1080] != "unavailable-route" {
+		t.Fatalf("other settings updates changed saved routes: %v", loaded.Routes)
+	}
 	shown := send(ControlRequest{Op: "show"}).Credentials
 	if shown == nil || *shown != loaded.Credentials {
 		t.Fatal("show did not return current credentials")

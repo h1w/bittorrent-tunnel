@@ -75,7 +75,7 @@ func installMain(args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := saveClientSettings(nil, raw, *socksListen, *noTun, *tunName); err != nil {
+		if err := saveClientSettings(nil, raw, client.ManagedConfig{ListenIP: *socksListen, NoTUN: *noTun, TUNName: *tunName}); err != nil {
 			return err
 		}
 	} else if err != nil {

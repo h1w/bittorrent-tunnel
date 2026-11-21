@@ -27,7 +27,7 @@ func RequestControl(req ControlRequest) (r ControlResponse, running bool, err er
 	if err != nil {
 		return r, false, err
 	}
-	if err := cfg.update(req); err != nil {
+	if err := cfg.update(req, nil, false); err != nil {
 		return r, false, err
 	}
 	if req.mutates() {

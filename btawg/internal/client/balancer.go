@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"bittorrent-tunnel/btawg/internal/mesh"
 	"bittorrent-tunnel/btawg/internal/socks"
 	"bittorrent-tunnel/btawg/internal/tunneldns"
 )
@@ -207,7 +208,9 @@ func (t *managedTunnel) watch(enabled bool, adaptive *balancer) {
 				c.score.Store(0)
 			}
 		}()
-		gateway := netip.AddrPortFrom(netip.MustParseAddr(t.c.cfg.ServerIP), tunneldns.Port)
+		hub := netip.MustParseAddr(t.c.cfg.ServerIP)
+		gateway := netip.AddrPortFrom(hub, mesh.ControlPort)
+		legacy := netip.AddrPortFrom(hub, tunneldns.Port)
 		tick := time.NewTicker(probeInterval)
 		defer tick.Stop()
 		var health probeHealth
@@ -218,6 +221,9 @@ func (t *managedTunnel) watch(enabled bool, adaptive *balancer) {
 			started := time.Now()
 			probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 			conn, err := t.c.proxyTCP(probeCtx, gateway)
+			if err != nil && probeCtx.Err() == nil {
+				conn, err = t.c.proxyTCP(probeCtx, legacy)
+			}
 			cancel()
 			var elapsed time.Duration
 			if err == nil {

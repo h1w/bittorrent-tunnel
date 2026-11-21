@@ -62,11 +62,20 @@ func TestTLSSessionRetirement(t *testing.T) {
 	if err := st.SaveGroup(store.GroupRecord{ID: "extra", Name: "Extra", Subnet: "10.78.0.0/24", ServerIP: "10.78.0.1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.RevokeClient(rec.ID); err != nil {
-		t.Fatal(err)
+	if err := hub.DeleteClient(rec.ID); err == nil {
+		t.Fatal("expected delete to fail when netstack policy reload fails")
 	}
-	if err := hub.RevokeClient(rotated); err == nil {
-		t.Fatal("expected netstack group reload to fail")
+	if saved, err := st.GetClient(rec.ID); err != nil || !saved.Revoked || saved.IP != rec.IP {
+		t.Fatalf("failed delete released the address: revoked=%v IP=%s err=%v", saved.Revoked, saved.IP, err)
 	}
 	wait(0)
+	if err := st.DeleteGroup("extra"); err != nil {
+		t.Fatal(err)
+	}
+	if err := hub.DeleteClient(rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetClient(rec.ID); err != store.ErrNotFound {
+		t.Fatalf("deleted client lookup: %v, want not found", err)
+	}
 }
