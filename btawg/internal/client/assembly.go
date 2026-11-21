@@ -204,7 +204,7 @@ func (m *Managed) applyLocked(enabled []string, auth Credentials, pools map[stri
 	for i, pool := range poolModes {
 		paths := make([]*managedTunnel, 0, len(pool))
 		policy := balancerPolicies[i]
-		if _, custom := pools[policy]; custom && policy == failoverPolicy {
+		if _, custom := pools[policy]; custom && (policy == failoverPolicy || policy == adaptivePolicy) {
 			for _, mode := range pool {
 				tunnel := m.tunnels[slices.Index(modes, mode)]
 				if !slices.Contains(paths, tunnel) {

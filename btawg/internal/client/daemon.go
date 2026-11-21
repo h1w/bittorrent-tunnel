@@ -233,7 +233,7 @@ func (c *ManagedConfig) update(req ControlRequest, options []RouteOption, runnin
 			}
 		}
 		order := modes
-		if req.Balancer == failoverPolicy {
+		if req.Balancer == failoverPolicy || req.Balancer == adaptivePolicy {
 			order = req.Enabled
 		}
 		pool := make([]string, 0, min(len(req.Enabled), len(modes)))

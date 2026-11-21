@@ -45,7 +45,7 @@ func clientSetup(install bool) (*service.Screen, error) {
 	}
 	help := "Paste the btawg:// string from the server panel. The import is hidden."
 	if previous != nil {
-		help = "Leave the import blank to keep it. Settings take effect on next start."
+		help = "Leave the import blank to keep it. Saving changes restarts a running service."
 	}
 	submit := "Save settings"
 	if install {
@@ -65,13 +65,6 @@ func clientSetup(install bool) (*service.Screen, error) {
 			{Label: "Public P2P UDP address (optional)", Value: cfg.PeerEndpoint},
 		},
 		Save: func(fields []service.Field) (*service.Screen, error) {
-			state, _, err := service.Client.State()
-			if err != nil {
-				return nil, err
-			}
-			if state != service.NotInstalled && state != "inactive" && state != "failed" {
-				return nil, fmt.Errorf("stop the service before changing launch settings (currently %s)", state)
-			}
 			latest, err := client.LoadManagedConfig(client.ManagedConfigPath)
 			if err == nil {
 				previous = &latest
@@ -297,11 +290,14 @@ func balancerSettings(port int, label, policy string) (*service.Screen, error) {
 		pool = status.Enabled
 	}
 	modes := config.ClientModes()
-	reorder := policy == "failover"
+	reorder := policy == "failover" || policy == "adaptive"
 	fields := make([]service.Field, 0, len(modes))
 	text := "Choose tunnels for this port only. An empty list disables forwarding."
 	if reorder {
-		text = "First checked working tunnel wins. Use -/+ to move a row up/down."
+		text = "First checked working tunnel wins. Use - to move up, + or = to move down."
+		if policy == "adaptive" {
+			text = "Comparable paths follow this order; a consistently faster path can win. Use - to move up, + or = to move down."
+		}
 		if custom {
 			for _, mode := range pool {
 				fields = append(fields, service.Field{Label: mode, Toggle: true, Checked: true})

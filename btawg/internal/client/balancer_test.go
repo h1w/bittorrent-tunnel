@@ -65,6 +65,21 @@ func TestBalancerSelectionSkipsFailedPathsAndRecovers(t *testing.T) {
 	assertPick(&adaptive, &second)
 }
 
+func TestAdaptivePrefersConfiguredOrderForComparablePaths(t *testing.T) {
+	var first, second managedTunnel
+	first.score.Store(int64(22 * time.Millisecond))
+	second.score.Store(int64(20 * time.Millisecond))
+	b := balancer{policy: adaptivePolicy}
+	b.replace([]*managedTunnel{&first, &second})
+	if b.pick() != &first {
+		t.Fatal("minor timing difference overrode saved priority")
+	}
+	b.replace([]*managedTunnel{&second, &first})
+	if b.pick() != &second {
+		t.Fatal("reordering did not affect the next choice")
+	}
+}
+
 func TestAdaptiveRequiresTwoMeaningfullyBetterProbes(t *testing.T) {
 	for _, tc := range []struct {
 		name                string

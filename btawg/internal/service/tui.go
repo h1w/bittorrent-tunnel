@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -111,6 +112,7 @@ type dashboard struct {
 	selection int
 	offset    int
 	hits      []hit
+	textInput bool
 }
 
 type hit struct {
@@ -238,8 +240,8 @@ func (d *dashboard) actions() []Action {
 			}
 			out = append(out, Action{Label: label, Run: perform(func() error { return u.Control(cmd) })})
 		}
-		if d.menu.Setup != nil && (s.state == NotInstalled || s.state == "inactive" || s.state == "failed") {
-			out = append(out, Action{Label: "Service settings", Run: d.menu.Setup})
+		if d.menu.Setup != nil {
+			out = append(out, Action{Label: "Service settings", Run: d.settings})
 		}
 		out = append(out, s.actions...)
 		if s.state != NotInstalled {
@@ -250,6 +252,51 @@ func (d *dashboard) actions() []Action {
 		}
 	}
 	return append(out, Action{Label: "View service logs", Run: u.logs}, Action{Label: "Quit"})
+}
+
+func (d *dashboard) settings() (*Screen, error) {
+	s, err := d.menu.Setup()
+	if err != nil || s == nil || s.Save == nil {
+		return s, err
+	}
+	initial, save := slices.Clone(s.Fields), s.Save
+	unit := d.menu.Unit
+	s.Save = func(fields []Field) (*Screen, error) {
+		if slices.Equal(initial, fields) {
+			return nil, nil
+		}
+		next, err := save(fields)
+		if err != nil {
+			return next, err
+		}
+		state, _, err := unit.State()
+		if err != nil {
+			return next, fmt.Errorf("settings saved; check service state: %w", err)
+		}
+		if state == "active" || state == "activating" || state == "reloading" {
+			if err := unitAction(unit.unitName(), "try-restart"); err != nil {
+				return next, fmt.Errorf("settings saved; restart failed: %w", err)
+			}
+		}
+		return next, nil
+	}
+	return s, nil
+}
+
+func (d *dashboard) syncInputMode(term tui.Terminal) {
+	s := d.screen
+	textInput := s != nil && s.Save != nil && d.selection < len(s.Fields) && !s.Fields[d.selection].Toggle
+	if textInput == d.textInput {
+		return
+	}
+	d.textInput = textInput
+	// Let the SSH terminal handle right-click paste instead of reporting it
+	// to the application while a text field is selected.
+	if textInput {
+		term.DisableMouse()
+	} else {
+		term.EnableMouse()
+	}
 }
 
 func (u Unit) logs() (*Screen, error) {
@@ -396,7 +443,7 @@ func (d *dashboard) key(e tui.KeyEvent) {
 				switch {
 				case f.Toggle && e.Rune == ' ':
 					d.activate()
-				case s.Reorder && (e.Rune == '-' || e.Rune == '+'):
+				case s.Reorder && (e.Rune == '-' || e.Rune == '+' || e.Rune == '='):
 					to := d.selection + 1
 					if e.Rune == '-' {
 						to = d.selection - 1
@@ -454,6 +501,7 @@ func (d *dashboard) HandleMouse(e tui.MouseEvent) bool {
 
 func (d *dashboard) Render(app *tui.App) *tui.Element {
 	d.app = app
+	d.syncInputMode(app.Terminal())
 	d.hits = d.hits[:0]
 	width, height := app.Size()
 	root := tui.New(tui.WithDirection(tui.Column), tui.WithPaddingTRBL(0, 1, 0, 1))
@@ -542,7 +590,7 @@ func (d *dashboard) Render(app *tui.App) *tui.Element {
 			d.renderForm(main, s, width, max(1, room-1-min(len(text), 2)))
 			footer = "Tab / ↑/↓ Move  •  Enter Next / Save  •  Ctrl+U Clear  •  Esc Back"
 			if s.Reorder {
-				footer = "↑/↓ Select  •  Space Toggle  •  -/+ Reorder  •  Enter Toggle / Save  •  Esc Back"
+				footer = "↑/↓ Select  •  Space Toggle  •  - / + or = Reorder  •  Enter Toggle / Save  •  Esc Back"
 			}
 		}
 	default:

@@ -39,9 +39,10 @@ database to recover a password: it contains the hub and client identities.
 
 After installation, `sudo btawg-server` opens the dashboard. Use ↑/↓ and Enter
 or click a menu item. Start, stop, restart, autostart, logs, update, and removal
-are available in the dashboard. To change launch settings, stop the service
-and select **Service settings**. Removing either service keeps its installed
-launcher, `/etc/btawg` settings and keys, and `/var/lib/btawg` server state.
+are available in the dashboard. Open **Service settings** to change launch
+options. Saving a change restarts a running service; a stopped service stays
+stopped. Removing either service keeps its installed launcher, `/etc/btawg`
+settings and keys, and `/var/lib/btawg` server state.
 For unattended installation, `sudo ./btawg-server install` still works.
 
 Open **6881/TCP**, **6881/UDP**, **51821/UDP** (AWG), and **51820/UDP**
@@ -80,8 +81,10 @@ choose **Save and install**. The installer saves the import and generated SOCKS5
 credentials under `/etc/btawg`, then enables and starts `btawg-client.service`.
 The imported mode starts enabled; other modes are reserved but off. Select a
 transport and press Enter or Space to toggle it without restarting the service.
-To edit the import, SOCKS5 listen address or TUN options later, stop the service
-and choose **Service settings**. Leaving the import field blank keeps it.
+To edit the import, SOCKS5 listen address or TUN options, choose **Service
+settings**. Saving changes restarts the service if running. Leaving the import
+field blank keeps it. In a text field, use your terminal's paste action (e.g.
+right-click in PuTTY or the terminal menu); the TUI keeps the import hidden.
 For unattended installation, use `sudo ./btawg-client install -import-file client.txt`.
 
 Each connection mode has a **fixed** local SOCKS5 port (1080 = first mode,
@@ -114,15 +117,13 @@ Uncheck all tunnels to stop forwarding on that balancer; the port remains
 reserved. Only new sessions can use a different tunnel. A balancer switches
 transports, never the selected Internet route. It does not balance ordinary TUN traffic.
 
-In **Failover**, highlight a tunnel and press **-** to move it up or **+** to
-move it down. Only checked rows count: the highest working one gets new
-connections. Save to apply the new priority. Until customized, Failover uses
-fixed-port order (1080 first).
-
-**Adaptive** changes a working route only after the same alternative has an
-estimated score (smoothed latency plus recent failure penalty) at least 5 ms
-and 15% better on two consecutive probes. An unavailable route is replaced
-without this wait. A closed BitTorrent carrier is excluded immediately, and
+In **Failover** and **Adaptive**, highlight a tunnel and press **-** to move
+it up or **+** (or the unshifted **=** key) to move it down. Failover takes
+the first reachable checked tunnel. Adaptive uses the order to choose among
+paths whose scores differ by less than its switching threshold. A working
+path switches only after the same alternative scores at least 5 ms and 15%
+better on two consecutive probes. An unavailable path is replaced without
+this wait. A closed BitTorrent carrier is excluded immediately, and
 its replacement needs a fresh successful probe. Native AWG/WG still relies
 on background probes to detect loss of reachability. SOCKS5 requests do not
 run or wait for additional checks.

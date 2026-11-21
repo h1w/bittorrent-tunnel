@@ -36,20 +36,13 @@ func serverSetup() (*service.Screen, error) {
 	}
 	return &service.Screen{
 		Title: "Server settings", Submit: "Save settings",
-		Text: "Launch settings apply on next start. Manage groups, gateways, clients and routing in the web panel.",
+		Text: "Saving changes restarts a running service. Manage groups, gateways, clients and routing in the web panel.",
 		Fields: []service.Field{
 			{Label: "Database path", Value: launch.Store},
 			{Label: "TUN interface", Value: launch.TUNName},
 			{Label: "Userspace only (no TUN)", Toggle: true, Checked: launch.NoTUN},
 		},
 		Save: func(fields []service.Field) (*service.Screen, error) {
-			state, _, err := service.Server.State()
-			if err != nil {
-				return nil, err
-			}
-			if state != service.NotInstalled && state != "inactive" && state != "failed" {
-				return nil, fmt.Errorf("stop the service before changing launch settings (currently %s)", state)
-			}
 			return nil, (serverLaunch{Store: strings.TrimSpace(fields[0].Value), TUNName: strings.TrimSpace(fields[1].Value), NoTUN: fields[2].Checked}).save()
 		},
 	}, nil

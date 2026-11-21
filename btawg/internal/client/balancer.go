@@ -66,10 +66,7 @@ func (b *balancer) replace(paths []*managedTunnel) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.policy == adaptivePolicy && !slices.Equal(b.paths, paths) {
-		b.challenger = adaptivePath{}
-		if !slices.Contains(paths, b.current.tunnel) {
-			b.current = adaptivePath{}
-		}
+		b.current, b.challenger = adaptivePath{}, adaptivePath{}
 	}
 	b.paths = paths
 	if b.next >= len(paths) {
@@ -114,7 +111,22 @@ func (b *balancer) bestAdaptive() (best adaptivePath, bestScore time.Duration) {
 			best, bestScore = path, score
 		}
 	}
+	if best.tunnel == nil {
+		return best, bestScore
+	}
+	// Priority breaks ties and small score differences without making a
+	// slower path win over a substantially faster one.
+	for _, tunnel := range b.paths {
+		if path, score := tunnel.adaptiveScore(); score > 0 && (path == best || !adaptiveImprovement(bestScore, score)) {
+			return path, score
+		}
+	}
 	return best, bestScore
+}
+
+func adaptiveImprovement(best, current time.Duration) bool {
+	gain := current - best
+	return gain >= adaptiveMinGain && gain*100 >= current*15
 }
 
 // probed is called once per completed background check, never by a request.
@@ -130,8 +142,7 @@ func (b *balancer) probed(tunnel *managedTunnel, carrier *carrierHealth) {
 		return
 	}
 	best, score := b.bestAdaptive()
-	gain := currentScore - score
-	if best.tunnel == nil || gain < adaptiveMinGain || gain*100 < currentScore*15 {
+	if best.tunnel == nil || !adaptiveImprovement(score, currentScore) {
 		b.challenger = adaptivePath{}
 		return
 	}

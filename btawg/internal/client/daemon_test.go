@@ -67,12 +67,13 @@ func TestDaemonControlToggleRotatePersist(t *testing.T) {
 	// The three inbounds have independent settings; [] is not the default pool.
 	send(ControlRequest{Op: "set-balancer", Balancer: "failover", Enabled: []string{config.ModeWG, config.ModeAWG, config.ModeWG}})
 	send(ControlRequest{Op: "set-balancer", Balancer: "round-robin"})
+	send(ControlRequest{Op: "set-balancer", Balancer: "adaptive", Enabled: []string{config.ModeWG, config.ModeAWG, config.ModeWG}})
 	if _, err := request(socket, ControlRequest{Op: "set-balancer", Balancer: "adaptive", Enabled: []string{"invalid"}}); err == nil {
 		t.Fatal("unsupported mode accepted into a balancer pool")
 	}
 	checkPools := func(pools map[string][]string) {
 		t.Helper()
-		if !slices.Equal(pools["failover"], []string{config.ModeWG, config.ModeAWG}) || pools["round-robin"] == nil || len(pools["round-robin"]) != 0 || len(pools) != 2 {
+		if !slices.Equal(pools["failover"], []string{config.ModeWG, config.ModeAWG}) || !slices.Equal(pools["adaptive"], []string{config.ModeWG, config.ModeAWG}) || pools["round-robin"] == nil || len(pools["round-robin"]) != 0 || len(pools) != 3 {
 			t.Fatalf("wrong balancer pools: %#v", pools)
 		}
 	}

@@ -127,7 +127,9 @@ func TestManagedEgressCascadeAndLiveRevocation(t *testing.T) {
 		cfg.WGEndpoint = net.JoinHostPort("127.0.0.1", strconv.Itoa(hc.WGPort))
 		var selection map[int]string
 		if i == 0 {
-			selection = map[int]string{1085: "cascade", 1090: "cascade", 1091: "cascade", 1092: "cascade"}
+			// The WG fixed inbound selects the hub (which has no egress here).
+			// The same WG transport must still serve all three named routes.
+			selection = map[int]string{1090: "cascade", 1091: "cascade", 1092: "cascade"}
 		}
 		m, err := newManagedAt(t.Context(), cfg, []string{config.ModeWG}, netip.MustParseAddr("127.0.0.1"), auth, false, "", 0, nil, selection)
 		if err != nil {
@@ -171,8 +173,14 @@ func TestManagedEgressCascadeAndLiveRevocation(t *testing.T) {
 		}
 		return c, status[1]
 	}
+	if c, status := connect(5); status == 0 {
+		c.Close()
+		t.Fatal("fixed WG port unexpectedly inherited the balancer route")
+	} else {
+		c.Close()
+	}
 	var held net.Conn
-	for _, slot := range []int{5, 10, 11, 12} {
+	for _, slot := range []int{10, 11, 12} {
 		c, status := connect(slot)
 		if status != 0 {
 			t.Fatalf("slot %d CONNECT failed: %d", slot, status)
