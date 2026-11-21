@@ -35,6 +35,7 @@ type meshNode struct {
 	catalogue atomic.Pointer[catalogue]
 	paths     atomic.Pointer[[]*managedTunnel]
 	selected  atomic.Pointer[map[int]string]
+	peer      atomic.Pointer[PeerSettings]
 }
 
 func (m *Managed) RouteOptions() []RouteOption {
@@ -54,8 +55,15 @@ func (m *Managed) applyRoutes(routes map[int]string) {
 	m.network.selected.Store(&routes)
 }
 
-func (m *Managed) startNetwork(p2p, autoMap, serve bool, port uint16, endpoint string) {
-	m.network.start(p2p, autoMap, serve, port, endpoint)
+func (m *Managed) applyPeerSettings(cfg PeerSettings) {
+	if m.shared != nil {
+		m.shared.configurePeer(cfg)
+	}
+	m.network.peer.Store(&cfg)
+}
+
+func (m *Managed) startNetwork(p2p, autoMap, serve bool, port uint16, endpoint, tcpEndpoint string) {
+	m.network.start(p2p, autoMap, serve, port, endpoint, tcpEndpoint)
 }
 
 func (n *meshNode) selectProxy(port int, path *managedTunnel) (*socks.Server, context.Context) {
@@ -333,13 +341,16 @@ func (n *meshNode) runExit(ctx context.Context, path *managedTunnel, running *at
 	return routeproxy.ServeWithBlockedPrefixes(ctx, ln, n.allowRoute, blocked)
 }
 
-func (n *meshNode) start(p2p, autoMap, serve bool, port uint16, endpoint string) {
+func (n *meshNode) start(p2p, autoMap, serve bool, port uint16, endpoint, tcpEndpoint string) {
 	n.owner.networkWG.Go(func() {
 		var exitRunning atomic.Int32
 		if serve {
 			n.owner.networkWG.Go(func() { n.serveExit(&exitRunning) })
 		}
-		n.run(p2p, autoMap, port, endpoint, &exitRunning)
+		if p2p && n.owner.shared != nil {
+			n.owner.networkWG.Go(n.servePeerProbe)
+		}
+		n.run(p2p, autoMap, port, endpoint, tcpEndpoint, &exitRunning)
 	})
 }
 

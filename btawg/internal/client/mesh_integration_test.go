@@ -136,7 +136,7 @@ func TestManagedEgressCascadeAndLiveRevocation(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { m.Close() })
-		m.startNetwork(false, false, i != 0, 0, "")
+		m.startNetwork(false, false, i != 0, 0, "", "")
 		nodes = append(nodes, m)
 	}
 	origin := nodes[0]

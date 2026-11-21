@@ -298,23 +298,31 @@ usable in the original modes; there is no TLS-to-AWG fallback.
 
 ### Client-to-client
 
-Dial another client's VPN IPv4 address for peer services. Both ends must allow
-each other under the hub's peer ACL. The existing hub-relayed path still works
-between heterogeneous transports. Managed clients with a Linux TUN can also
-enable **Allow direct peer connections (P2P)** in **Service settings**, then
-restart. When both peers opt in and a path is authenticated, VPN packets can
-travel over direct AWG + BitTorrent extended µTP without changing either VPN IP.
+Dial another client's VPN IPv4 address for peer services. The hub must allow
+communication in both directions. On managed Linux-TUN clients, enable
+**Allow direct peer connections (P2P)** in **Service settings** and save, then
+open **Peer connections** in the client dashboard:
 
-The hub introduces allowed pairs using their reachable LAN/public candidates,
-optional manual public UDP endpoint, global IPv6 or an address observed from
-the same UDP socket for hole punching. **Automatically map the peer UDP port**
-opts in to PCP, NAT-PMP and UPnP IGD; these cannot guarantee reachability
-through CGNAT. For a manual forward, set the client's **P2P listen port** and
-**Public P2P UDP address**. The automatic listen port tries UDP 6881–6889
-then an ephemeral port. DHT discovers the hub, not clients. Direct paths lose
-authorization if the hub cannot renew their short leases. Public peer addresses
-are shared with the authorized counterpart, not with the public DHT. Keep
-host firewall rules under operator control.
+- **Accept incoming** controls which of the ten transports a peer can use to
+  initiate its own traffic to this device. An empty list accepts none.
+- **Outgoing pools** configures independent **Failover**, **Round Robin**,
+  and **Adaptive** pools. **Connect using** selects a single mode or a pool.
+  Only modes accepted by the recipient can carry new direct flows. Replies
+  use the same path. P2P pools do not change the 13 SOCKS5 exit selections.
+- **Allow relay via central server** is off by default. With P2P enabled,
+  peer traffic without a direct path is blocked unless relay is enabled on
+  both ends. Hub gateway traffic and SOCKS5 Internet exits are separate.
+
+Existing P2P configurations default to AWG `ext-utp` for incoming and outgoing
+connections. Update both clients and the hub to negotiate transport selection.
+The P2P listener uses distinct TCP and UDP candidates. UDP supports hole
+punching and optional PCP, NAT-PMP and UPnP IGD mappings; TCP requires a
+reachable listener and does not use UDP mappings. For a manual forward, set
+a fixed **P2P listen port**, forward the appropriate protocol, and set its
+matching **Public P2P UDP address** or **Public P2P TCP address**. Native AWG
+and WG use separate UDP sockets. DHT discovers the
+hub, not clients. Direct paths expire if the hub cannot renew their leases.
+Peer endpoints are shared only with authorized peers.
 
 ### Select a client exit or cascade
 

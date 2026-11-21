@@ -2,18 +2,27 @@ package client
 
 import (
 	"net/netip"
+	"slices"
 	"time"
 
 	"bittorrent-tunnel/btawg/internal/config"
 )
 
+var peerModeOrder = config.ClientModes()
+
 func (s *sharedTUN) enableDirect(cfg config.ClientConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.direct = make(map[netip.Addr]*tunPath)
-	s.directGateway = netip.MustParseAddr(cfg.ServerIP)
+	if s.directWanted != nil {
+		return
+	}
+	s.direct = make(map[netip.Addr]*peerPathGroup)
+	s.directGateways = map[netip.Addr]bool{netip.MustParseAddr(cfg.ServerIP): true}
 	s.directOwn = netip.MustParseAddr(cfg.ClientIP)
 	s.directWanted = make(chan netip.Addr, 64)
+	s.peerFlows = make(map[peerTuple]peerFlow)
+	s.peerFragments = make(map[fragmentID]fragmentPath)
+	s.peerRequests = make(map[netip.Addr]time.Time)
 	for _, raw := range cfg.Routes {
 		if p, err := netip.ParsePrefix(raw); err == nil && p.Bits() > 0 {
 			s.directRanges = append(s.directRanges, p)
@@ -22,16 +31,40 @@ func (s *sharedTUN) enableDirect(cfg config.ClientConfig) {
 	if p, err := netip.ParsePrefix(cfg.Subnet); err == nil {
 		s.directRanges = append(s.directRanges, p)
 	}
+	s.peerEnabled.Store(true)
+}
+
+func (s *sharedTUN) configurePeer(settings PeerSettings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.peerModes = settings.OutgoingModes()
+	s.peerIncoming = settings.IncomingModes()
+	s.peerUse = settings.SelectedMode()
+	s.peerRelay = settings.Relay
+	for k, f := range s.peerFlows {
+		if !s.peerPathAllowedLocked(f.path) {
+			delete(s.peerFlows, k)
+		}
+	}
+	for _, g := range s.direct {
+		s.updatePeerPoolLocked(g)
+	}
+}
+
+func (s *sharedTUN) setPeerNetwork(gateways []netip.Addr, prefixes []netip.Prefix) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.directGateways)
+	for _, addr := range gateways {
+		s.directGateways[addr] = true
+	}
+	s.peerNetwork = slices.Clone(prefixes)
 }
 
 func (s *sharedTUN) directPath(ip netip.Addr) *tunPath {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	p := s.direct[ip]
-	if p == nil || !p.validDirect() {
-		return nil
-	}
-	return p
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pickPeerLocked(ip)
 }
 
 func (s *sharedTUN) wantDirect(ip netip.Addr) {
@@ -48,18 +81,135 @@ func (s *sharedTUN) wantDirect(ip netip.Addr) {
 
 func (s *sharedTUN) setDirect(ip netip.Addr, p *tunPath) {
 	s.mu.Lock()
-	s.direct[ip] = p
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	if !p.peerOutbound {
+		return
+	}
+	i := peerModeIndex(p.peerMode)
+	if i < 0 {
+		return
+	}
+	g := s.direct[ip]
+	if g == nil {
+		g = &peerPathGroup{}
+		s.direct[ip] = g
+	}
+	g.constSize[i] = p
+	s.updatePeerPoolLocked(g)
 }
 
 func (s *sharedTUN) removeDirect(ip netip.Addr, p *tunPath) {
 	s.mu.Lock()
-	if s.direct[ip] == p {
-		delete(s.direct, ip)
+	defer s.mu.Unlock()
+	g := s.direct[ip]
+	if i := peerModeIndex(p.peerMode); g != nil && i >= 0 && g.constSize[i] == p {
+		g.constSize[i] = nil
+		s.updatePeerPoolLocked(g)
+		if len(g.policy.paths) == 0 {
+			empty := true
+			for _, v := range g.constSize {
+				if v != nil {
+					empty = false
+					break
+				}
+			}
+			if empty {
+				delete(s.direct, ip)
+			}
+		}
 	}
-	s.mu.Unlock()
+}
+
+func peerModeIndex(mode string) int {
+	for i, n := range peerModeOrder {
+		if n == mode {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *sharedTUN) updatePeerPoolLocked(g *peerPathGroup) {
+	policy := s.peerUse
+	if peerModeIndex(policy) >= 0 {
+		policy = failoverPolicy
+	}
+	if g.policy.policy != policy {
+		g.policy.policy = policy
+		g.policy.current, g.policy.challenger = adaptivePath{}, adaptivePath{}
+		g.policy.next = 0
+	}
+	paths := make([]*managedTunnel, 0, len(s.peerModes))
+	for _, mode := range s.peerModes {
+		if i := peerModeIndex(mode); i >= 0 && g.constSize[i] != nil {
+			paths = append(paths, g.constSize[i].peerHealth)
+		}
+	}
+	g.policy.replace(paths)
+}
+
+func (s *sharedTUN) pickPeerLocked(ip netip.Addr) *tunPath {
+	g := s.direct[ip]
+	if g == nil {
+		return nil
+	}
+	if member := g.policy.pick(); member != nil && member.c.path.validDirect() {
+		return member.c.path
+	}
+	return nil
+}
+
+func (s *sharedTUN) readyPeerLocked(ip netip.Addr) bool {
+	if g := s.direct[ip]; g != nil {
+		for _, m := range g.policy.paths {
+			if m.score.Load() > 0 && m.c.path.validDirect() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *sharedTUN) probePeer(ip netip.Addr, p *tunPath, score time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p.peerHealth.score.Store(int64(score))
+	if g := s.direct[ip]; g != nil {
+		g.policy.probed(p.peerHealth, nil)
+	}
 }
 
 func (p *tunPath) validDirect() bool {
+	select {
+	case <-p.done:
+		return false
+	default:
+	}
 	return p.directLife == nil || (p.directLife.Err() == nil && time.Now().UnixNano() < p.directUntil.Load())
+}
+
+func (s *sharedTUN) peerPathAllowedLocked(p *tunPath) bool {
+	if !p.validDirect() {
+		return false
+	}
+	if p.directLife == nil {
+		return s.peerRelay
+	}
+	if p.peerOutbound {
+		return slices.Contains(s.peerModes, p.peerMode)
+	}
+	return slices.Contains(s.peerIncoming, p.peerMode)
+}
+
+func (s *sharedTUN) enqueuePacket(path *tunPath, storage *[]byte, buf, packet []byte) bool {
+	if !s.peerEnabled.Load() {
+		return path.enqueue(storage, buf)
+	}
+	dst := netip.AddrFrom4([4]byte(packet[16:20]))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.shouldRoutePeerLocked(dst) && !s.peerPathAllowedLocked(path) {
+		return false
+	}
+	return path.enqueue(storage, buf)
 }

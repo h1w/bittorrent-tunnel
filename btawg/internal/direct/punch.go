@@ -44,10 +44,16 @@ type path struct {
 }
 
 type attempt struct {
-	ctx       context.Context
-	key       [32]byte
-	id        token
-	initiator bool
+	ctx           context.Context
+	key           [32]byte
+	id            token
+	initiator     bool
+	framing       string
+	tcp           bool
+	tcpCandidates []netip.AddrPort
+	tcpLocal      []netip.Addr
+	conn          net.Conn
+	dialer        bool
 
 	// Guarded by the owning Socket's mutex.
 	paths     map[netip.AddrPort]*path
@@ -140,7 +146,7 @@ func (s *Socket) punched(f *purego.Socket, b []byte, source netip.AddrPort) {
 	s.mu.Lock()
 	a := s.attempts[id]
 	s.mu.Unlock()
-	if a == nil || a.initiator == (b[8]&1 != 0) || a.ctx.Err() != nil || sender == (token{}) {
+	if a == nil || a.tcp || a.initiator == (b[8]&1 != 0) || a.ctx.Err() != nil || sender == (token{}) {
 		return
 	}
 	want := mac(a.key, punchTagDomain, b[8:57])
@@ -196,7 +202,7 @@ func (s *Socket) rejectSYN(from net.Addr) bool {
 		return true
 	}
 	for _, a := range s.attempts {
-		if !a.initiator && !a.committed && a.ctx.Err() == nil {
+		if !a.tcp && !a.initiator && !a.committed && a.ctx.Err() == nil {
 			if p := a.paths[source]; p != nil && p.proved {
 				return false
 			}

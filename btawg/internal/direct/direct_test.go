@@ -202,8 +202,8 @@ func TestCrossedOffersExchangeExtendedDatagrams(t *testing.T) {
 				}
 			}
 			lease := time.Now().Add(5 * time.Second)
-			out := runConnect(ctx, a, Offer{key, true, candidates(b), lease})
-			in := runConnect(ctx, b, Offer{key, false, candidates(a), lease})
+			out := runConnect(ctx, a, Offer{Secret: key, Initiator: true, Candidates: candidates(b), Expires: lease})
+			in := runConnect(ctx, b, Offer{Secret: key, Initiator: false, Candidates: candidates(a), Expires: lease})
 			fromA, fromB := requireConnected(t, out), requireConnected(t, in)
 			cancel() // The successfully returned carriers belong to the callers.
 			exchange(t, fromA, fromB, "alice to bob")
@@ -253,8 +253,8 @@ func TestConnectWrongKeyOrRoleCannotAttach(t *testing.T) {
 			candidates := func(remote *Socket) []Candidate {
 				return []Candidate{{Addr: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), remote.Port()), Kind: "lan"}}
 			}
-			out := runConnect(ctx, a, Offer{[32]byte{1}, true, candidates(b), lease})
-			in := runConnect(ctx, b, Offer{tc.keyB, tc.roleB, candidates(a), lease})
+			out := runConnect(ctx, a, Offer{Secret: [32]byte{1}, Initiator: true, Candidates: candidates(b), Expires: lease})
+			in := runConnect(ctx, b, Offer{Secret: tc.keyB, Initiator: tc.roleB, Candidates: candidates(a), Expires: lease})
 			requireConnectError(t, out, context.DeadlineExceeded)
 			requireConnectError(t, in, context.DeadlineExceeded)
 		})
@@ -344,7 +344,7 @@ func TestUnauthenticatedStreamCannotReserveActiveOffer(t *testing.T) {
 	// The source is present in the offer, but cannot even allocate an
 	// incoming stream until it has answered an authenticated punch.
 	probe := udpTest(t, "udp4", "127.0.0.1")
-	in := runConnect(ctx, b, Offer{key, false, []Candidate{{dest(a), "lan"}, {probe.LocalAddr().(*net.UDPAddr).AddrPort(), "lan"}}, lease})
+	in := runConnect(ctx, b, Offer{Secret: key, Candidates: []Candidate{{Addr: dest(a), Kind: "lan"}, {Addr: probe.LocalAddr().(*net.UDPAddr).AddrPort(), Kind: "lan"}}, Expires: lease})
 	// Prove the offer is already in flight before trying the unauthenticated SYN.
 	if err := probe.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 		t.Fatal(err)
@@ -359,6 +359,6 @@ func TestUnauthenticatedStreamCannotReserveActiveOffer(t *testing.T) {
 		_ = c.Close()
 		t.Fatal("listener allocated µTP for an unverified candidate")
 	}
-	out := runConnect(ctx, a, Offer{key, true, []Candidate{{dest(b), "lan"}}, lease})
+	out := runConnect(ctx, a, Offer{Secret: key, Initiator: true, Candidates: []Candidate{{Addr: dest(b), Kind: "lan"}}, Expires: lease})
 	exchange(t, requireConnected(t, out), requireConnected(t, in), "valid attachment")
 }

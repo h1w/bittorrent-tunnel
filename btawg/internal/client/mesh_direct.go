@@ -2,8 +2,10 @@ package client
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"slices"
@@ -17,10 +19,12 @@ import (
 
 	"bittorrent-tunnel/btawg/internal/awg"
 	"bittorrent-tunnel/btawg/internal/bind"
+	"bittorrent-tunnel/btawg/internal/carrier"
+	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/dht"
 	"bittorrent-tunnel/btawg/internal/direct"
+	"bittorrent-tunnel/btawg/internal/iptunnel"
 	"bittorrent-tunnel/btawg/internal/mesh"
-	"bittorrent-tunnel/btawg/internal/portmap"
 )
 
 type directPeer struct {
@@ -32,138 +36,144 @@ type directPeer struct {
 	done       chan struct{}
 }
 
-func (n *meshNode) run(p2p, autoMap bool, port uint16, endpoint string, exitRunning *atomic.Int32) {
-	var sock *direct.Socket
-	var private, public string
-	var err error
+type peerOfferKey struct {
+	ip, origin netip.Addr
+	mode       string
+}
+
+func offerKey(p mesh.Pair) peerOfferKey { return peerOfferKey{p.IP, p.Origin, p.Mode} }
+
+type directIdentity struct {
+	private, public string
+	tls             *iptunnel.Identity
+}
+
+func newDirectIdentity() (directIdentity, error) {
+	private, public, err := awg.GenerateKeyPair()
+	if err != nil {
+		return directIdentity{}, err
+	}
+	tlsID, err := iptunnel.NewIdentity(private, iptunnel.Client)
+	return directIdentity{private, public, tlsID}, err
+}
+
+func (n *meshNode) run(p2p, autoMap bool, port uint16, endpoint, tcpEndpoint string, exitRunning *atomic.Int32) {
+	var sockets *peerSockets
+	var identity directIdentity
 	if p2p && n.owner.shared != nil {
-		private, public, err = awg.GenerateKeyPair()
-		if err == nil {
-			sock, err = direct.Listen(port)
-		}
-		if err != nil {
-			log.Printf("btawg-client: direct socket: %v", err)
-		}
-		if err != nil {
-			public = ""
-		}
-	}
-	if sock != nil {
-		defer sock.Close()
-	}
-	var mapped atomic.Pointer[[]netip.AddrPort]
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	if sock != nil && autoMap {
-		wg.Go(func() {
-			if err := portmap.Run(n.ctx, sock.Port(), func(aps []netip.AddrPort) { next := slices.Clone(aps); mapped.Store(&next) }); err != nil {
-				log.Printf("btawg-client: port mapping: %v", err)
-			}
-		})
-	}
-	var requested map[netip.Addr]time.Time
-	if sock != nil {
-		requested = make(map[netip.Addr]time.Time)
+		var err error
 		n.owner.shared.enableDirect(n.owner.cfg)
+		if p := n.peer.Load(); p != nil {
+			n.owner.shared.configurePeer(*p)
+		}
+		identity, err = newDirectIdentity()
+		if err == nil {
+			sockets, err = openPeerSockets(n.ctx, port, autoMap)
+		}
+		if err != nil {
+			log.Printf("btawg-client: direct peer sockets: %v", err)
+		}
 	}
-	active := make(map[netip.Addr]*directPeer)
+	if sockets != nil {
+		defer sockets.close()
+	}
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	active := make(map[peerOfferKey]*directPeer)
 	defer func() {
 		for _, p := range active {
 			p.stop()
 		}
 	}()
+	requested := make(map[netip.Addr]time.Time)
 	var observer netip.AddrPort
-	if sock != nil {
-		observer = n.observerEndpoint()
-	}
-	var observed netip.AddrPort
-	var expiry time.Time
+	var refresh time.Time
 	for n.ctx.Err() == nil {
-		reg := mesh.Registration{DirectKey: public, Egress: exitRunning.Load() > 0}
-		if sock != nil {
-			if ep, err := netip.ParseAddrPort(endpoint); err == nil {
-				kind := "public"
-				if ep.Addr().Is6() {
-					kind = "ipv6"
-				}
-				reg.Candidates = append(reg.Candidates, mesh.Candidate{Addr: ep, Kind: kind})
-			}
+		reg := mesh.Registration{Egress: exitRunning.Load() > 0}
+		if sockets != nil {
+			p := n.peer.Load()
+			reg.DirectKey, reg.TLSPin, reg.TransportPolicy = identity.public, identity.tls.Pin(), true
+			reg.IncomingModes, reg.OutgoingModes = p.IncomingModes(), p.OutgoingModes()
 			now := time.Now()
-			for addr, until := range requested {
+			for ip, until := range requested {
 				if !now.Before(until) {
-					delete(requested, addr)
+					delete(requested, ip)
 				}
 			}
-			for i := 0; i < cap(n.owner.shared.directWanted); i++ {
+			for range cap(n.owner.shared.directWanted) {
 				select {
-				case addr := <-n.owner.shared.directWanted:
-					if len(requested) < mesh.MaxPeers || !requested[addr].IsZero() {
-						requested[addr] = now.Add(mesh.Lease * 2)
+				case ip := <-n.owner.shared.directWanted:
+					if len(requested) < mesh.MaxPeers || !requested[ip].IsZero() {
+						requested[ip] = now.Add(mesh.Lease * 2)
 					}
 				default:
-					goto wantsReady
+					goto drained
 				}
 			}
-		wantsReady:
-			for addr := range requested {
-				reg.Want = append(reg.Want, addr)
+		drained:
+			for ip := range requested {
+				reg.Want = append(reg.Want, ip)
 			}
-			for _, c := range sock.LocalCandidates() {
-				reg.Candidates = append(reg.Candidates, mesh.Candidate{Addr: c.Addr, Kind: c.Kind})
-			}
-			if candidates := mapped.Load(); candidates != nil {
-				for _, ap := range *candidates {
-					reg.Candidates = append(reg.Candidates, mesh.Candidate{Addr: ap, Kind: "mapped"})
-				}
-			}
-			if time.Now().After(expiry) {
+			slices.SortFunc(reg.Want, netip.Addr.Compare)
+			if now.After(refresh) {
 				if !observer.IsValid() {
 					observer = n.observerEndpoint()
 				}
 				if observer.IsValid() {
-					ctx, cancel := context.WithTimeout(n.ctx, 500*time.Millisecond)
-					observed, _ = sock.Observe(ctx, observer)
-					cancel()
+					sockets.observe(n.ctx, observer)
 				}
-				expiry = time.Now().Add(8 * time.Second)
+				refresh = time.Now().Add(8 * time.Second)
 			}
-			if observed.IsValid() {
-				reg.Candidates = append(reg.Candidates, mesh.Candidate{Addr: observed, Kind: "observed"})
-			}
-			if len(reg.Candidates) > 32 {
-				reg.Candidates = reg.Candidates[:32]
+			reg.Candidates = sockets.candidates(endpoint, tcpEndpoint, reg.IncomingModes, reg.OutgoingModes)
+			if len(reg.Candidates) > 64 {
+				reg.Candidates = reg.Candidates[:64]
 			}
 		}
 		reply, err := n.register(reg)
-		if sock != nil && (err == nil || err == errMeshDenied) {
-			for addr, p := range active {
-				i := slices.IndexFunc(reply.Pairs, func(o mesh.Pair) bool { return o.IP == addr && o.Secret == p.secret })
-				if i < 0 {
-					p.stop()
-					continue
-				}
-				if !p.ready.Load() && !slices.Equal(p.candidates, reply.Pairs[i].Candidates) {
-					p.stop()
-					continue
-				}
-				p.until.Store(reply.Pairs[i].Expires.UnixNano())
-			}
+		if p2p && n.owner.shared != nil && err == nil {
+			n.owner.shared.setPeerNetwork(reply.Gateways, reply.PeerPrefixes)
+		}
+		if sockets != nil && (err == nil || err == errMeshDenied) {
+			local := netip.MustParseAddr(n.owner.cfg.ClientIP)
+			offers := make(map[peerOfferKey]mesh.Pair, len(reply.Pairs))
 			for _, offer := range reply.Pairs {
-				if _, ok := active[offer.IP]; ok {
+				if !offer.IP.Is4() || offer.IP == local || offer.Mode == "" || !offer.Origin.IsValid() || (offer.Origin != local && offer.Origin != offer.IP) || (offer.Origin == local) != offer.Initiator {
+					continue
+				}
+				modes := reg.IncomingModes
+				if offer.Origin == local {
+					modes = reg.OutgoingModes
+				}
+				if slices.Contains(modes, offer.Mode) {
+					offers[offerKey(offer)] = offer
+				}
+			}
+			for k, p := range active {
+				select {
+				case <-p.done:
+					delete(active, k)
+					continue
+				default:
+				}
+				offer, ok := offers[k]
+				if !ok || offer.Secret != p.secret || !p.ready.Load() && !slices.Equal(p.candidates, offer.Candidates) {
+					p.stop()
+					continue
+				}
+				p.until.Store(offer.Expires.UnixNano())
+			}
+			for k, offer := range offers {
+				if len(active) >= mesh.MaxPeerOffers {
+					break
+				}
+				if active[k] != nil {
 					continue
 				}
 				ctx, stop := context.WithCancel(n.ctx)
-				p := &directPeer{secret: offer.Secret, candidates: offer.Candidates, stop: stop, done: make(chan struct{})}
+				p := &directPeer{secret: offer.Secret, stop: stop, candidates: offer.Candidates, done: make(chan struct{})}
 				p.until.Store(offer.Expires.UnixNano())
-				active[offer.IP] = p
-				wg.Go(func() { defer close(p.done); defer stop(); n.runPeer(ctx, sock, private, offer, p) })
-			}
-		}
-		for addr, p := range active {
-			select {
-			case <-p.done:
-				delete(active, addr)
-			default:
+				active[k] = p
+				workers.Go(func() { defer close(p.done); defer stop(); n.runPeer(ctx, sockets, identity, offer, p) })
 			}
 		}
 		select {
@@ -194,30 +204,96 @@ func (n *meshNode) observerEndpoint() netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-func (n *meshNode) runPeer(ctx context.Context, sock *direct.Socket, private string, p mesh.Pair, peer *directPeer) {
-	if !p.IP.Is4() || len(p.Key) != 64 {
+func (n *meshNode) runPeer(ctx context.Context, sockets *peerSockets, id directIdentity, p mesh.Pair, peer *directPeer) {
+	started := time.Now()
+	var tr carrier.Transport
+	var raw net.Conn
+	dialer := p.Initiator
+	var err error
+	if config.IsNativeMode(p.Mode) {
+		tr, err = sockets.nativeConnect(ctx, p)
+	} else {
+		o := direct.Offer{Secret: p.Secret, Initiator: p.Initiator, Expires: p.Expires, Mode: p.Mode}
+		for _, c := range p.Candidates {
+			o.Candidates = append(o.Candidates, direct.Candidate{Addr: c.Addr, Kind: c.Kind, Protocol: c.Protocol})
+		}
+		tr, raw, dialer, err = sockets.stream.ConnectStream(ctx, o)
+	}
+	if err != nil {
+		return
+	}
+	defer tr.Wait()
+	defer tr.Close()
+	linkCtx, stop := context.WithCancel(ctx)
+	defer stop()
+	closeCarrier := context.AfterFunc(linkCtx, tr.Close)
+	defer closeCarrier()
+	shared := n.owner.shared
+	path := shared.newPath()
+	path.directLife, path.directUntil = linkCtx, &peer.until
+	path.peerOutbound, path.peerMode = p.Initiator, p.Mode
+	path.peerHealth = &managedTunnel{c: &Client{path: path}, life: linkCtx}
+	defer path.Close()
+	defer shared.removeDirect(p.IP, path)
+	local := netip.MustParseAddr(n.owner.cfg.ClientIP)
+	link := &directTun{tunPath: path, local: local, peer: p.IP}
+	var ready bool
+	var probeDone chan struct{}
+	defer func() {
+		if probeDone != nil {
+			stop()
+			<-probeDone
+		}
+	}()
+	publish := func() {
+		if ready || !path.validDirect() {
+			return
+		}
+		path.peerHealth.score.Store(int64(max(time.Since(started), time.Nanosecond)))
+		shared.setDirect(p.IP, path)
+		peer.ready.Store(true)
+		ready = true
+		if p.Initiator {
+			probeDone = make(chan struct{})
+			go func() { defer close(probeDone); n.probeDirect(linkCtx, path, p.IP) }()
+		}
+	}
+	if config.IsTLSMode(p.Mode) {
+		creds, err := id.tls.TLS(p.Key)
+		if err != nil {
+			return
+		}
+		stream := iptunnel.Stream(raw, tr)
+		secure := tls.Server(stream, creds)
+		if dialer {
+			secure = tls.Client(stream, creds)
+		}
+		handshake, cancel := context.WithDeadline(linkCtx, p.Expires)
+		stopHandshake := context.AfterFunc(handshake, tr.Close)
+		err = secure.HandshakeContext(handshake)
+		ok := stopHandshake()
+		cancel()
+		if err != nil || !ok {
+			return
+		}
+		publish()
+		var ioWG sync.WaitGroup
+		ioWG.Go(func() {
+			defer stop()
+			_ = iptunnel.SendPackets(path, func(b []byte) error { _, err := secure.Write(b); return err })
+		})
+		ioWG.Go(func() { defer stop(); _ = iptunnel.ReceivePackets(link, secure) })
+		n.waitPeer(linkCtx, tr, peer, nil)
+		stop()
+		path.Close()
+		tr.Close()
+		ioWG.Wait()
 		return
 	}
 	var key device.NoisePublicKey
 	if key.FromHex(p.Key) != nil {
 		return
 	}
-	offer := direct.Offer{Secret: p.Secret, Initiator: p.Initiator, Expires: p.Expires}
-	for _, c := range p.Candidates {
-		offer.Candidates = append(offer.Candidates, direct.Candidate{Addr: c.Addr, Kind: c.Kind})
-	}
-	tr, err := sock.Connect(ctx, offer)
-	if err != nil {
-		return
-	}
-	defer tr.Wait()
-	shared := n.owner.shared
-	path := shared.newPath()
-	path.directLife = ctx
-	path.directUntil = &peer.until
-	defer path.Close()
-	local := netip.MustParseAddr(n.owner.cfg.ClientIP)
-	link := &directTun{tunPath: path, local: local, peer: p.IP}
 	b := bind.New()
 	level := device.LogLevelError
 	if os.Getenv("BTAWG_AWG_VERBOSE") != "" {
@@ -226,32 +302,42 @@ func (n *meshNode) runPeer(ctx context.Context, sock *direct.Socket, private str
 	d := device.NewDevice(link, b, device.NewLogger(level, "btawg-p2p: "))
 	defer d.Close()
 	ep := bind.Endpoint(p.IP)
-	cfg := fmt.Sprintf("private_key=%s\n%spublic_key=%s\nallowed_ip=%s/32\nendpoint=%s\n", private, n.owner.cfg.Profile.String(), p.Key, p.IP, ep.DstToString())
-	if err := d.IpcSet(cfg); err != nil {
-		log.Printf("btawg-client: direct device config: %v", err)
-		return
+	profile := ""
+	if p.Mode != config.ModeWG {
+		profile = n.owner.cfg.Profile.String()
 	}
-	if err := d.Up(); err != nil {
-		log.Printf("btawg-client: direct device: %v", err)
+	cfg := fmt.Sprintf("private_key=%s\n%spublic_key=%s\nallowed_ip=%s/32\nendpoint=%s\n", id.private, profile, p.Key, p.IP, ep.DstToString())
+	if d.IpcSet(cfg) != nil || d.Up() != nil {
 		return
 	}
 	b.Attach(ep, tr)
-	// The responder learns the session on the first initiation and confirms
-	// it on the first encrypted keepalive. Do not race two AWG handshakes.
 	if p.Initiator {
-		if err := d.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=5\n", p.Key)); err != nil {
+		if d.IpcSet(fmt.Sprintf("public_key=%s\npersistent_keepalive_interval=5\n", p.Key)) != nil {
 			return
 		}
-		if wg := d.LookupPeer(key); wg != nil {
-			wg.SendKeepalive()
+		if remote := d.LookupPeer(key); remote != nil {
+			remote.SendKeepalive()
 		}
 	}
-	ready := false
-	defer func() {
+	n.waitPeer(linkCtx, tr, peer, func() bool {
 		if ready {
-			shared.removeDirect(p.IP, path)
+			return true
 		}
-	}()
+		status, err := d.IpcGet()
+		if err != nil {
+			return false
+		}
+		for line := range strings.SplitSeq(status, "\n") {
+			if sec, ok := strings.CutPrefix(line, "last_handshake_time_sec="); ok && sec != "0" {
+				publish()
+				return true
+			}
+		}
+		return !time.Now().After(p.Expires)
+	})
+}
+
+func (n *meshNode) waitPeer(ctx context.Context, tr carrier.Transport, p *directPeer, poll func() bool) {
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -262,35 +348,14 @@ func (n *meshNode) runPeer(ctx context.Context, sock *direct.Socket, private str
 			return
 		case <-tick.C:
 		}
-		now := time.Now()
-		if now.UnixNano() >= peer.until.Load() {
+		if time.Now().UnixNano() >= p.until.Load() || poll != nil && !poll() {
 			return
-		}
-		if !ready {
-			status, err := d.IpcGet()
-			if err != nil {
-				return
-			}
-			for line := range strings.SplitSeq(status, "\n") {
-				if secs, ok := strings.CutPrefix(line, "last_handshake_time_sec="); ok && secs != "0" {
-					if ctx.Err() != nil {
-						return
-					}
-					shared.setDirect(p.IP, path)
-					ready = true
-					peer.ready.Store(true)
-					break
-				}
-			}
-			if !ready && !now.Before(p.Expires) {
-				return
-			}
 		}
 	}
 }
 
-// AWG only accepts the peer's overlay /32; this also rejects any packet
-// destined elsewhere, including attempts to use this device as a router.
+// The paired path admits only packets authenticated under the peer's engine
+// and stamped with its exact overlay address. Pin replies before feeding TUN.
 type directTun struct {
 	*tunPath
 	local, peer netip.Addr
@@ -299,15 +364,16 @@ type directTun struct {
 var _ tun.Device = (*directTun)(nil)
 
 func (t *directTun) Write(bufs [][]byte, offset int) (int, error) {
-	if !t.validDirect() {
-		return len(bufs), nil
-	}
 	for _, b := range bufs {
 		if len(b) < offset+20 {
 			continue
 		}
 		p := b[offset:]
-		if p[0]>>4 != 4 || netip.AddrFrom4([4]byte(p[12:16])) != t.peer || netip.AddrFrom4([4]byte(p[16:20])) != t.local {
+		h := int(p[0]&15) * 4
+		if p[0]>>4 != 4 || h < 20 || h > len(p) || netip.AddrFrom4([4]byte(p[12:16])) != t.peer || netip.AddrFrom4([4]byte(p[16:20])) != t.local {
+			continue
+		}
+		if !t.shared.acceptPeerPacket(t.tunPath, p, h) {
 			continue
 		}
 		if _, err := t.tunPath.Write([][]byte{b}, offset); err != nil {

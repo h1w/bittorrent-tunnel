@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"bittorrent-tunnel/btawg/internal/config"
@@ -134,13 +135,19 @@ func meshNode(rec store.ClientRecord) mesh.Node {
 
 func (s *Server) meshRegister(rec store.ClientRecord, ip netip.Addr, req mesh.Registration, now time.Time) (mesh.Reply, error) {
 	var reply mesh.Reply
-	if len(req.Want) > mesh.MaxPeers || len(req.Candidates) > 32 {
-		return reply, errors.New("too many candidates")
+	if len(req.Want) > mesh.MaxPeers || len(req.Candidates) > 64 || !validMeshModes(req.IncomingModes) || !validMeshModes(req.OutgoingModes) {
+		return reply, errors.New("invalid peer candidates or transport modes")
 	}
 	if req.DirectKey != "" {
 		key, err := hex.DecodeString(req.DirectKey)
 		if err != nil || len(key) != 32 || req.DirectKey == rec.PubKey {
 			return reply, errors.New("invalid direct key")
+		}
+		if req.TransportPolicy {
+			pin, err := hex.DecodeString(req.TLSPin)
+			if err != nil || len(pin) != 32 {
+				return reply, errors.New("invalid direct TLS pin")
+			}
 		}
 	} else if len(req.Candidates) != 0 || len(req.Want) != 0 {
 		return reply, errors.New("missing direct key")
@@ -151,6 +158,9 @@ func (s *Server) meshRegister(rec store.ClientRecord, ip netip.Addr, req mesh.Re
 			return true
 		}
 		if s.policy.Contains(a) {
+			return true
+		}
+		if c.Mode != "" && !config.IsNativeMode(c.Mode) || c.Protocol != "" && c.Protocol != "udp" && c.Protocol != "tcp" || c.Mode != "" && c.Protocol == "tcp" {
 			return true
 		}
 		switch c.Kind {
@@ -173,6 +183,7 @@ func (s *Server) meshRegister(rec store.ClientRecord, ip netip.Addr, req mesh.Re
 	s.mesh.clients[rec.ID] = self
 	for _, gateway := range s.gateways {
 		reply.Gateways = append(reply.Gateways, gateway.Addr())
+		reply.PeerPrefixes = append(reply.PeerPrefixes, gateway.Masked())
 	}
 	if s.kernel != nil {
 		s.policy.mu.RLock()
@@ -215,7 +226,7 @@ func (s *Server) meshRegister(rec store.ClientRecord, ip netip.Addr, req mesh.Re
 			}
 		}
 		for id, peer := range s.mesh.clients {
-			if len(reply.Pairs) >= mesh.MaxPeers {
+			if len(reply.Pairs) >= mesh.MaxPeerOffers {
 				break
 			}
 			if slices.Contains(peer.Want, self.ip) {
@@ -226,42 +237,109 @@ func (s *Server) meshRegister(rec store.ClientRecord, ip netip.Addr, req mesh.Re
 	return reply, nil
 }
 
+func validMeshModes(modes []string) bool {
+	if len(modes) > len(config.ClientModes()) {
+		return false
+	}
+	for i, mode := range modes {
+		if !config.ValidClientMode(mode) || config.CanonicalMode(mode) != mode || slices.Contains(modes[:i], mode) {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) appendPair(reply *mesh.Reply, rec store.ClientRecord, self meshRegistration, id string, now time.Time) {
 	peer, ok := s.mesh.clients[id]
-	if !ok || id == rec.ID || peer.DirectKey == "" || peer.DirectKey == self.DirectKey || len(reply.Pairs) >= mesh.MaxPeers {
+	if !ok || id == rec.ID || peer.DirectKey == "" || peer.DirectKey == self.DirectKey || len(reply.Pairs) >= mesh.MaxPeerOffers || !now.Before(peer.until) {
 		return
-	}
-	for _, pair := range reply.Pairs {
-		if pair.IP == peer.ip {
-			return
-		}
 	}
 	current, ok := s.meshClient(peer.ip)
 	if !ok || current.ID != id || current.PubKey != peer.key || !s.policy.clientCanReach(self.ip, peer.ip) {
 		return
 	}
-	a, b := self, peer
-	aID, bID := rec.ID, id
-	init := aID < bID
-	if !init {
-		a, b = b, a
-		aID, bID = bID, aID
+	if !self.TransportPolicy || !peer.TransportPolicy {
+		// An old client cannot enforce directional transport admission.
+		// Preserve the original symmetric contract only between old clients.
+		if !self.TransportPolicy && !peer.TransportPolicy {
+			a, b, aID, bID := self, peer, rec.ID, id
+			initiator := aID < bID
+			if !initiator {
+				a, b, aID, bID = b, a, bID, aID
+			}
+			s.appendPairMode(reply, self, peer, a, b, aID, bID, "", initiator)
+		}
+		return
+	}
+	if slices.Contains(self.Want, peer.ip) {
+		for _, mode := range self.OutgoingModes {
+			if slices.Contains(peer.IncomingModes, mode) {
+				s.appendPairMode(reply, self, peer, self, peer, rec.ID, id, mode, true)
+			}
+		}
+	}
+	if slices.Contains(peer.Want, self.ip) {
+		for _, mode := range peer.OutgoingModes {
+			if slices.Contains(self.IncomingModes, mode) {
+				s.appendPairMode(reply, self, peer, peer, self, id, rec.ID, mode, false)
+			}
+		}
+	}
+}
+
+func (s *Server) appendPairMode(reply *mesh.Reply, self, peer, a, b meshRegistration, aID, bID, mode string, initiator bool) {
+	if len(reply.Pairs) >= mesh.MaxPeerOffers {
+		return
+	}
+	var origin netip.Addr
+	if mode != "" {
+		origin = a.ip
+	}
+	for _, pair := range reply.Pairs {
+		if pair.IP == peer.ip && pair.Mode == mode && pair.Origin == origin {
+			return
+		}
 	}
 	mac := hmac.New(sha256.New, s.mesh.key[:])
 	for _, x := range []string{"btawg/mesh-pair/v1", aID, a.ip.String(), a.key, a.DirectKey, bID, b.ip.String(), b.key, b.DirectKey} {
 		mac.Write([]byte(x))
 		mac.Write([]byte{0})
 	}
-	var secret [32]byte
-	copy(secret[:], mac.Sum(nil))
-	if !now.Before(peer.until) {
-		return
+	if mode != "" {
+		for _, x := range []string{mode, a.TLSPin, b.TLSPin} {
+			mac.Write([]byte(x))
+			mac.Write([]byte{0})
+		}
 	}
+	var secret [32]byte
+	mac.Sum(secret[:0])
 	until := self.until
 	if peer.until.Before(until) {
 		until = peer.until
 	}
-	reply.Pairs = append(reply.Pairs, mesh.Pair{IP: peer.ip, Key: peer.DirectKey, Secret: secret, Initiator: init, Candidates: peer.Candidates, Expires: until})
+	candidates := peer.Candidates
+	key := peer.DirectKey
+	if mode != "" {
+		candidates = nil
+		for _, c := range peer.Candidates {
+			switch {
+			case config.IsNativeMode(mode):
+				if c.Mode != mode || c.Receive != initiator {
+					continue
+				}
+			case c.Mode != "" || (c.Protocol == "tcp") != strings.HasSuffix(mode, "-tcp"):
+				continue
+			}
+			candidates = append(candidates, c)
+			if len(candidates) == 8 {
+				break
+			}
+		}
+		if config.IsTLSMode(mode) {
+			key = peer.TLSPin
+		}
+	}
+	reply.Pairs = append(reply.Pairs, mesh.Pair{IP: peer.ip, Key: key, Secret: secret, Initiator: initiator, Candidates: candidates, Expires: until, Mode: mode, Origin: origin})
 }
 
 func (s *Server) meshHopsAvailable(hops []store.ClientRecord, now time.Time) bool {

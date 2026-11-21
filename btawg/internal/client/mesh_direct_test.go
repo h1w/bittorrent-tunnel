@@ -102,6 +102,7 @@ func TestManagedDirectTUNWithHubRevocation(t *testing.T) {
 	}
 	stdin.Close()
 	waitMesh(t, func() bool { _, err := os.Stat(path + ".ready"); return err == nil }, "child TUN listener")
+	mode := selectedTestPeerMode()
 	client := newDirectFixture(t, a, "direct-a")
 
 	peerIP := netip.MustParseAddr(b.ClientIP)
@@ -111,6 +112,24 @@ func TestManagedDirectTUNWithHubRevocation(t *testing.T) {
 		var d net.Dialer
 		return d.DialContext(try, "tcp4", netip.AddrPortFrom(peerIP, 19722).String())
 	}
+	if os.Getenv("BTAWG_PEER_DENY") == "1" {
+		if c, err := dial(); err == nil {
+			c.Close()
+			t.Fatal("direct refusal leaked to the hub with relay disabled")
+		}
+		client.applyPeerSettings(PeerSettings{Outgoing: mode, Relay: true})
+		waitMesh(t, func() bool {
+			c, err := dial()
+			if c != nil {
+				c.Close()
+			}
+			return err == nil
+		}, "explicit relay")
+		if client.shared.directPath(peerIP) != nil {
+			t.Fatal("peer admitted forbidden direct mode")
+		}
+		return
+	}
 	waitMesh(t, func() bool {
 		c, err := dial()
 		if c != nil {
@@ -119,6 +138,9 @@ func TestManagedDirectTUNWithHubRevocation(t *testing.T) {
 		return err == nil
 	}, "peer reachable over overlay")
 	waitMesh(t, func() bool { return client.shared.directPath(peerIP) != nil }, "authenticated direct path")
+	if p := client.shared.directPath(peerIP); p == nil || p.peerMode != mode {
+		t.Fatalf("did not select requested mode %s", mode)
+	}
 	before := hub.Traffic()["b"]
 	c, err := dial()
 	if err != nil {
@@ -154,13 +176,26 @@ func TestManagedDirectTUNWithHubRevocation(t *testing.T) {
 
 func newDirectFixture(t *testing.T, cfg config.ClientConfig, name string) *Managed {
 	t.Helper()
-	m, err := newManagedAt(t.Context(), cfg, []string{config.ModeWG}, netip.MustParseAddr("127.0.0.1"), Credentials{Username: "direct", Password: "test"}, true, name, 0, nil)
+	mode := selectedTestPeerMode()
+	peer := PeerSettings{Incoming: []string{mode}, Outgoing: mode}
+	if name == "direct-b" && os.Getenv("BTAWG_PEER_DENY") == "1" {
+		peer.Incoming = []string{}
+		peer.Relay = true
+	}
+	m, err := newManagedWithPeer(t.Context(), cfg, []string{config.ModeWG}, netip.MustParseAddr("127.0.0.1"), Credentials{Username: "direct", Password: "test"}, true, name, 0, nil, nil, true, peer)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { m.Close() })
-	m.startNetwork(true, false, false, 0, "")
+	m.startNetwork(true, false, false, 0, "", "")
 	return m
+}
+
+func selectedTestPeerMode() string {
+	if mode := os.Getenv("BTAWG_PEER_MODE"); mode != "" {
+		return mode
+	}
+	return config.ModeExtUTP
 }
 
 func runDirectChild(t *testing.T, cfg config.ClientConfig, ready string) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"slices"
 
 	"bittorrent-tunnel/btawg/internal/config"
 	"bittorrent-tunnel/btawg/internal/mesh"
@@ -29,6 +30,87 @@ type RouteOption struct {
 	Name string `json:"name"`
 }
 
+// PeerSettings controls directional peer transports independently of SOCKS5.
+type PeerSettings struct {
+	Incoming []string            `json:"incoming"`
+	Outgoing string              `json:"outgoing"`
+	Pools    map[string][]string `json:"pools"`
+	Relay    bool                `json:"relay"`
+}
+
+// SelectedMode returns the canonical transport or pool selected for outgoing flows.
+func (p PeerSettings) SelectedMode() string {
+	if p.Outgoing == "" {
+		return config.ModeExtUTP
+	}
+	return config.CanonicalMode(p.Outgoing)
+}
+
+func canonicalPeerModes(modes []string) []string {
+	result := make([]string, 0, len(modes))
+	for _, mode := range modes {
+		result = append(result, config.CanonicalMode(mode))
+	}
+	return result
+}
+
+// IncomingModes returns the canonical incoming allowlist, respecting explicit empty lists.
+func (p PeerSettings) IncomingModes() []string {
+	if p.Incoming == nil {
+		return []string{config.ModeExtUTP}
+	}
+	return canonicalPeerModes(p.Incoming)
+}
+
+// OutgoingModes returns the selected transport or ordered members of its pool.
+func (p PeerSettings) OutgoingModes() []string {
+	selected := p.SelectedMode()
+	if !slices.Contains(balancerPolicies[:], selected) {
+		return []string{selected}
+	}
+	pool, ok := p.Pools[selected]
+	if !ok {
+		return config.ClientModes()
+	}
+	return canonicalPeerModes(pool)
+}
+
+func (p PeerSettings) validate() error {
+	validateModes := func(modes []string) error {
+		seen := make(map[string]bool, len(modes))
+		for _, mode := range modes {
+			canonical := config.CanonicalMode(mode)
+			if !config.ValidClientMode(canonical) {
+				return fmt.Errorf("unsupported peer transport %q", mode)
+			}
+			if seen[canonical] {
+				return fmt.Errorf("duplicate peer transport %q", mode)
+			}
+			seen[canonical] = true
+		}
+		return nil
+	}
+	if err := validateModes(p.Incoming); err != nil {
+		return err
+	}
+	selected := p.SelectedMode()
+	if !config.ValidClientMode(selected) && !slices.Contains(balancerPolicies[:], selected) {
+		return fmt.Errorf("unknown peer transport or policy %q", p.Outgoing)
+	}
+	for policy, modes := range p.Pools {
+		if !slices.Contains(balancerPolicies[:], policy) {
+			return fmt.Errorf("unknown peer pool %q", policy)
+		}
+		if modes == nil {
+			return fmt.Errorf("peer pool %q must be an array", policy)
+		}
+		if err := validateModes(modes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ManagedConfig is the root-owned client configuration and persists across
 // upgrades and restarts.
 type ManagedConfig struct {
@@ -41,12 +123,14 @@ type ManagedConfig struct {
 	// A missing balancer pool follows Enabled; an empty list routes nothing.
 	Balancers map[string][]string `json:"balancers,omitempty"`
 	// Missing entries use the hub; explicit choices survive catalogue changes.
-	Routes       map[int]string `json:"routes,omitempty"`
-	P2P          bool           `json:"p2p,omitempty"`
-	AutoMap      bool           `json:"auto_map,omitempty"`
-	ServeEgress  bool           `json:"serve_egress,omitempty"`
-	PeerPort     uint16         `json:"peer_port,omitempty"` // zero lets the OS allocate a port
-	PeerEndpoint string         `json:"peer_endpoint,omitempty"`
+	Routes          map[int]string `json:"routes,omitempty"`
+	P2P             bool           `json:"p2p,omitempty"`
+	AutoMap         bool           `json:"auto_map,omitempty"`
+	ServeEgress     bool           `json:"serve_egress,omitempty"`
+	PeerPort        uint16         `json:"peer_port,omitempty"` // zero lets the OS allocate a port
+	PeerEndpoint    string         `json:"peer_endpoint,omitempty"`
+	PeerTCPEndpoint string         `json:"peer_tcp_endpoint,omitempty"`
+	Peer            PeerSettings   `json:"peer"`
 }
 
 func selectedRouteID(routes map[int]string, port int) string {
@@ -59,18 +143,23 @@ func selectedRouteID(routes map[int]string, port int) string {
 var globalIPv6 = netip.MustParsePrefix("2000::/3")
 
 func (c ManagedConfig) validatePeerSettings(realTUN bool) error {
+	if err := c.Peer.validate(); err != nil {
+		return err
+	}
 	if c.P2P && (!realTUN || c.NoTUN) {
 		return fmt.Errorf("direct peer connections require a TUN interface")
 	}
 	if c.AutoMap && !c.P2P {
 		return fmt.Errorf("automatic peer port mapping requires P2P")
 	}
-	if c.PeerEndpoint != "" {
-		endpoint, err := netip.ParseAddrPort(c.PeerEndpoint)
+	for i, raw := range [2]string{c.PeerEndpoint, c.PeerTCPEndpoint} {
+		if raw == "" {
+			continue
+		}
+		endpoint, err := netip.ParseAddrPort(raw)
 		ip := endpoint.Addr()
-		if err != nil || endpoint.Port() == 0 || ip.Zone() != "" || ip.Is4In6() ||
-			!config.PublicIPv4(ip) && !globalIPv6.Contains(ip) {
-			return fmt.Errorf("public P2P UDP address must be a public IPv4 or global IPv6 address with a nonzero port")
+		if err != nil || endpoint.Port() == 0 || ip.Zone() != "" || ip.Is4In6() || !config.PublicIPv4(ip) && !globalIPv6.Contains(ip) {
+			return fmt.Errorf("public P2P %s address must be a public IPv4 or global IPv6 address with a nonzero port", [2]string{"UDP", "TCP"}[i])
 		}
 	}
 	return nil

@@ -13,16 +13,18 @@ import (
 )
 
 const (
-	ControlPort = 1054
-	EgressPort  = 1055
-	RelayPort   = 1056
-	HubRoute    = "hub"
-	Lease       = 15 * time.Second
-	Poll        = 2 * time.Second
-	MaxRequest  = 32 << 10
-	MaxReply    = 512 << 10
-	MaxPeers    = 32
-	Path        = "/v1/mesh"
+	ControlPort   = 1054
+	EgressPort    = 1055
+	RelayPort     = 1056
+	PeerProbePort = 1057
+	HubRoute      = "hub"
+	Lease         = 15 * time.Second
+	Poll          = 2 * time.Second
+	MaxRequest    = 32 << 10
+	MaxReply      = 512 << 10
+	MaxPeers      = 32
+	MaxPeerOffers = MaxPeers * 10 * 2
+	Path          = "/v1/mesh"
 )
 
 // Node identifies one enrollment independently of its current overlay address.
@@ -33,15 +35,22 @@ type Node struct {
 }
 
 type Candidate struct {
-	Addr netip.AddrPort `json:"addr"`
-	Kind string         `json:"kind"`
+	Addr     netip.AddrPort `json:"addr"`
+	Kind     string         `json:"kind"`
+	Protocol string         `json:"protocol,omitempty"` // empty is UDP
+	Mode     string         `json:"mode,omitempty"`     // native UDP candidates are mode-specific
+	Receive  bool           `json:"receive,omitempty"`  // native socket accepts new flows
 }
 
 type Registration struct {
-	DirectKey  string       `json:"key,omitempty"`
-	Candidates []Candidate  `json:"candidates,omitempty"`
-	Want       []netip.Addr `json:"want,omitempty"`
-	Egress     bool         `json:"egress,omitempty"`
+	DirectKey       string       `json:"key,omitempty"`
+	Candidates      []Candidate  `json:"candidates,omitempty"`
+	Want            []netip.Addr `json:"want,omitempty"`
+	Egress          bool         `json:"egress,omitempty"`
+	TransportPolicy bool         `json:"transport_policy,omitempty"`
+	IncomingModes   []string     `json:"incoming_modes,omitempty"`
+	OutgoingModes   []string     `json:"outgoing_modes,omitempty"`
+	TLSPin          string       `json:"tls_pin,omitempty"`
 }
 
 type Pair struct {
@@ -51,6 +60,8 @@ type Pair struct {
 	Initiator  bool        `json:"initiator"`
 	Candidates []Candidate `json:"candidates"`
 	Expires    time.Time   `json:"expires"`
+	Mode       string      `json:"mode,omitempty"`
+	Origin     netip.Addr  `json:"origin,omitempty"` // initiator of flows, not just the physical connection
 }
 
 type Route struct {
@@ -75,12 +86,13 @@ type Request struct {
 }
 
 type Reply struct {
-	Routes   []Route        `json:"routes,omitempty"`
-	Pairs    []Pair         `json:"pairs,omitempty"`
-	Next     netip.Addr     `json:"next,omitempty"`
-	Gateways []netip.Addr   `json:"gateways,omitempty"`
-	Prefixes []netip.Prefix `json:"prefixes,omitempty"`
-	Session  string         `json:"session,omitempty"`
+	Routes       []Route        `json:"routes,omitempty"`
+	Pairs        []Pair         `json:"pairs,omitempty"`
+	Next         netip.Addr     `json:"next,omitempty"`
+	Gateways     []netip.Addr   `json:"gateways,omitempty"`
+	Prefixes     []netip.Prefix `json:"prefixes,omitempty"`
+	PeerPrefixes []netip.Prefix `json:"peer_prefixes,omitempty"`
+	Session      string         `json:"session,omitempty"`
 }
 
 type Grant struct {

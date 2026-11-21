@@ -1,4 +1,4 @@
-// Package direct establishes a BitTorrent extended carrier over a peer-to-peer UDP path.
+// Package direct establishes authenticated peer-to-peer BitTorrent carriers.
 package direct
 
 import (
@@ -15,10 +15,11 @@ import (
 	"github.com/anacrolix/go-utp/purego"
 )
 
-// Candidate is an advertised UDP endpoint. Kind is lan, public, mapped, observed or ipv6.
+// Candidate is an advertised endpoint. Empty Protocol denotes UDP.
 type Candidate struct {
-	Addr netip.AddrPort
-	Kind string
+	Addr     netip.AddrPort
+	Kind     string
+	Protocol string
 }
 
 // Offer is a short-lived grant for one pair. Both peers have the same secret
@@ -29,14 +30,17 @@ type Offer struct {
 	Initiator  bool
 	Candidates []Candidate
 	Expires    time.Time
+	Mode       string
 }
 
 // Socket owns the long-lived UDP endpoints and the streams established on them.
 type Socket struct {
-	v4, v6 *purego.Socket
-	port   uint16
-	ctx    context.Context
-	cancel context.CancelFunc
+	v4, v6  *purego.Socket
+	port    uint16
+	tcp     net.Listener
+	tcpPort uint16
+	ctx     context.Context
+	cancel  context.CancelFunc
 
 	mu         sync.Mutex // Never call µTP while holding mu: its firewall takes mu.
 	closed     bool
@@ -51,7 +55,10 @@ type Socket struct {
 
 // Listen binds UDP4 and, where available, UDP6 to the same port on all local
 // addresses. Zero tries the BitTorrent port range and then an ephemeral port.
-func Listen(port uint16) (*Socket, error) {
+func Listen(port uint16) (*Socket, error) { return ListenWithTCP(port, false) }
+
+// ListenWithTCP optionally binds a separate TCP listener alongside the UDP socket.
+func ListenWithTCP(port uint16, tcp bool) (*Socket, error) {
 	pc, err := bind4(port)
 	if err != nil {
 		return nil, fmt.Errorf("listen on direct UDP4: %w", err)
@@ -71,6 +78,13 @@ func Listen(port uint16) (*Socket, error) {
 		observers:  make(map[token]observation),
 		transports: make(map[*ownedConn]carrier.Transport),
 		accepting:  make(chan struct{}, 32),
+	}
+	if tcp {
+		s.tcp, err = net.Listen("tcp", net.JoinHostPort("", fmt.Sprint(port)))
+		if err == nil {
+			s.tcpPort = uint16(s.tcp.Addr().(*net.TCPAddr).Port)
+			s.workers.Go(func() { s.acceptTCP() })
+		}
 	}
 	if pc6, err := net.ListenUDP("udp6", &net.UDPAddr{Port: int(s.port)}); err == nil {
 		if s.v6, err = carrier.NewUTPSocket(pc6); err != nil {
@@ -101,6 +115,9 @@ func bind4(port uint16) (*net.UDPConn, error) {
 
 // Port is the bound UDP port, also used by the optional IPv6 socket.
 func (s *Socket) Port() uint16 { return s.port }
+
+// TCPPort returns the TCP listener port, or zero when TCP is disabled.
+func (s *Socket) TCPPort() uint16 { return s.tcpPort }
 
 // LocalCandidates enumerates current interface addresses, so callers may use
 // it again following network changes. External mappings and observations are
@@ -135,6 +152,9 @@ func (s *Socket) LocalCandidates() []Candidate {
 			}
 			seen[ip] = true
 			result = append(result, Candidate{Addr: netip.AddrPortFrom(ip, s.port), Kind: kind})
+			if s.tcpPort != 0 {
+				result = append(result, Candidate{Addr: netip.AddrPortFrom(ip, s.tcpPort), Kind: kind, Protocol: "tcp"})
+			}
 		}
 	}
 	return result
@@ -197,6 +217,9 @@ func (s *Socket) Close() error {
 		if s.v6 != nil {
 			s.closeErr = errors.Join(s.closeErr, s.v6.Close())
 		}
+		if s.tcp != nil {
+			s.closeErr = errors.Join(s.closeErr, s.tcp.Close())
+		}
 		for _, tr := range transports {
 			tr.Wait()
 		}
@@ -221,13 +244,19 @@ func (c *ownedConn) Close() error {
 	return c.Conn.Close()
 }
 
-func (s *Socket) extended(ctx context.Context, c net.Conn, key [32]byte) (carrier.Transport, error) {
+func (s *Socket) streamCarrier(ctx context.Context, c net.Conn, key [32]byte, framing string, dialer bool) (carrier.Transport, error) {
 	var infoHash, peerID [20]byte
 	hash := mac(key, "btawg/direct/infohash/1", nil)
 	copy(infoHash[:], hash[:])
 	random(peerID[:])
 	owned := &ownedConn{Conn: c, s: s}
-	tr, _, err := carrier.NewExtended(owned, infoHash, peerID)
+	var tr carrier.Transport
+	var err error
+	if framing == "req" {
+		tr, _, err = carrier.NewRequestPiece(owned, infoHash, peerID, !dialer)
+	} else {
+		tr, _, err = carrier.NewExtended(owned, infoHash, peerID)
+	}
 	if err != nil {
 		return nil, err
 	}

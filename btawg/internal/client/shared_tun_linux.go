@@ -37,13 +37,23 @@ type sharedTUN struct {
 	done        chan struct{}
 	readErr     error // published by closing done
 
-	mu            sync.RWMutex
-	ports         map[localPort]*socketPath
-	direct        map[netip.Addr]*tunPath
-	directRanges  []netip.Prefix
-	directGateway netip.Addr
-	directOwn     netip.Addr
-	directWanted  chan netip.Addr
+	mu             sync.RWMutex
+	ports          map[localPort]*socketPath
+	direct         map[netip.Addr]*peerPathGroup
+	directRanges   []netip.Prefix
+	peerNetwork    []netip.Prefix
+	directGateways map[netip.Addr]bool
+	directOwn      netip.Addr
+	directWanted   chan netip.Addr
+	peerModes      []string
+	peerIncoming   []string
+	peerUse        string
+	peerRelay      bool
+	peerFlows      map[peerTuple]peerFlow
+	peerRequests   map[netip.Addr]time.Time
+	peerEnabled    atomic.Bool
+	peerFragments  map[fragmentID]fragmentPath
+	peerSweep      time.Time
 }
 
 type localPort struct {
@@ -58,14 +68,17 @@ type socketPath struct {
 }
 
 type tunPath struct {
-	shared      *sharedTUN
-	directLife  context.Context
-	directUntil *atomic.Int64
-	packets     chan *[]byte
-	done        chan struct{}
-	events      chan tun.Event
-	mu          sync.Mutex // serialize close and enqueue
-	closed      bool
+	shared       *sharedTUN
+	directLife   context.Context
+	directUntil  *atomic.Int64
+	peerOutbound bool
+	peerMode     string
+	peerHealth   *managedTunnel
+	packets      chan *[]byte
+	done         chan struct{}
+	events       chan tun.Event
+	mu           sync.Mutex // serialize close and enqueue
+	closed       bool
 }
 
 func newSharedTUN(dev tun.Device, name string, mtu int) *sharedTUN {
@@ -173,7 +186,7 @@ func (s *sharedTUN) dispatch() {
 			} else {
 				path = s.packetPath(p, hlen)
 			}
-			if path != nil && path.enqueue(storage[i], b) {
+			if path != nil && s.enqueuePacket(path, storage[i], b, p) {
 				storage[i] = s.pool.Get().(*[]byte)
 				bufs[i] = (*storage[i])[:cap(*storage[i])]
 			}
@@ -200,24 +213,9 @@ func (s *sharedTUN) packetPath(p []byte, hlen int) *tunPath {
 	if primary := s.primary.Load(); primary == nil && p[9] == 6 && len(p) >= hlen+4 && binary.BigEndian.Uint16(p[hlen:]) == mesh.EgressPort {
 		return s.servicePath.Load()
 	}
-	if dst := netip.AddrFrom4([4]byte(p[16:20])); dst.IsValid() {
-		s.mu.RLock()
-		path := s.direct[dst]
-		if wanted := s.directWanted; wanted != nil && dst != s.directGateway && dst != s.directOwn {
-			for _, prefix := range s.directRanges {
-				if prefix.Contains(dst) {
-					select {
-					case wanted <- dst:
-					default:
-					}
-					break
-				}
-			}
-		}
-		s.mu.RUnlock()
-		if path != nil && path.validDirect() {
-			return path
-		}
+	dst := netip.AddrFrom4([4]byte(p[16:20]))
+	if path, handled := s.choosePeerPacket(p, hlen, dst); handled {
+		return path
 	}
 	return s.primary.Load()
 }
@@ -238,7 +236,7 @@ func (p *tunPath) enqueue(storage *[]byte, packet []byte) bool {
 }
 
 func (p *tunPath) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
-	for n := range bufs {
+	for n := 0; n < len(bufs); {
 		var b *[]byte
 		if n == 0 {
 			select {
@@ -264,17 +262,50 @@ func (p *tunPath) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 			return n, net.ErrClosed
 		}
 		packet := (*b)[packetHeadroom:]
+		if p.shared.peerEnabled.Load() && len(packet) >= 20 {
+			dst := netip.AddrFrom4([4]byte(packet[16:20]))
+			p.shared.mu.RLock()
+			allowed := !p.shared.shouldRoutePeerLocked(dst) || p.shared.peerPathAllowedLocked(p)
+			p.shared.mu.RUnlock()
+			if !allowed {
+				p.shared.pool.Put(b)
+				continue
+			}
+		}
 		if len(packet) > len(bufs[n])-offset {
 			p.shared.pool.Put(b)
 			return n, io.ErrShortBuffer
 		}
 		sizes[n] = copy(bufs[n][offset:], packet)
 		p.shared.pool.Put(b)
+		n++
 	}
 	return len(bufs), nil
 }
 
 func (p *tunPath) Write(bufs [][]byte, offset int) (int, error) {
+	if p.directLife != nil || !p.shared.peerEnabled.Load() {
+		return p.shared.dev.Write(bufs, offset)
+	}
+	for i, b := range bufs {
+		if len(b) < offset+20 || !p.shared.acceptHubPacket(p, b[offset:]) {
+			// The engine owns these buffers; compact into a local batch only
+			// when policy filters at least one packet.
+			var filtered [pathBatchSize][]byte
+			allowed := append(filtered[:0], bufs[:i]...)
+			for _, next := range bufs[i+1:] {
+				if len(next) >= offset+20 && p.shared.acceptHubPacket(p, next[offset:]) {
+					allowed = append(allowed, next)
+				}
+			}
+			if len(allowed) > 0 {
+				if _, err := p.shared.dev.Write(allowed, offset); err != nil {
+					return 0, err
+				}
+			}
+			return len(bufs), nil
+		}
+	}
 	return p.shared.dev.Write(bufs, offset)
 }
 

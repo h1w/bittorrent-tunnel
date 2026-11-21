@@ -23,7 +23,7 @@ func TestConnectFallsBackAfterVerifiedCandidateDropsUTP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	lease := time.Now().Add(5 * time.Second)
-	out := runConnect(ctx, a, Offer{key, true, []Candidate{{bad, "observed"}, {addrB, "lan"}}, lease})
+	out := runConnect(ctx, a, Offer{Secret: key, Initiator: true, Candidates: []Candidate{{Addr: bad, Kind: "observed"}, {Addr: addrB, Kind: "lan"}}, Expires: lease})
 
 	if err := blackhole.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -53,7 +53,7 @@ func TestConnectFallsBackAfterVerifiedCandidateDropsUTP(t *testing.T) {
 		}
 	}
 	// b is activated only after a has committed time to the failed path.
-	in := runConnect(ctx, b, Offer{key, false, []Candidate{{addrA, "lan"}}, lease})
+	in := runConnect(ctx, b, Offer{Secret: key, Candidates: []Candidate{{Addr: addrA, Kind: "lan"}}, Expires: lease})
 	exchange(t, requireConnected(t, out), requireConnected(t, in), "recovered after µTP failure")
 }
 
@@ -62,7 +62,7 @@ func TestPreviousAttemptProofCannotNominateNewStream(t *testing.T) {
 	remote := udpTest(t, "udp4", "127.0.0.1")
 	addr := remote.LocalAddr().(*net.UDPAddr).AddrPort()
 	key := [32]byte{56}
-	off := Offer{key, true, []Candidate{{addr, "lan"}}, time.Now().Add(4 * time.Second)}
+	off := Offer{Secret: key, Initiator: true, Candidates: []Candidate{{Addr: addr, Kind: "lan"}}, Expires: time.Now().Add(4 * time.Second)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	first := runConnect(ctx, s, off)
