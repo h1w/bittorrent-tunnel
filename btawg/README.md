@@ -152,11 +152,20 @@ sudo ./btawg-client 'btawg://…'      # one mode, btawg0 interface
 In either dashboard (`sudo btawg-server` or `sudo btawg-client`), choose
 **Update from GitHub**. The updater uses the host's regular Internet
 connection, without SOCKS5 or proxy environment variables. It checks the
-latest stable release in [GitHub Releases](https://github.com/h1w/bittorrent-tunnel/releases/latest)
+latest stable release in [GitHub Releases](https://github.com/h1w/btawg-tunnel/releases/latest)
 and installs only a newer version after verifying its SHA-256. It keeps
 settings, keys, and the systemd unit unchanged. A running service is restarted;
 a stopped service stays stopped. If the new service fails to start, the
 updater restores the previous executable and tries to restart it.
+
+Both dashboards show the current update stage at the bottom of the screen.
+During the download they show the percentage, or the amount downloaded if
+GitHub does not provide a total size.
+
+The dashboard stays responsive while the update runs. Press **Esc** to cancel
+the download and return to the menu, or **Ctrl+C** to quit. If the executable
+has already been replaced, the updater finishes the systemd restart or rollback
+before quitting. Network failures and timeouts are shown in the dashboard.
 
 The client dashboard checks release availability in the background when it
 opens and shows a notice under the service status if a newer stable version

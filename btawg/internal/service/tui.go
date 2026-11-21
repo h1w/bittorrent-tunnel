@@ -2,11 +2,13 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -65,6 +67,14 @@ func TUI(menu Menu) error {
 		return err
 	}
 	defer app.Close()
+	defer func() {
+		if d.cancelUpdate != nil {
+			d.cancelUpdate()
+		}
+		if d.updateDone != nil {
+			<-d.updateDone // let installation or rollback finish before process exit
+		}
+	}()
 	if notices != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -104,6 +114,13 @@ type dashboard struct {
 
 	releaseNotices <-chan string
 	newRelease     string
+
+	// Only the download is cancellable. The worker owns installation through rollback.
+	cancelUpdate    context.CancelFunc
+	updateDone      <-chan struct{}
+	stoppingUpdate  bool
+	quitAfterUpdate bool
+	updateProgress  atomic.Value // string; published by the update worker
 
 	screen    *Screen
 	history   []*Screen
@@ -149,12 +166,23 @@ func (d *dashboard) run(label string, fn func() (*Screen, error)) {
 		d.message = ""
 		d.app.MarkDirty()
 	}
+	var done chan struct{}
+	if label == updateActionLabel {
+		done = make(chan struct{})
+		d.updateDone = done
+	}
+	current := d.current
 	go func() {
 		r := update{operation: label}
 		if fn != nil {
 			r.screen, r.err = fn()
 		}
-		r.snapshot = d.status()
+		if done != nil {
+			close(done)
+			r.snapshot = current // Do not delay cancellation on a service status probe.
+		} else {
+			r.snapshot = d.status()
+		}
 		d.results <- r
 	}()
 }
@@ -181,6 +209,15 @@ func (d *dashboard) receive(u update) {
 	oldState := d.current.state
 	label := d.working
 	d.current, d.busy, d.working = u.snapshot, false, ""
+	if u.operation == updateActionLabel {
+		d.cancelUpdate()
+		d.cancelUpdate, d.updateDone, d.stoppingUpdate = nil, nil, false
+		if d.quitAfterUpdate {
+			d.app.Stop()
+			return
+		}
+		d.quitAfterUpdate = false
+	}
 	if u.err == nil && u.operation == updateActionLabel {
 		// Ignore any startup result that arrives after the manual check.
 		d.releaseNotices, d.newRelease = nil, ""
@@ -192,6 +229,8 @@ func (d *dashboard) receive(u update) {
 		return
 	}
 	switch {
+	case u.operation == updateActionLabel && errors.Is(u.err, context.Canceled):
+		d.message = "GitHub update cancelled"
 	case u.err != nil:
 		d.message = "Error: " + u.err.Error()
 	case u.screen != nil:
@@ -246,7 +285,7 @@ func (d *dashboard) actions() []Action {
 		out = append(out, s.actions...)
 		if s.state != NotInstalled {
 			out = append(out,
-				Action{Label: updateActionLabel, Confirm: "Download the latest release directly? A running service will restart.", Run: u.updateScreen},
+				Action{Label: updateActionLabel, Confirm: "Download the latest release directly? A running service will restart."},
 				Action{Label: "Remove service", Confirm: "Stop and remove the systemd service? Configuration, keys, and the installed launcher are kept.", Run: perform(u.Uninstall)},
 			)
 		}
@@ -311,6 +350,12 @@ func (u Unit) logs() (*Screen, error) {
 
 func (d *dashboard) activate() {
 	if d.busy && d.working != "" {
+		if d.working == updateActionLabel {
+			items := d.actions()
+			if d.selection < len(items) && items[d.selection].Label == "Quit" {
+				d.interruptUpdate(true)
+			}
+		}
 		return
 	}
 	if a := d.confirm; a != nil {
@@ -318,7 +363,20 @@ func (d *dashboard) activate() {
 		d.selection = 0
 		if d.offset == 1 {
 			d.offset = 0
-			d.run(a.Label, a.Run)
+			if a.Label == updateActionLabel {
+				ctx, cancel := context.WithCancel(context.Background())
+				d.cancelUpdate = cancel
+				d.updateProgress.Store("Waiting to check latest release…")
+				app, unit := d.app, d.menu.Unit
+				d.run(a.Label, func() (*Screen, error) {
+					return unit.updateScreen(ctx, func(progress string) {
+						d.updateProgress.Store(progress)
+						app.MarkDirty()
+					})
+				})
+			} else {
+				d.run(a.Label, a.Run)
+			}
 		} else {
 			d.offset = 0
 		}
@@ -350,15 +408,31 @@ func (d *dashboard) activate() {
 		return
 	}
 	a := items[d.selection]
-	if a.Run == nil {
-		d.app.Stop()
-	} else if a.Confirm != "" {
+	if a.Confirm != "" {
 		d.confirm = &a
 		d.selection, d.offset = 0, 0
 		d.message = ""
+	} else if a.Run == nil {
+		d.app.Stop()
 	} else {
 		d.run(a.Label, a.Run)
 	}
+}
+
+func (d *dashboard) interruptUpdate(quit bool) {
+	d.cancelUpdate()
+	if d.updateDone == nil {
+		// The update is still queued behind a status refresh.
+		d.cancelUpdate, d.pending, d.working = nil, nil, ""
+		d.message = "GitHub update cancelled"
+		if quit {
+			d.app.Stop()
+		}
+	} else {
+		d.stoppingUpdate = true
+		d.quitAfterUpdate = d.quitAfterUpdate || quit
+	}
+	d.app.MarkDirty()
 }
 
 func (d *dashboard) back() {
@@ -406,16 +480,22 @@ func (d *dashboard) KeyMap() tui.KeyMap {
 }
 
 func (d *dashboard) key(e tui.KeyEvent) {
-	if e.Key == tui.KeyRune && e.Mod.Has(tui.ModCtrl) && e.Rune == 'c' {
+	ctrlC := e.Key == tui.KeyRune && e.Mod.Has(tui.ModCtrl) && e.Rune == 'c'
+	quit := e.Key == tui.KeyRune && e.Rune == 'q' && d.screen == nil
+	if d.working == updateActionLabel && (ctrlC || quit || e.Key == tui.KeyEscape) {
+		d.interruptUpdate(ctrlC || quit)
+		return
+	}
+	if ctrlC {
 		if d.working == "" {
 			d.app.Stop()
 		}
 		return
 	}
-	if d.busy && d.working != "" {
+	if d.busy && d.working != "" && d.working != updateActionLabel {
 		return
 	}
-	if e.Key == tui.KeyEscape || (d.screen == nil && e.Key == tui.KeyRune && e.Rune == 'q') {
+	if e.Key == tui.KeyEscape || quit {
 		d.back()
 	} else {
 		switch e.Key {
@@ -469,7 +549,7 @@ func (d *dashboard) key(e tui.KeyEvent) {
 }
 
 func (d *dashboard) HandleMouse(e tui.MouseEvent) bool {
-	if d.busy && d.working != "" {
+	if d.busy && d.working != "" && d.working != updateActionLabel {
 		return false
 	}
 	if e.Button == tui.MouseWheelDown {
@@ -539,11 +619,18 @@ func (d *dashboard) Render(app *tui.App) *tui.Element {
 	if msg != "" {
 		msg = strings.Join(strings.Fields(msg), " ")
 	}
-	msgLines := len(wrap(msg, max(1, width-2)))
-	if d.working != "" {
-		msg, msgLines = d.working+"…", 1
+	switch {
+	case d.stoppingUpdate:
+		msg = "GitHub update: waiting for safe stop…"
+	case d.working == updateActionLabel:
+		if progress, ok := d.updateProgress.Load().(string); ok {
+			msg = "GitHub update: " + progress
+		}
+	case d.working != "":
+		msg = d.working + "…"
 	}
-	room := max(1, height-4-min(msgLines, 3))
+	rows := wrap(msg, max(1, width-2))
+	room := max(1, height-4-min(len(rows), 3))
 	if showRelease {
 		room = max(1, room-1)
 	}
@@ -608,9 +695,11 @@ func (d *dashboard) Render(app *tui.App) *tui.Element {
 			footer = fmt.Sprintf("%d/%d  •  %s", d.selection+1, len(items), footer)
 		}
 	}
+	if d.working == updateActionLabel {
+		footer = "↑/↓ Move  •  Esc Cancel download  •  Ctrl+C Quit safely"
+	}
 
 	if msg != "" {
-		rows := wrap(msg, max(1, width-2))
 		style := good
 		if d.working == "" && (strings.HasPrefix(msg, "Error:") || msg == d.message && d.current.err != nil || d.message == "") {
 			style = warning

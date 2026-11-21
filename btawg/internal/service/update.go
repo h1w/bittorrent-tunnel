@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -26,8 +27,8 @@ import (
 var Version = "dev"
 
 const (
-	latestRelease = "https://api.github.com/repos/h1w/bittorrent-tunnel/releases/latest"
-	assetBase     = "https://github.com/h1w/bittorrent-tunnel/releases/download/"
+	latestRelease = "https://api.github.com/repos/h1w/btawg-tunnel/releases/latest"
+	assetBase     = "https://github.com/h1w/btawg-tunnel/releases/download/"
 	maxAssetSize  = 64 << 20
 )
 
@@ -40,15 +41,15 @@ func releaseSupported() bool {
 	return runtime.GOOS == "linux" && runtime.GOARCH == "amd64"
 }
 
-func (u Unit) updateScreen() (*Screen, error) {
+func (u Unit) updateScreen(ctx context.Context, progress func(string)) (*Screen, error) {
 	if !releaseSupported() {
 		return nil, fmt.Errorf("GitHub release binaries are only available for Linux amd64")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	client := directUpdateClient()
 	defer client.CloseIdleConnections()
-	result, err := u.updateFrom(ctx, client)
+	result, err := u.updateFrom(ctx, client, progress)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +64,12 @@ func directUpdateClient() *http.Client {
 	return &http.Client{
 		// No proxy lookup, including HTTP_PROXY and HTTPS_PROXY. btawg
 		// does not install an Internet default route on either host.
-		Transport: &http.Transport{ForceAttemptHTTP2: true},
+		Transport: &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 15 * time.Second,
+			ForceAttemptHTTP2:     true,
+		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) < 10 && req.URL.Scheme == "https" && req.URL.User == nil {
 				switch req.URL.Host {
@@ -76,7 +82,7 @@ func directUpdateClient() *http.Client {
 	}
 }
 
-func (u Unit) updateFrom(ctx context.Context, client *http.Client) (updateResult, error) {
+func (u Unit) updateFrom(ctx context.Context, client *http.Client, progress func(string)) (updateResult, error) {
 	var result updateResult
 	path := u.binaryPath()
 	lock, err := os.OpenFile(path+".update.lock", os.O_CREATE|os.O_RDWR, 0o600)
@@ -87,11 +93,12 @@ func (u Unit) updateFrom(ctx context.Context, client *http.Client) (updateResult
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		return result, fmt.Errorf("lock update: %w", err)
 	}
+	progress("Checking latest release…")
 	result, err = u.checkRelease(ctx, client)
 	if err != nil || !result.updated {
 		return result, err
 	}
-	return result, u.applyRelease(ctx, client, result.latest)
+	return result, u.applyRelease(ctx, client, result.latest, progress)
 }
 
 func (u Unit) availableRelease(ctx context.Context, client *http.Client) string {
@@ -107,6 +114,9 @@ func (u Unit) checkRelease(ctx context.Context, client *http.Client) (updateResu
 	versionCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	out, err := exec.CommandContext(versionCtx, u.binaryPath(), "--version").Output()
 	cancel()
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	result.installed = strings.TrimSpace(string(out))
 	current, valid := stableVersion(result.installed)
 	if err != nil || !valid {
@@ -122,8 +132,8 @@ func (u Unit) checkRelease(ctx context.Context, client *http.Client) (updateResu
 		Draft      bool   `json:"draft"`
 		Prerelease bool   `json:"prerelease"`
 	}
-	err = json.NewDecoder(io.LimitReader(metadata, 1<<20)).Decode(&release)
-	metadata.Close()
+	defer metadata.Body.Close()
+	err = json.NewDecoder(io.LimitReader(metadata.Body, 1<<20)).Decode(&release)
 	if err != nil {
 		return result, fmt.Errorf("read release metadata: %w", err)
 	}
@@ -160,7 +170,7 @@ func stableVersion(tag string) ([3]uint64, bool) {
 	return version, true
 }
 
-func getReleaseFile(ctx context.Context, client *http.Client, url string) (io.ReadCloser, error) {
+func getReleaseFile(ctx context.Context, client *http.Client, url string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -173,12 +183,13 @@ func getReleaseFile(ctx context.Context, client *http.Client, url string) (io.Re
 		res.Body.Close()
 		return nil, fmt.Errorf("GitHub returned %s", res.Status)
 	}
-	return res.Body, nil
+	return res, nil
 }
 
-func (u Unit) applyRelease(ctx context.Context, client *http.Client, tag string) error {
+func (u Unit) applyRelease(ctx context.Context, client *http.Client, tag string, progress func(string)) error {
 	base := assetBase + tag + "/"
 	name := u.binaryName()
+	progress("Fetching SHA-256 checksum…")
 	want, err := releaseChecksum(ctx, client, base, name)
 	if err != nil {
 		return fmt.Errorf("get release checksum: %w", err)
@@ -196,17 +207,25 @@ func (u Unit) applyRelease(ctx context.Context, client *http.Client, tag string)
 		}
 	}()
 	staged := filepath.Join(dir, name)
-	if err := downloadBinary(ctx, client, base+name, staged, want); err != nil {
+	if err := downloadBinary(ctx, client, base+name, staged, want, progress); err != nil {
 		return fmt.Errorf("download %s %s: %w", name, tag, err)
 	}
 	backup := filepath.Join(dir, "previous")
 	if err := os.Link(path, backup); err != nil {
 		return fmt.Errorf("back up installed binary: %w", err)
 	}
+	// Cancellation is safe up to this point. Once the executable is replaced,
+	// finish the restart or rollback even if the dashboard is closing.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	progress("Installing verified binary…")
 	if err := os.Rename(staged, path); err != nil {
 		return fmt.Errorf("replace installed binary: %w", err)
 	}
+	progress("Restarting service if running…")
 	if err := unitAction(u.unitName(), "try-restart"); err != nil {
+		progress("Restoring previous version…")
 		if restoreErr := os.Rename(backup, path); restoreErr != nil {
 			keepBackup = true
 			return errors.Join(err, fmt.Errorf("restore previous binary (backup at %s): %w", backup, restoreErr))
@@ -220,12 +239,12 @@ func (u Unit) applyRelease(ctx context.Context, client *http.Client, tag string)
 }
 
 func releaseChecksum(ctx context.Context, client *http.Client, base, name string) ([]byte, error) {
-	body, err := getReleaseFile(ctx, client, base+"SHA256SUMS")
+	res, err := getReleaseFile(ctx, client, base+"SHA256SUMS")
 	if err != nil {
 		return nil, err
 	}
-	defer body.Close()
-	scanner := bufio.NewScanner(io.LimitReader(body, 64<<10))
+	defer res.Body.Close()
+	scanner := bufio.NewScanner(io.LimitReader(res.Body, 64<<10))
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) == 2 {
@@ -245,24 +264,48 @@ func releaseChecksum(ctx context.Context, client *http.Client, base, name string
 	return nil, fmt.Errorf("no SHA-256 for %s", name)
 }
 
-func downloadBinary(ctx context.Context, client *http.Client, url, path string, want []byte) error {
-	body, err := getReleaseFile(ctx, client, url)
+func downloadBinary(ctx context.Context, client *http.Client, url, path string, want []byte, progress func(string)) error {
+	progress("Connecting to download…")
+	res, err := getReleaseFile(ctx, client, url)
 	if err != nil {
 		return err
 	}
-	defer body.Close()
+	defer res.Body.Close()
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, hash), io.LimitReader(body, maxAssetSize+1))
+	meter := downloadMeter{progress: progress, total: res.ContentLength, last: -1}
+	meter.Write(nil)
+	n, err := io.Copy(io.MultiWriter(f, hash, &meter), io.LimitReader(res.Body, maxAssetSize+1))
 	if err != nil {
 		return err
 	}
+	progress("Verifying SHA-256…")
 	if n == 0 || n > maxAssetSize || !bytes.Equal(hash.Sum(nil), want) {
 		return fmt.Errorf("invalid binary size or SHA-256 mismatch")
 	}
 	return f.Sync()
+}
+
+type downloadMeter struct {
+	progress             func(string)
+	total, written, last int64
+}
+
+func (m *downloadMeter) Write(b []byte) (int, error) {
+	m.written += int64(len(b))
+	if m.total > 0 {
+		percent := min(100, m.written*100/m.total)
+		if percent != m.last {
+			m.last = percent
+			m.progress(fmt.Sprintf("Downloading: %d%%", percent))
+		}
+	} else if step := m.written / (64 << 10); step != m.last {
+		m.last = step
+		m.progress(fmt.Sprintf("Downloading: %d KiB", m.written>>10))
+	}
+	return len(b), nil
 }

@@ -89,3 +89,14 @@ func TestTextFieldLeavesPasteMouseGestureToTerminal(t *testing.T) {
 		t.Fatal("mouse reporting not restored after leaving import field")
 	}
 }
+
+func TestGitHubUpdateKeepsDashboardNavigationResponsive(t *testing.T) {
+	d := dashboard{
+		app: new(tui.App), menu: Menu{Unit: Client}, root: true,
+		current: snapshot{state: "active"}, busy: true, working: updateActionLabel,
+	}
+	d.key(tui.KeyEvent{Key: tui.KeyDown})
+	if got := d.actions()[d.selection].Label; got != "Restart service" {
+		t.Fatalf("Down selects %q during the GitHub update, want Restart service", got)
+	}
+}

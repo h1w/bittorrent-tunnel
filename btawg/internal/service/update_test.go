@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +21,7 @@ func TestUpdateFromRelease(t *testing.T) {
 		unit                     Unit
 		installed, asset         string
 		active, rejectRestart    bool
+		cancelAfterDownload      bool
 		wantFailed, wantDownload bool
 		wantInstalled            string
 	}{
@@ -29,6 +31,7 @@ func TestUpdateFromRelease(t *testing.T) {
 		{name: "never downgrade", tag: "v0.5.8", unit: Client, installed: old, wantInstalled: old},
 		{name: "never install a prerelease", tag: "v0.5.10-rc.1", unit: Client, installed: old, wantFailed: true, wantInstalled: old},
 		{name: "reject corrupt download", tag: "v0.5.10", unit: Server, installed: old, asset: "corrupt", wantFailed: true, wantDownload: true, wantInstalled: old},
+		{name: "cancel before replacing the executable", tag: "v0.5.10", unit: Client, installed: old, asset: next, active: true, cancelAfterDownload: true, wantFailed: true, wantDownload: true, wantInstalled: old},
 		{name: "restore after restart failure", tag: "v0.5.10", unit: Client, installed: old, asset: next, active: true, rejectRestart: true, wantFailed: true, wantDownload: true, wantInstalled: old},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,9 +65,9 @@ func TestUpdateFromRelease(t *testing.T) {
 				return "", err
 			}
 			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				base := "/h1w/bittorrent-tunnel/releases/download/" + tc.tag + "/"
+				base := "/h1w/btawg-tunnel/releases/download/" + tc.tag + "/"
 				switch r.URL.Path {
-				case "/repos/h1w/bittorrent-tunnel/releases/latest":
+				case "/repos/h1w/btawg-tunnel/releases/latest":
 					fmt.Fprintf(w, `{"tag_name":%q}`, tc.tag)
 				case base + "SHA256SUMS":
 					fmt.Fprintf(w, "%x  dist/btawg-%s\n", sha256.Sum256([]byte(next)), tc.unit)
@@ -78,15 +81,24 @@ func TestUpdateFromRelease(t *testing.T) {
 			hc := srv.Client()
 			transport := hc.Transport
 			downloaded := false
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			hc.Transport = updateRoundTrip(func(r *http.Request) (*http.Response, error) {
-				if r.URL.Path == "/h1w/bittorrent-tunnel/releases/download/"+tc.tag+"/btawg-"+string(tc.unit) {
+				if r.URL.Path == "/h1w/btawg-tunnel/releases/download/"+tc.tag+"/btawg-"+string(tc.unit) {
 					downloaded = true
 				}
 				clone := r.Clone(r.Context())
 				clone.URL.Host = srv.Listener.Addr().String()
-				return transport.RoundTrip(clone)
+				res, err := transport.RoundTrip(clone)
+				if err == nil && tc.cancelAfterDownload && downloaded {
+					res.Body = cancelOnClose{res.Body, cancel}
+				}
+				return res, err
 			})
-			_, err := tc.unit.updateFrom(context.Background(), hc)
+			_, err := tc.unit.updateFrom(ctx, hc, func(string) {})
+			if tc.cancelAfterDownload && !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled update returned %v, want context.Canceled", err)
+			}
 			if (err != nil) != tc.wantFailed {
 				t.Fatalf("error = %v, want failure %t", err, tc.wantFailed)
 			}
@@ -107,6 +119,16 @@ func TestUpdateFromRelease(t *testing.T) {
 type updateRoundTrip func(*http.Request) (*http.Response, error)
 
 func (rt updateRoundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return rt(r) }
+
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (body cancelOnClose) Close() error {
+	body.cancel()
+	return body.ReadCloser.Close()
+}
 
 func TestAvailableRelease(t *testing.T) {
 	for _, tc := range []struct {
@@ -129,7 +151,7 @@ func TestAvailableRelease(t *testing.T) {
 				t.Fatal(err)
 			}
 			hc := &http.Client{Transport: updateRoundTrip(func(r *http.Request) (*http.Response, error) {
-				if r.Method != http.MethodGet || r.URL.String() != "https://api.github.com/repos/h1w/bittorrent-tunnel/releases/latest" {
+				if r.Method != http.MethodGet || r.URL.String() != "https://api.github.com/repos/h1w/btawg-tunnel/releases/latest" {
 					t.Fatalf("background check sent unexpected request: %s %s", r.Method, r.URL)
 				}
 				w := httptest.NewRecorder()
